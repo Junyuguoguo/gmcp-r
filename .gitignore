@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# PyCharm
+.idea/
+
+# macOS
+.DS_Store
+
+# experiment outputs
+results/*.csv
+results/figures/*.png
+logs/
+
+# temporary
+*.log
