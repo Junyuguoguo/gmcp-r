@@ -12,9 +12,11 @@ from gmcp.config import (
     DEFAULT_PORT,
     CLIENT_ID,
     EPOCH,
+    SHARED_KEY,
 )
 from gmcp.memory import initial_memory
 from gmcp.protocol import GMCPState, GMCPVerifier
+from gmcp.crypto_utils import verify_hmac
 
 
 state_lock = threading.Lock()
@@ -36,6 +38,57 @@ def make_state(session_id: str) -> GMCPState:
 def send_json_line(conn, response: Dict[str, Any]):
     raw = json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n"
     conn.sendall(raw)
+
+
+def verify_recovery_request(packet: Dict[str, Any]) -> bool:
+    tag = packet.get("auth_tag")
+    if not tag:
+        return False
+
+    data = dict(packet)
+    data.pop("auth_tag", None)
+
+    return verify_hmac(SHARED_KEY, data, tag)
+
+
+def handle_recovery_request(packet, states, verifiers, stats):
+    recv_time = time.time()
+    session_id = packet.get("session_id", "unknown-session")
+
+    if not verify_recovery_request(packet):
+        return {
+            "ok": False,
+            "type": "RECOVERY_RESPONSE",
+            "reason": "invalid recovery request auth_tag",
+            "server_time": recv_time,
+        }
+
+    with state_lock:
+        if session_id not in states:
+            states[session_id] = make_state(session_id)
+            verifiers[session_id] = GMCPVerifier(states[session_id])
+            stats[session_id] = {
+                "total": 0,
+                "accepted": 0,
+                "rejected": 0,
+            }
+
+        state = states[session_id]
+
+        response = {
+            "ok": True,
+            "type": "RECOVERY_RESPONSE",
+            "reason": "ok",
+            "recovery_mode": "memory_ticket_checkpoint",
+            "session_id": session_id,
+            "server_last_seq": state.last_seq,
+            "server_last_mem": state.last_mem,
+            "checkpoint_seq": state.last_seq,
+            "checkpoint_mem": state.last_mem,
+            "server_time": recv_time,
+        }
+
+    return response
 
 
 def handle_client(conn, addr, states, verifiers, stats):
@@ -69,12 +122,19 @@ def handle_client(conn, addr, states, verifiers, stats):
                 })
                 continue
 
-            if packet.get("type") == "PING":
+            packet_type = packet.get("type")
+
+            if packet_type == "PING":
                 send_json_line(conn, {
                     "ok": True,
                     "reason": "pong",
                     "server_time": recv_time,
                 })
+                continue
+
+            if packet_type == "RECOVERY_REQUEST":
+                response = handle_recovery_request(packet, states, verifiers, stats)
+                send_json_line(conn, response)
                 continue
 
             session_id = packet.get("session_id", "unknown-session")
