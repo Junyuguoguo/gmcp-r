@@ -70,9 +70,30 @@ def recv_json_line(file_obj):
     if not line:
         raise ConnectionError("server closed connection")
     return json.loads(line)
+def close_tcp(sock, file_obj):
+    try:
+        if file_obj:
+            file_obj.close()
+    except Exception:
+        pass
+
+    try:
+        if sock:
+            sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+
+    try:
+        if sock:
+            sock.close()
+    except Exception:
+        pass
 
 
 def ping_server() -> bool:
+    sock = None
+    file_obj = None
+
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(SOCKET_TIMEOUT)
@@ -88,13 +109,13 @@ def ping_server() -> bool:
         send_json_line(sock, msg)
         resp = recv_json_line(file_obj)
 
-        sock.close()
-
         return resp.get("ok") is True
 
     except Exception:
         return False
 
+    finally:
+        close_tcp(sock, file_obj)
 
 def run_one_real_tcp_experiment(
     message_count: int,

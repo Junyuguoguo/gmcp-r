@@ -3,18 +3,21 @@
 
 import json
 import socket
+import threading
 import time
 from typing import Dict, Any
 
 from gmcp.config import (
     SERVER_BIND_HOST,
     DEFAULT_PORT,
-    BUFFER_SIZE,
     CLIENT_ID,
     EPOCH,
 )
 from gmcp.memory import initial_memory
 from gmcp.protocol import GMCPState, GMCPVerifier
+
+
+state_lock = threading.Lock()
 
 
 def make_state(session_id: str) -> GMCPState:
@@ -36,88 +39,113 @@ def send_json_line(conn, response: Dict[str, Any]):
 
 
 def handle_client(conn, addr, states, verifiers, stats):
-    print(f"[REAL_TCP_SERVER] connected from {addr}")
+    print(f"[REAL_TCP_SERVER] connected from {addr}", flush=True)
 
-    file_obj = conn.makefile("r", encoding="utf-8", newline="\n")
+    file_obj = None
 
-    while True:
-        line = file_obj.readline()
+    try:
+        conn.settimeout(30)
+        file_obj = conn.makefile("r", encoding="utf-8", newline="\n")
 
-        if not line:
-            break
+        while True:
+            try:
+                line = file_obj.readline()
+            except socket.timeout:
+                print(f"[REAL_TCP_SERVER] connection timeout from {addr}", flush=True)
+                break
 
-        recv_time = time.time()
+            if not line:
+                break
+
+            recv_time = time.time()
+
+            try:
+                packet: Dict[str, Any] = json.loads(line)
+            except Exception:
+                response = {
+                    "ok": False,
+                    "reason": "invalid json",
+                    "server_time": recv_time,
+                }
+                send_json_line(conn, response)
+                continue
+
+            if packet.get("type") == "PING":
+                response = {
+                    "ok": True,
+                    "reason": "pong",
+                    "server_time": recv_time,
+                }
+                send_json_line(conn, response)
+                continue
+
+            session_id = packet.get("session_id", "unknown-session")
+
+            with state_lock:
+                if session_id not in states:
+                    states[session_id] = make_state(session_id)
+                    verifiers[session_id] = GMCPVerifier(states[session_id])
+                    stats[session_id] = {
+                        "total": 0,
+                        "accepted": 0,
+                        "rejected": 0,
+                    }
+                    print(f"[REAL_TCP_SERVER] new session: {session_id}", flush=True)
+
+                state = states[session_id]
+                verifier = verifiers[session_id]
+
+                ok, reason = verifier.verify_data_packet(packet)
+
+                stats[session_id]["total"] += 1
+
+                if ok:
+                    stats[session_id]["accepted"] += 1
+
+                    if state.last_seq % 100 == 0:
+                        print(
+                            f"[REAL_TCP_SERVER] session={session_id}, "
+                            f"accepted={stats[session_id]['accepted']}, "
+                            f"last_seq={state.last_seq}",
+                            flush=True,
+                        )
+                else:
+                    stats[session_id]["rejected"] += 1
+                    print(
+                        f"[REAL_TCP_SERVER] reject session={session_id}, "
+                        f"seq={packet.get('seq')}, reason={reason}",
+                        flush=True,
+                    )
+
+                response = {
+                    "ok": ok,
+                    "reason": reason,
+                    "session_id": session_id,
+                    "last_seq": state.last_seq,
+                    "last_mem": state.last_mem,
+                    "server_time": recv_time,
+                    "accepted": stats[session_id]["accepted"],
+                    "rejected": stats[session_id]["rejected"],
+                }
+
+            send_json_line(conn, response)
+
+    except Exception as e:
+        print(f"[REAL_TCP_SERVER] error from {addr}: {e}", flush=True)
+
+    finally:
+        try:
+            if file_obj:
+                file_obj.close()
+        except Exception:
+            pass
 
         try:
-            packet: Dict[str, Any] = json.loads(line)
+            conn.close()
         except Exception:
-            response = {
-                "ok": False,
-                "reason": "invalid json",
-                "server_time": recv_time,
-            }
-            send_json_line(conn, response)
-            continue
+            pass
 
-        if packet.get("type") == "PING":
-            response = {
-                "ok": True,
-                "reason": "pong",
-                "server_time": recv_time,
-            }
-            send_json_line(conn, response)
-            continue
-
-        session_id = packet.get("session_id", "unknown-session")
-
-        if session_id not in states:
-            states[session_id] = make_state(session_id)
-            verifiers[session_id] = GMCPVerifier(states[session_id])
-            stats[session_id] = {
-                "total": 0,
-                "accepted": 0,
-                "rejected": 0,
-            }
-            print(f"[REAL_TCP_SERVER] new session: {session_id}")
-
-        state = states[session_id]
-        verifier = verifiers[session_id]
-
-        ok, reason = verifier.verify_data_packet(packet)
-
-        stats[session_id]["total"] += 1
-
-        if ok:
-            stats[session_id]["accepted"] += 1
-
-            if state.last_seq % 100 == 0:
-                print(
-                    f"[REAL_TCP_SERVER] session={session_id}, "
-                    f"accepted={stats[session_id]['accepted']}, "
-                    f"last_seq={state.last_seq}"
-                )
-        else:
-            stats[session_id]["rejected"] += 1
-            print(
-                f"[REAL_TCP_SERVER] reject session={session_id}, "
-                f"seq={packet.get('seq')}, reason={reason}"
-            )
-
-        response = {
-            "ok": ok,
-            "reason": reason,
-            "session_id": session_id,
-            "last_seq": state.last_seq,
-            "last_mem": state.last_mem,
-            "server_time": recv_time,
-            "accepted": stats[session_id]["accepted"],
-            "rejected": stats[session_id]["rejected"],
-        }
-
-        send_json_line(conn, response)
-
-    conn.close()
-    print(f"[REAL_TCP_SERVER] disconnected from {addr}")
+        print(f"[REAL_TCP_SERVER] disconnected from {addr}", flush=True)
 
 
 def main():
@@ -128,13 +156,19 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((SERVER_BIND_HOST, DEFAULT_PORT))
-    sock.listen(20)
+    sock.listen(100)
 
-    print(f"[REAL_TCP_SERVER] Listening on {SERVER_BIND_HOST}:{DEFAULT_PORT}")
+    print(f"[REAL_TCP_SERVER] Listening on {SERVER_BIND_HOST}:{DEFAULT_PORT}", flush=True)
 
     while True:
         conn, addr = sock.accept()
-        handle_client(conn, addr, states, verifiers, stats)
+
+        t = threading.Thread(
+            target=handle_client,
+            args=(conn, addr, states, verifiers, stats),
+            daemon=True,
+        )
+        t.start()
 
 
 if __name__ == "__main__":
