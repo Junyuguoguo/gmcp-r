@@ -62,21 +62,19 @@ def handle_client(conn, addr, states, verifiers, stats):
             try:
                 packet: Dict[str, Any] = json.loads(line)
             except Exception:
-                response = {
+                send_json_line(conn, {
                     "ok": False,
                     "reason": "invalid json",
                     "server_time": recv_time,
-                }
-                send_json_line(conn, response)
+                })
                 continue
 
             if packet.get("type") == "PING":
-                response = {
+                send_json_line(conn, {
                     "ok": True,
                     "reason": "pong",
                     "server_time": recv_time,
-                }
-                send_json_line(conn, response)
+                })
                 continue
 
             session_id = packet.get("session_id", "unknown-session")
