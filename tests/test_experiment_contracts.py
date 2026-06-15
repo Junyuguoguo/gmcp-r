@@ -207,5 +207,33 @@ class WeakNetworkContractTests(unittest.TestCase):
         self.assertGreater(gmcp_row["recovery_success_rate"], ticket_row["recovery_success_rate"])
 
 
+class RerunFailedRecoveryTests(unittest.TestCase):
+    def test_detects_failed_recovery_rows_from_tcp_disconnects(self):
+        from rerun_failed_real_recovery import is_failed_recovery_row
+
+        self.assertTrue(
+            is_failed_recovery_row(
+                {
+                    "full_recovery_success": "False",
+                    "recovery_success": "False",
+                    "timeout_count": "1",
+                    "accepted_count": "0",
+                    "detection_reason": "tcp error: server closed connection",
+                }
+            )
+        )
+        self.assertFalse(
+            is_failed_recovery_row(
+                {
+                    "full_recovery_success": "True",
+                    "recovery_success": "True",
+                    "timeout_count": "0",
+                    "accepted_count": "500",
+                    "detection_reason": "prev_mem mismatch, history is not continuous",
+                }
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
