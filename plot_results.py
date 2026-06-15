@@ -67,14 +67,18 @@ def main():
 
     # 兼容 True/False 被读成 bool 或 str 的情况
     if df["recovery_success"].dtype == object:
-        df["recovery_success_bool"] = df["recovery_success"].astype(str).str.lower() == "true"
+        df["recovery_success_bool"] = (
+            df["recovery_success"].astype(str).str.lower() == "true"
+        ).astype(int)
     else:
-        df["recovery_success_bool"] = df["recovery_success"].astype(bool)
+        df["recovery_success_bool"] = df["recovery_success"].astype(bool).astype(int)
 
     if df["memory_recovered"].dtype == object:
-        df["memory_recovered_bool"] = df["memory_recovered"].astype(str).str.lower() == "true"
+        df["memory_recovered_bool"] = (
+            df["memory_recovered"].astype(str).str.lower() == "true"
+        ).astype(int)
     else:
-        df["memory_recovered_bool"] = df["memory_recovered"].astype(bool)
+        df["memory_recovered_bool"] = df["memory_recovered"].astype(bool).astype(int)
 
     formal_df = df[df["scenario"] == "formal_v2"]
     weak_df = df[df["scenario"] == "weak_net"]

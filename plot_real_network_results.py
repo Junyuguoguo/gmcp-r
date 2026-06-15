@@ -61,9 +61,9 @@ def main():
     df = pd.read_csv(INPUT_CSV)
 
     # 兼容 bool / str
-    df["attack_detected_bool"] = df["attack_detected"].astype(str).str.lower() == "true"
-    df["recovery_success_bool"] = df["recovery_success"].astype(str).str.lower() == "true"
-    df["server_reachable_bool"] = df["server_reachable"].astype(str).str.lower() == "true"
+    df["attack_detected_bool"] = (df["attack_detected"].astype(str).str.lower() == "true").astype(int)
+    df["recovery_success_bool"] = (df["recovery_success"].astype(str).str.lower() == "true").astype(int)
+    df["server_reachable_bool"] = (df["server_reachable"].astype(str).str.lower() == "true").astype(int)
     if "p50_rtt_ms" not in df.columns:
         df["p50_rtt_ms"] = df["avg_rtt_ms"]
     if "p95_rtt_ms" not in df.columns:

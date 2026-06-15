@@ -26,7 +26,7 @@ def clean_old_figures() -> None:
 
 
 def bool_series(series):
-    return series.astype(str).str.lower() == "true"
+    return (series.astype(str).str.lower() == "true").astype(int)
 
 
 def save_bar(series, xlabel, ylabel, title, output_path, rotation=45) -> None:

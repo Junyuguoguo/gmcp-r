@@ -82,10 +82,10 @@ def main():
 
     df = pd.read_csv(INPUT_CSV)
 
-    df["memory_match_bool"] = df["memory_match"].astype(str).str.lower() == "true"
-    df["memory_verified_bool"] = df["memory_verified"].astype(str).str.lower() == "true"
-    df["attack_detected_bool"] = df["attack_detected"].astype(str).str.lower() == "true"
-    df["seq_consistent_bool"] = df["seq_consistent"].astype(str).str.lower() == "true"
+    df["memory_match_bool"] = (df["memory_match"].astype(str).str.lower() == "true").astype(int)
+    df["memory_verified_bool"] = (df["memory_verified"].astype(str).str.lower() == "true").astype(int)
+    df["attack_detected_bool"] = (df["attack_detected"].astype(str).str.lower() == "true").astype(int)
+    df["seq_consistent_bool"] = (df["seq_consistent"].astype(str).str.lower() == "true").astype(int)
 
     normal_df = df[df["attack_type"] == "none"]
     attack_df = df[df["attack_type"] != "none"]

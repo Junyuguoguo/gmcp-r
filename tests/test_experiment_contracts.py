@@ -1,6 +1,17 @@
 import unittest
 
 
+class PlotCompatibilityTests(unittest.TestCase):
+    def test_baseline_bool_series_is_numeric_for_old_pandas_plotting(self):
+        import pandas as pd
+
+        from plot_baseline_comparison_results import bool_series
+
+        converted = bool_series(pd.Series(["True", "False", True, False]))
+        self.assertEqual(converted.tolist(), [1, 0, 1, 0])
+        self.assertNotEqual(str(converted.dtype), "bool")
+
+
 class BaselineComparisonContractTests(unittest.TestCase):
     def test_protocol_matrix_fields_and_security_expectations(self):
         from run_baseline_comparison_experiment import simulate_protocol_result

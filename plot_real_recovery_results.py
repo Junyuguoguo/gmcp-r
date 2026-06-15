@@ -46,7 +46,7 @@ def main():
         "memory_match_after_recovery",
         "final_seq_consistent",
     ]:
-        df[col + "_bool"] = df[col].astype(str).str.lower() == "true"
+        df[col + "_bool"] = (df[col].astype(str).str.lower() == "true").astype(int)
     if "recovery_extra_messages" not in df.columns:
         df["recovery_extra_messages"] = 0
     if "recovery_extra_bytes" not in df.columns:
