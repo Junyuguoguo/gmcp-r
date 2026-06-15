@@ -1,0 +1,7 @@
+attack_type,ticket_verified_rate,attack_detection_rate,recovery_allowed_rate
+expired_ticket,0.0,1.0,0.0
+replayed_ticket,0.0,1.0,0.0
+rollback_ticket,0.0,1.0,0.0
+tampered_ticket,0.0,1.0,0.0
+valid_ticket,1.0,0.0,1.0
+wrong_session_ticket,0.0,1.0,0.0

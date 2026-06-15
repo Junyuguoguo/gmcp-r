@@ -18,6 +18,7 @@ from gmcp.config import (
 from gmcp.crypto_utils import hash_text, hmac_sha256_hex
 from gmcp.memory import initial_memory, update_memory
 from gmcp.packet import build_data_packet
+from gmcp.ticket import verify_memory_ticket_for_recovery
 
 
 OUTPUT_DIR = "results/real_recovery"
@@ -26,7 +27,8 @@ OUTPUT_CSV = os.path.join(OUTPUT_DIR, "real_recovery_results.csv")
 MESSAGE_COUNTS = [100, 500, 1000]
 PAYLOAD_SIZES = [128, 512]
 ATTACK_TYPES = ["drop", "modify", "replay", "prev_mem", "disconnect"]
-REPEATS = [1]
+REPEAT_COUNT = int(os.getenv("GMCP_REPEATS", "1"))
+REPEATS = list(range(1, REPEAT_COUNT + 1))
 
 SOCKET_TIMEOUT = 10.0
 
@@ -44,6 +46,17 @@ def make_payload(seq: int, payload_size: int) -> str:
 def send_json_line(sock: socket.socket, packet: Dict[str, Any]):
     raw = json.dumps(packet, ensure_ascii=False).encode("utf-8") + b"\n"
     sock.sendall(raw)
+
+
+def json_size(packet: Dict[str, Any]) -> int:
+    return len(json.dumps(packet, ensure_ascii=False).encode("utf-8"))
+
+
+def enable_tcp_nodelay(sock: socket.socket) -> None:
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
 
 
 def recv_json_line(file_obj):
@@ -75,6 +88,7 @@ def close_tcp(sock, file_obj):
 
 def open_tcp():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    enable_tcp_nodelay(sock)
     sock.settimeout(SOCKET_TIMEOUT)
     sock.connect((SERVER_TARGET_HOST, DEFAULT_PORT))
     file_obj = sock.makefile("r", encoding="utf-8", newline="\n")
@@ -128,7 +142,7 @@ def request_recovery(
     client_last_seq: int,
     client_last_mem: str,
     reason: str,
-) -> Tuple[bool, Dict[str, Any], float]:
+) -> Tuple[bool, Dict[str, Any], float, int, int, Dict[str, Any]]:
 
     start = time.time()
 
@@ -139,11 +153,40 @@ def request_recovery(
         reason=reason,
     )
 
+    request_bytes = json_size(request)
     send_json_line(sock, request)
     response = recv_json_line(file_obj)
+    response_bytes = json_size(response)
 
     latency_ms = (time.time() - start) * 1000
-    return response.get("ok") is True, response, latency_ms
+
+    ticket = response.get("memory_ticket")
+    ticket_info = {
+        "ticket_verified": False,
+        "ticket_nonce": "",
+        "ticket_expired": False,
+        "ticket_replay_detected": False,
+        "ticket_reason": "missing memory_ticket",
+    }
+
+    if isinstance(ticket, dict):
+        ticket_ok, ticket_reason = verify_memory_ticket_for_recovery(
+            ticket=ticket,
+            expected_session_id=session_id,
+            expected_client_id=CLIENT_ID,
+            expected_epoch=EPOCH,
+            min_last_seq=int(response.get("server_last_seq", 0)),
+        )
+        ticket_info = {
+            "ticket_verified": ticket_ok,
+            "ticket_nonce": ticket.get("ticket_nonce", ""),
+            "ticket_expired": ticket_reason == "ticket expired",
+            "ticket_replay_detected": "replay" in ticket_reason,
+            "ticket_reason": ticket_reason,
+        }
+
+    ok = response.get("ok") is True and ticket_info["ticket_verified"]
+    return ok, response, latency_ms, 2, request_bytes + response_bytes, ticket_info
 
 
 def run_one_recovery_experiment(
@@ -175,8 +218,14 @@ def run_one_recovery_experiment(
     memory_match_after_recovery = False
 
     recovery_latency_ms = 0.0
+    recovery_extra_messages = 0
+    recovery_extra_bytes = 0
     detection_reason = "normal"
     recovery_reason = "not_started"
+    ticket_verified = False
+    ticket_nonce = ""
+    ticket_expired = False
+    ticket_replay_detected = False
 
     saved_packets: Dict[int, Dict[str, Any]] = {}
 
@@ -214,7 +263,14 @@ def run_one_recovery_experiment(
                 sock, file_obj = open_tcp()
 
                 recovery_requested = True
-                ok, recovery_response, recovery_latency_ms = request_recovery(
+                (
+                    ok,
+                    recovery_response,
+                    recovery_latency_ms,
+                    recovery_extra_messages,
+                    recovery_extra_bytes,
+                    ticket_info,
+                ) = request_recovery(
                     sock=sock,
                     file_obj=file_obj,
                     session_id=session_id,
@@ -222,6 +278,10 @@ def run_one_recovery_experiment(
                     client_last_mem=current_mem,
                     reason=detection_reason,
                 )
+                ticket_verified = ticket_info["ticket_verified"]
+                ticket_nonce = ticket_info["ticket_nonce"]
+                ticket_expired = ticket_info["ticket_expired"]
+                ticket_replay_detected = ticket_info["ticket_replay_detected"]
 
                 if ok:
                     recovered = True
@@ -234,7 +294,10 @@ def run_one_recovery_experiment(
                     seq = final_server_last_seq + 1
                     continue
                 else:
-                    recovery_reason = recovery_response.get("reason", "recovery failed")
+                    recovery_reason = ticket_info.get(
+                        "ticket_reason",
+                        recovery_response.get("reason", "recovery failed"),
+                    )
                     break
 
             packet = build_data_packet(
@@ -307,7 +370,14 @@ def run_one_recovery_experiment(
 
             recovery_requested = True
 
-            ok, recovery_response, recovery_latency_ms = request_recovery(
+            (
+                ok,
+                recovery_response,
+                recovery_latency_ms,
+                recovery_extra_messages,
+                recovery_extra_bytes,
+                ticket_info,
+            ) = request_recovery(
                 sock=sock,
                 file_obj=file_obj,
                 session_id=session_id,
@@ -315,6 +385,10 @@ def run_one_recovery_experiment(
                 client_last_mem=current_mem,
                 reason=detection_reason,
             )
+            ticket_verified = ticket_info["ticket_verified"]
+            ticket_nonce = ticket_info["ticket_nonce"]
+            ticket_expired = ticket_info["ticket_expired"]
+            ticket_replay_detected = ticket_info["ticket_replay_detected"]
 
             if ok:
                 recovered = True
@@ -327,7 +401,10 @@ def run_one_recovery_experiment(
                 seq = final_server_last_seq + 1
                 continue
             else:
-                recovery_reason = recovery_response.get("reason", "recovery failed")
+                recovery_reason = ticket_info.get(
+                    "ticket_reason",
+                    recovery_response.get("reason", "recovery failed"),
+                )
                 break
 
     except socket.timeout:
@@ -384,6 +461,8 @@ def run_one_recovery_experiment(
         "recovery_point_seq": recovery_point_seq,
 
         "recovery_latency_ms": round(recovery_latency_ms, 4),
+        "recovery_extra_messages": recovery_extra_messages,
+        "recovery_extra_bytes": recovery_extra_bytes,
         "elapsed_ms": round(elapsed * 1000, 4),
         "throughput_msg_per_s": round(throughput, 2),
 
@@ -394,6 +473,10 @@ def run_one_recovery_experiment(
         "memory_match_after_recovery": memory_match_after_recovery,
         "server_last_seq": final_server_last_seq,
         "final_seq_consistent": final_seq_consistent,
+        "ticket_verified": ticket_verified,
+        "ticket_nonce": ticket_nonce,
+        "ticket_expired": ticket_expired,
+        "ticket_replay_detected": ticket_replay_detected,
 
         "detection_reason": detection_reason,
         "recovery_reason": recovery_reason,

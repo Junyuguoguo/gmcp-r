@@ -17,6 +17,7 @@ from gmcp.config import (
 from gmcp.memory import initial_memory
 from gmcp.protocol import GMCPState, GMCPVerifier
 from gmcp.crypto_utils import verify_hmac
+from gmcp.ticket import build_memory_ticket
 
 
 state_lock = threading.Lock()
@@ -38,6 +39,13 @@ def make_state(session_id: str) -> GMCPState:
 def send_json_line(conn, response: Dict[str, Any]):
     raw = json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n"
     conn.sendall(raw)
+
+
+def enable_tcp_nodelay(conn) -> None:
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
 
 
 def verify_recovery_request(packet: Dict[str, Any]) -> bool:
@@ -74,6 +82,15 @@ def handle_recovery_request(packet, states, verifiers, stats):
             }
 
         state = states[session_id]
+        memory_ticket = build_memory_ticket(
+            session_id=session_id,
+            client_id=packet.get("client_id", CLIENT_ID),
+            epoch=EPOCH,
+            last_seq=state.last_seq,
+            last_mem=state.last_mem,
+            checkpoint_seq=state.last_seq,
+            checkpoint_mem=state.last_mem,
+        )
 
         response = {
             "ok": True,
@@ -85,6 +102,7 @@ def handle_recovery_request(packet, states, verifiers, stats):
             "server_last_mem": state.last_mem,
             "checkpoint_seq": state.last_seq,
             "checkpoint_mem": state.last_mem,
+            "memory_ticket": memory_ticket,
             "server_time": recv_time,
         }
 
@@ -92,6 +110,7 @@ def handle_recovery_request(packet, states, verifiers, stats):
 
 
 def handle_client(conn, addr, states, verifiers, stats):
+    enable_tcp_nodelay(conn)
     print(f"[REAL_TCP_SERVER] connected from {addr}", flush=True)
 
     file_obj = None
@@ -160,7 +179,7 @@ def handle_client(conn, addr, states, verifiers, stats):
                 if ok:
                     stats[session_id]["accepted"] += 1
 
-                    if state.last_seq % 100 == 0:
+                    if state.last_seq % 500 == 0:
                         print(
                             f"[REAL_TCP_SERVER] session={session_id}, "
                             f"accepted={stats[session_id]['accepted']}, "
@@ -220,6 +239,7 @@ def main():
 
     while True:
         conn, addr = sock.accept()
+        enable_tcp_nodelay(conn)
 
         t = threading.Thread(
             target=handle_client,

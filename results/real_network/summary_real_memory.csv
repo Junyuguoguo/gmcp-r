@@ -1,2 +1,2 @@
-normal_memory_match_rate,normal_memory_verified_rate,prev_mem_detection_rate,all_attack_detection_rate,seq_consistency_rate,avg_throughput,avg_rtt_ms
-1.0,1.0,1.0,1.0,1.0,21.04888888888889,240.71303333333333
+normal_memory_match_rate,normal_memory_verified_rate,prev_mem_detection_rate,all_attack_detection_rate,seq_consistency_rate,avg_throughput,avg_rtt_ms,std_throughput,min_throughput,max_throughput,std_rtt_ms,min_rtt_ms,max_rtt_ms
+1.0,1.0,1.0,1.0,1.0,24883.98611111111,0.17204999999999998,11918.033200453316,5430.36,42171.19,0.07608588220286491,0.0619,0.2905

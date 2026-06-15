@@ -1,0 +1,5 @@
+protocol,recovery_latency_ms_mean,recovery_latency_ms_std,recovery_latency_ms_min,recovery_latency_ms_max,memory_recovery_rate,attack_detection_rate,secure_memory_recovery_rate,fast_secure_memory_recovery_rate,recovery_extra_bytes_mean,throughput_score_mean,replay_count_mean
+gmcp_r,3.3533333333333335,0.4141084964930683,3.05,4.55,1.0,1.0,1.0,1.0,6592.0,0.8881666666666667,63.333333333333336
+hash_chain,30.975,34.343814730003665,3.8,89.65,1.0,0.8333333333333334,1.0,0.0,369600.0,0.7800000000000001,1155.0
+seq_mac,1.6,0.04087216219741026,1.55,1.65,0.0,0.6666666666666666,0.0,0.0,128.0,1.0,0.0
+ticket_only,3.1,0.040872162197410355,3.05,3.15,0.0,0.6666666666666666,0.0,0.0,256.0,0.95,0.0

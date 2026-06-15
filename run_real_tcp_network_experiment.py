@@ -31,7 +31,8 @@ MESSAGE_COUNTS = [100, 500, 1000]
 PAYLOAD_SIZES = [128, 512]
 WINDOW_SIZES = [1, 5, 10]
 ATTACK_TYPES = ["none", "drop", "modify", "replay", "prev_mem"]
-REPEATS = [1]
+REPEAT_COUNT = int(os.getenv("GMCP_REPEATS", "1"))
+REPEATS = list(range(1, REPEAT_COUNT + 1))
 
 SOCKET_TIMEOUT = 10.0
 
@@ -74,6 +75,26 @@ def send_json_line(sock: socket.socket, packet: Dict[str, Any]):
     sock.sendall(raw)
 
 
+def enable_tcp_nodelay(sock: socket.socket) -> None:
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
+
+def percentile(values: List[float], percent: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * percent
+    low = int(pos)
+    high = min(low + 1, len(ordered) - 1)
+    weight = pos - low
+    return ordered[low] * (1 - weight) + ordered[high] * weight
+
+
 def recv_json_line(file_obj):
     line = file_obj.readline()
     if not line:
@@ -107,6 +128,7 @@ def ping_server() -> bool:
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        enable_tcp_nodelay(sock)
         sock.settimeout(SOCKET_TIMEOUT)
         sock.connect((SERVER_TARGET_HOST, DEFAULT_PORT))
 
@@ -176,6 +198,7 @@ def run_one_real_tcp_experiment(
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        enable_tcp_nodelay(sock)
         sock.settimeout(SOCKET_TIMEOUT)
         sock.connect((SERVER_TARGET_HOST, DEFAULT_PORT))
 
@@ -324,6 +347,8 @@ def run_one_real_tcp_experiment(
     avg_rtt_ms = sum(rtts) / len(rtts) if rtts else 0
     max_rtt_ms = max(rtts) if rtts else 0
     min_rtt_ms = min(rtts) if rtts else 0
+    p50_rtt_ms = percentile(rtts, 0.50)
+    p95_rtt_ms = percentile(rtts, 0.95)
 
     recovery_success = (
         attack_type == "none"
@@ -372,6 +397,8 @@ def run_one_real_tcp_experiment(
         "avg_rtt_ms": round(avg_rtt_ms, 4),
         "min_rtt_ms": round(min_rtt_ms, 4),
         "max_rtt_ms": round(max_rtt_ms, 4),
+        "p50_rtt_ms": round(p50_rtt_ms, 4),
+        "p95_rtt_ms": round(p95_rtt_ms, 4),
         "elapsed_ms": round(elapsed * 1000, 4),
         "throughput_msg_per_s": round(throughput, 2),
 

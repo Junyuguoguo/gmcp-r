@@ -1,0 +1,19 @@
+attack_type,repeat_id,ticket_valid,ticket_verified,attack_detected,detection_reason,recovery_allowed,ticket_nonce,ticket_expired,ticket_replay_detected
+valid_ticket,1,True,True,False,ok,True,b4078d15cacd841024c69f6c9985fdf8,False,False
+valid_ticket,2,True,True,False,ok,True,a2a043a71903df44e6f34f86ab98a149,False,False
+valid_ticket,3,True,True,False,ok,True,6ae209a07051e103fafdb3dc9cf7eb6e,False,False
+expired_ticket,1,False,False,True,ticket expired,False,312ccaddf0f4856a18437d32ab0aa26d,True,False
+expired_ticket,2,False,False,True,ticket expired,False,e0ee30c7c1dcea09d2ee1c7df36ba9c5,True,False
+expired_ticket,3,False,False,True,ticket expired,False,4e452bcc2609bbe469e12c790d1a4471,True,False
+replayed_ticket,1,False,False,True,ticket replay detected,False,59fcc52f0f0e5549c45ee2088d726881,False,True
+replayed_ticket,2,False,False,True,ticket replay detected,False,318214c7836cc90266c3fef6cf3a6a2a,False,True
+replayed_ticket,3,False,False,True,ticket replay detected,False,8f7b5c0d002d698b7e8ab72c30267fbd,False,True
+tampered_ticket,1,False,False,True,invalid ticket auth tag,False,865ab26e921d01b8a86074b7257ebad2,False,False
+tampered_ticket,2,False,False,True,invalid ticket auth tag,False,1d37d717289a59298e00d50279495cbd,False,False
+tampered_ticket,3,False,False,True,invalid ticket auth tag,False,be8f37a56218c06515f6a93909cc19af,False,False
+wrong_session_ticket,1,False,False,True,session_id mismatch,False,91269d1169da22d06919c539fe8729e1,False,False
+wrong_session_ticket,2,False,False,True,session_id mismatch,False,a4462c9f993d50feac219439075b4fc9,False,False
+wrong_session_ticket,3,False,False,True,session_id mismatch,False,0fac860cc388e390a5f5e91471b00b13,False,False
+rollback_ticket,1,False,False,True,rollback detected: ticket last_seq is older than required,False,f49ba37b6e7fe34771a3b1e651090b7b,False,False
+rollback_ticket,2,False,False,True,rollback detected: ticket last_seq is older than required,False,6132d2a7ac131a37e8591699626e6545,False,False
+rollback_ticket,3,False,False,True,rollback detected: ticket last_seq is older than required,False,0a74c3d125290c4dccc7c6fedb087121,False,False

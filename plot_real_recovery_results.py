@@ -47,6 +47,10 @@ def main():
         "final_seq_consistent",
     ]:
         df[col + "_bool"] = df[col].astype(str).str.lower() == "true"
+    if "recovery_extra_messages" not in df.columns:
+        df["recovery_extra_messages"] = 0
+    if "recovery_extra_bytes" not in df.columns:
+        df["recovery_extra_bytes"] = 0
 
     fig1 = df.groupby("attack_type")["full_recovery_success_bool"].mean()
     save_bar(
@@ -93,12 +97,23 @@ def main():
         os.path.join(OUTPUT_DIR, "recovery_fig5_final_seq_consistency.png"),
     )
 
+    fig6 = df.groupby("attack_type")["recovery_extra_bytes"].mean()
+    save_bar(
+        fig6,
+        "Attack type",
+        "Recovery extra bytes",
+        "Recovery Overhead by Attack Type",
+        os.path.join(OUTPUT_DIR, "recovery_fig6_recovery_overhead_by_attack.png"),
+    )
+
     summary = df.groupby("attack_type").agg(
         attack_detection_rate=("attack_detected_bool", "mean"),
         recovery_success_rate=("full_recovery_success_bool", "mean"),
         memory_match_after_recovery=("memory_match_after_recovery_bool", "mean"),
         final_seq_consistency=("final_seq_consistent_bool", "mean"),
         recovery_latency_ms=("recovery_latency_ms", "mean"),
+        recovery_extra_messages=("recovery_extra_messages", "mean"),
+        recovery_extra_bytes=("recovery_extra_bytes", "mean"),
         post_recovery_accepted=("post_recovery_accepted", "mean"),
     )
 

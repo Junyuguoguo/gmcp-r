@@ -45,6 +45,15 @@ def save_line(table, xlabel, ylabel, title, output_path):
     plt.close()
 
 
+def flatten_columns(columns):
+    return [
+        "_".join([str(part) for part in col if str(part)])
+        if isinstance(col, tuple)
+        else str(col)
+        for col in columns
+    ]
+
+
 def main():
     ensure_output_dir()
     clean_old_figures()
@@ -55,17 +64,21 @@ def main():
     df["attack_detected_bool"] = df["attack_detected"].astype(str).str.lower() == "true"
     df["recovery_success_bool"] = df["recovery_success"].astype(str).str.lower() == "true"
     df["server_reachable_bool"] = df["server_reachable"].astype(str).str.lower() == "true"
+    if "p50_rtt_ms" not in df.columns:
+        df["p50_rtt_ms"] = df["avg_rtt_ms"]
+    if "p95_rtt_ms" not in df.columns:
+        df["p95_rtt_ms"] = df["max_rtt_ms"]
 
     normal_df = df[df["attack_type"] == "none"]
     attack_df = df[df["attack_type"] != "none"]
 
-    # 图 1：不同消息规模下真实网络平均 RTT
+    # avg_rtt_ms is Application-level RTT measured by DATA request/response.
     fig1 = normal_df.groupby("message_count")["avg_rtt_ms"].mean()
     save_bar(
         fig1,
         "Message count",
-        "Average RTT (ms)",
-        "Real Network Average RTT by Message Count",
+        "Application RTT (ms)",
+        "Real Network Application-level RTT by Message Count",
         os.path.join(OUTPUT_DIR, "real_fig1_avg_rtt_by_message_count.png"),
         rotation=0,
     )
@@ -128,11 +141,19 @@ def main():
     )
 
     summary = df.groupby("attack_type").agg(
-        avg_rtt_ms=("avg_rtt_ms", "mean"),
-        throughput_msg_per_s=("throughput_msg_per_s", "mean"),
-        accepted_count=("accepted_count", "mean"),
-        rejected_count=("rejected_count", "mean"),
-        timeout_count=("timeout_count", "mean"),
+        avg_rtt_ms_mean=("avg_rtt_ms", "mean"),
+        avg_rtt_ms_std=("avg_rtt_ms", "std"),
+        avg_rtt_ms_min=("avg_rtt_ms", "min"),
+        avg_rtt_ms_max=("avg_rtt_ms", "max"),
+        p50_rtt_ms_mean=("p50_rtt_ms", "mean"),
+        p95_rtt_ms_mean=("p95_rtt_ms", "mean"),
+        throughput_msg_per_s_mean=("throughput_msg_per_s", "mean"),
+        throughput_msg_per_s_std=("throughput_msg_per_s", "std"),
+        throughput_msg_per_s_min=("throughput_msg_per_s", "min"),
+        throughput_msg_per_s_max=("throughput_msg_per_s", "max"),
+        accepted_count_mean=("accepted_count", "mean"),
+        rejected_count_mean=("rejected_count", "mean"),
+        timeout_count_mean=("timeout_count", "mean"),
         detection_rate=("attack_detected_bool", "mean"),
     )
 

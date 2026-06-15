@@ -44,6 +44,38 @@ def save_line(table, xlabel, ylabel, title, output_path):
     plt.close()
 
 
+def save_window_tradeoff(table, output_path):
+    plt.figure(figsize=(8, 5))
+    ax1 = plt.gca()
+    ax1.plot(
+        table.index,
+        table["throughput_msg_per_s"],
+        marker="o",
+        color="tab:blue",
+        label="Throughput",
+    )
+    ax1.set_xlabel("Window size")
+    ax1.set_ylabel("Throughput (msg/s)", color="tab:blue")
+    ax1.tick_params(axis="y", labelcolor="tab:blue")
+    ax1.grid(True, linestyle="--", alpha=0.4)
+
+    ax2 = ax1.twinx()
+    ax2.plot(
+        table.index,
+        table["avg_rtt_ms"],
+        marker="s",
+        color="tab:red",
+        label="Application-level RTT",
+    )
+    ax2.set_ylabel("Application RTT (ms)", color="tab:red")
+    ax2.tick_params(axis="y", labelcolor="tab:red")
+
+    plt.title("Sliding Window Latency-Throughput Tradeoff")
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
 def main():
     ensure_output_dir()
     clean_old_figures()
@@ -108,8 +140,8 @@ def main():
     save_bar(
         fig5,
         "Window size",
-        "Average RTT (ms)",
-        "Average RTT under Different Sliding Window Sizes",
+        "Application RTT (ms)",
+        "Application-level RTT under Different Sliding Window Sizes",
         os.path.join(OUTPUT_DIR, "memory_fig5_window_rtt.png"),
         rotation=0,
     )
@@ -147,6 +179,15 @@ def main():
         rotation=45,
     )
 
+    tradeoff = normal_df.groupby("window_size").agg(
+        throughput_msg_per_s=("throughput_msg_per_s", "mean"),
+        avg_rtt_ms=("avg_rtt_ms", "mean"),
+    )
+    save_window_tradeoff(
+        tradeoff,
+        os.path.join(OUTPUT_DIR, "memory_fig9_window_latency_throughput_tradeoff.png"),
+    )
+
     summary = {
         "normal_memory_match_rate": normal_df["memory_match_bool"].mean(),
         "normal_memory_verified_rate": normal_df["memory_verified_bool"].mean(),
@@ -155,6 +196,12 @@ def main():
         "seq_consistency_rate": normal_df["seq_consistent_bool"].mean(),
         "avg_throughput": normal_df["throughput_msg_per_s"].mean(),
         "avg_rtt_ms": normal_df["avg_rtt_ms"].mean(),
+        "std_throughput": normal_df["throughput_msg_per_s"].std(),
+        "min_throughput": normal_df["throughput_msg_per_s"].min(),
+        "max_throughput": normal_df["throughput_msg_per_s"].max(),
+        "std_rtt_ms": normal_df["avg_rtt_ms"].std(),
+        "min_rtt_ms": normal_df["avg_rtt_ms"].min(),
+        "max_rtt_ms": normal_df["avg_rtt_ms"].max(),
     }
 
     pd.DataFrame([summary]).to_csv(

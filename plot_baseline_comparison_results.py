@@ -1,26 +1,35 @@
 # -*- coding: utf-8 -*-
 # plot_baseline_comparison_results.py
+#
+# Figures are based on protocol-level simulation output from
+# run_baseline_comparison_experiment.py.
 
-import os
 import glob
-import pandas as pd
+import os
+
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 INPUT_CSV = "results/baseline/baseline_comparison_results.csv"
 OUTPUT_DIR = "results/baseline/figures"
+SUMMARY_CSV = "results/baseline/summary_baseline_comparison.csv"
 
 
-def ensure_output_dir():
+def ensure_output_dir() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def clean_old_figures():
+def clean_old_figures() -> None:
     for path in glob.glob(os.path.join(OUTPUT_DIR, "*.png")):
         os.remove(path)
 
 
-def save_bar(series, xlabel, ylabel, title, output_path, rotation=45):
+def bool_series(series):
+    return series.astype(str).str.lower() == "true"
+
+
+def save_bar(series, xlabel, ylabel, title, output_path, rotation=45) -> None:
     plt.figure(figsize=(8, 5))
     series.plot(kind="bar")
     plt.xlabel(xlabel)
@@ -32,7 +41,7 @@ def save_bar(series, xlabel, ylabel, title, output_path, rotation=45):
     plt.close()
 
 
-def save_line(table, xlabel, ylabel, title, output_path):
+def save_line(table, xlabel, ylabel, title, output_path) -> None:
     plt.figure(figsize=(8, 5))
     table.plot(kind="line", marker="o")
     plt.xlabel(xlabel)
@@ -44,12 +53,11 @@ def save_line(table, xlabel, ylabel, title, output_path):
     plt.close()
 
 
-def main():
+def main() -> None:
     ensure_output_dir()
     clean_old_figures()
 
     df = pd.read_csv(INPUT_CSV)
-
     for col in [
         "memory_supported",
         "memory_recovered",
@@ -57,97 +65,109 @@ def main():
         "attack_detected",
         "normal_recovery_success",
         "secure_memory_recovery_success",
+        "fast_secure_memory_recovery_success",
     ]:
-        df[col + "_bool"] = df[col].astype(str).str.lower() == "true"
+        df[col + "_bool"] = bool_series(df[col])
 
-    detection_df = df[df["detection_result"] != "not_applicable"]
-
-    fig1 = df.groupby("protocol")["recovery_latency_ms"].mean()
     save_bar(
-        fig1,
+        df.groupby("protocol")["recovery_latency_ms"].mean(),
         "Protocol",
         "Recovery latency (ms)",
-        "Baseline Recovery Latency by Protocol",
-        os.path.join(OUTPUT_DIR, "baseline_fig1_recovery_latency.png"),
+        "Protocol-level Simulation Recovery Latency by Protocol",
+        os.path.join(OUTPUT_DIR, "baseline_fig1_recovery_latency_by_protocol.png"),
     )
 
-    fig2 = df.groupby("protocol")["memory_recovered_bool"].mean()
     save_bar(
-        fig2,
+        df.groupby("protocol")["memory_recovered_bool"].mean(),
         "Protocol",
         "Memory recovery rate",
-        "Memory Recovery Capability by Protocol",
-        os.path.join(OUTPUT_DIR, "baseline_fig2_memory_recovery_rate.png"),
+        "Protocol-level Simulation Memory Recovery Rate by Protocol",
+        os.path.join(OUTPUT_DIR, "baseline_fig2_memory_recovery_rate_by_protocol.png"),
     )
 
-    fig3 = detection_df.groupby("protocol")["attack_detected_bool"].mean()
     save_bar(
-        fig3,
+        df.groupby("protocol")["attack_detected_bool"].mean(),
         "Protocol",
-        "Detection rate",
-        "Attack Detection Rate by Protocol",
-        os.path.join(OUTPUT_DIR, "baseline_fig3_attack_detection_rate.png"),
+        "Attack detection rate",
+        "Protocol-level Simulation Attack Detection Rate by Protocol",
+        os.path.join(OUTPUT_DIR, "baseline_fig3_attack_detection_rate_by_protocol.png"),
     )
 
-    fig4 = df.groupby("protocol")["secure_memory_recovery_success_bool"].mean()
     save_bar(
-        fig4,
+        df.groupby("protocol")["secure_memory_recovery_success_bool"].mean(),
         "Protocol",
         "Secure memory recovery rate",
-        "Secure Memory Recovery Success by Protocol",
-        os.path.join(OUTPUT_DIR, "baseline_fig4_secure_memory_recovery.png"),
+        "Protocol-level Simulation Secure Memory Recovery by Protocol",
+        os.path.join(OUTPUT_DIR, "baseline_fig4_secure_memory_recovery_success_by_protocol.png"),
     )
 
-    fig5 = df.groupby("protocol")["recovery_extra_bytes"].mean()
     save_bar(
-        fig5,
+        df.groupby("protocol")["recovery_extra_bytes"].mean(),
         "Protocol",
         "Extra bytes",
-        "Recovery Extra Communication Overhead by Protocol",
-        os.path.join(OUTPUT_DIR, "baseline_fig5_recovery_overhead.png"),
+        "Protocol-level Simulation Recovery Extra Bytes by Protocol",
+        os.path.join(OUTPUT_DIR, "baseline_fig5_recovery_extra_bytes_by_protocol.png"),
     )
 
-    fig6 = df.groupby("protocol")["throughput_score"].mean()
     save_bar(
-        fig6,
+        df.groupby("protocol")["throughput_score"].mean(),
         "Protocol",
         "Relative throughput score",
-        "Relative Throughput Score by Protocol",
-        os.path.join(OUTPUT_DIR, "baseline_fig6_throughput_score.png"),
+        "Protocol-level Simulation Throughput Score by Protocol",
+        os.path.join(OUTPUT_DIR, "baseline_fig6_throughput_score_by_protocol.png"),
     )
 
-    gmcp_hash = df[df["protocol"].isin(["hash_chain", "gmcp_r"])]
-    fig7 = gmcp_hash.pivot_table(
+    checkpoint_table = df[df["protocol"].isin(["hash_chain", "gmcp_r"])].pivot_table(
         index="checkpoint_interval",
         columns="protocol",
         values="recovery_latency_ms",
         aggfunc="mean",
     )
     save_line(
-        fig7,
+        checkpoint_table,
         "Checkpoint interval",
         "Recovery latency (ms)",
-        "Checkpoint Interval Impact on Recovery Latency",
-        os.path.join(OUTPUT_DIR, "baseline_fig7_checkpoint_latency.png"),
+        "Protocol-level Simulation Checkpoint Interval Impact on Latency",
+        os.path.join(OUTPUT_DIR, "baseline_fig7_checkpoint_interval_latency.png"),
+    )
+
+    prev_mem = df[df["attack_type"] == "prev_mem"].groupby("protocol")["attack_detected_bool"].mean()
+    save_bar(
+        prev_mem,
+        "Protocol",
+        "prev_mem detection rate",
+        "Protocol-level Simulation prev_mem Detection by Protocol",
+        os.path.join(OUTPUT_DIR, "baseline_fig8_prev_mem_detection_by_protocol.png"),
+    )
+
+    rollback = df[df["attack_type"] == "rollback_ticket"].groupby("protocol")[
+        "attack_detected_bool"
+    ].mean()
+    save_bar(
+        rollback,
+        "Protocol",
+        "Rollback ticket detection rate",
+        "Protocol-level Simulation Rollback Ticket Detection by Protocol",
+        os.path.join(OUTPUT_DIR, "baseline_fig9_rollback_ticket_detection_by_protocol.png"),
     )
 
     summary = df.groupby("protocol").agg(
-        recovery_latency_ms=("recovery_latency_ms", "mean"),
+        recovery_latency_ms_mean=("recovery_latency_ms", "mean"),
+        recovery_latency_ms_std=("recovery_latency_ms", "std"),
+        recovery_latency_ms_min=("recovery_latency_ms", "min"),
+        recovery_latency_ms_max=("recovery_latency_ms", "max"),
         memory_recovery_rate=("memory_recovered_bool", "mean"),
+        attack_detection_rate=("attack_detected_bool", "mean"),
         secure_memory_recovery_rate=("secure_memory_recovery_success_bool", "mean"),
-        recovery_extra_bytes=("recovery_extra_bytes", "mean"),
-        throughput_score=("throughput_score", "mean"),
+        fast_secure_memory_recovery_rate=("fast_secure_memory_recovery_success_bool", "mean"),
+        recovery_extra_bytes_mean=("recovery_extra_bytes", "mean"),
+        throughput_score_mean=("throughput_score", "mean"),
+        replay_count_mean=("replay_count", "mean"),
     )
-
-    detection_summary = detection_df.groupby("protocol").agg(
-        attack_detection_rate=("attack_detected_bool", "mean")
-    )
-
-    summary = summary.join(detection_summary, how="left")
-    summary.to_csv("results/baseline/summary_baseline_comparison.csv", encoding="utf-8")
+    summary.to_csv(SUMMARY_CSV, encoding="utf-8")
 
     print("[BASELINE_PLOT] figures saved to", OUTPUT_DIR)
-    print("[BASELINE_PLOT] summary saved to results/baseline/summary_baseline_comparison.csv")
+    print("[BASELINE_PLOT] summary saved to", SUMMARY_CSV)
 
 
 if __name__ == "__main__":
