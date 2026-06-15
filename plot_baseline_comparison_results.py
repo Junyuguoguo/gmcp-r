@@ -7,8 +7,9 @@
 import glob
 import os
 
-import matplotlib.pyplot as plt
 import pandas as pd
+
+from gmcp.plot_style import save_bar_chart, save_line_chart
 
 
 INPUT_CSV = "results/baseline/baseline_comparison_results.csv"
@@ -30,27 +31,11 @@ def bool_series(series):
 
 
 def save_bar(series, xlabel, ylabel, title, output_path, rotation=45) -> None:
-    plt.figure(figsize=(8, 5))
-    series.plot(kind="bar")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.xticks(rotation=rotation)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    save_bar_chart(series, xlabel, ylabel, title, output_path, rotation=rotation)
 
 
 def save_line(table, xlabel, ylabel, title, output_path) -> None:
-    plt.figure(figsize=(8, 5))
-    table.plot(kind="line", marker="o")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    save_line_chart(table, xlabel, ylabel, title, output_path)
 
 
 def main() -> None:
@@ -71,49 +56,49 @@ def main() -> None:
 
     save_bar(
         df.groupby("protocol")["recovery_latency_ms"].mean(),
-        "Protocol",
-        "Recovery latency (ms)",
-        "Protocol-level Simulation Recovery Latency by Protocol",
+        "协议类型",
+        "恢复时延（ms）",
+        "协议级模拟：不同协议的恢复时延",
         os.path.join(OUTPUT_DIR, "baseline_fig1_recovery_latency_by_protocol.png"),
     )
 
     save_bar(
         df.groupby("protocol")["memory_recovered_bool"].mean(),
-        "Protocol",
-        "Memory recovery rate",
-        "Protocol-level Simulation Memory Recovery Rate by Protocol",
+        "协议类型",
+        "记忆恢复率",
+        "协议级模拟：不同协议的记忆恢复能力",
         os.path.join(OUTPUT_DIR, "baseline_fig2_memory_recovery_rate_by_protocol.png"),
     )
 
     save_bar(
         df.groupby("protocol")["attack_detected_bool"].mean(),
-        "Protocol",
-        "Attack detection rate",
-        "Protocol-level Simulation Attack Detection Rate by Protocol",
+        "协议类型",
+        "攻击检测率",
+        "协议级模拟：不同协议的攻击检测能力",
         os.path.join(OUTPUT_DIR, "baseline_fig3_attack_detection_rate_by_protocol.png"),
     )
 
     save_bar(
         df.groupby("protocol")["secure_memory_recovery_success_bool"].mean(),
-        "Protocol",
-        "Secure memory recovery rate",
-        "Protocol-level Simulation Secure Memory Recovery by Protocol",
+        "协议类型",
+        "安全记忆恢复率",
+        "协议级模拟：安全记忆恢复成功率",
         os.path.join(OUTPUT_DIR, "baseline_fig4_secure_memory_recovery_success_by_protocol.png"),
     )
 
     save_bar(
         df.groupby("protocol")["recovery_extra_bytes"].mean(),
-        "Protocol",
-        "Extra bytes",
-        "Protocol-level Simulation Recovery Extra Bytes by Protocol",
+        "协议类型",
+        "额外通信开销（字节）",
+        "协议级模拟：恢复阶段额外通信开销",
         os.path.join(OUTPUT_DIR, "baseline_fig5_recovery_extra_bytes_by_protocol.png"),
     )
 
     save_bar(
         df.groupby("protocol")["throughput_score"].mean(),
-        "Protocol",
-        "Relative throughput score",
-        "Protocol-level Simulation Throughput Score by Protocol",
+        "协议类型",
+        "相对吞吐评分",
+        "协议级模拟：不同协议的相对吞吐表现",
         os.path.join(OUTPUT_DIR, "baseline_fig6_throughput_score_by_protocol.png"),
     )
 
@@ -125,18 +110,18 @@ def main() -> None:
     )
     save_line(
         checkpoint_table,
-        "Checkpoint interval",
-        "Recovery latency (ms)",
-        "Protocol-level Simulation Checkpoint Interval Impact on Latency",
+        "检查点间隔",
+        "恢复时延（ms）",
+        "协议级模拟：检查点间隔对恢复时延的影响",
         os.path.join(OUTPUT_DIR, "baseline_fig7_checkpoint_interval_latency.png"),
     )
 
     prev_mem = df[df["attack_type"] == "prev_mem"].groupby("protocol")["attack_detected_bool"].mean()
     save_bar(
         prev_mem,
-        "Protocol",
-        "prev_mem detection rate",
-        "Protocol-level Simulation prev_mem Detection by Protocol",
+        "协议类型",
+        "记忆断裂检测率",
+        "协议级模拟：记忆断裂攻击检测率",
         os.path.join(OUTPUT_DIR, "baseline_fig8_prev_mem_detection_by_protocol.png"),
     )
 
@@ -145,9 +130,9 @@ def main() -> None:
     ].mean()
     save_bar(
         rollback,
-        "Protocol",
-        "Rollback ticket detection rate",
-        "Protocol-level Simulation Rollback Ticket Detection by Protocol",
+        "协议类型",
+        "票据回滚检测率",
+        "协议级模拟：票据回滚攻击检测率",
         os.path.join(OUTPUT_DIR, "baseline_fig9_rollback_ticket_detection_by_protocol.png"),
     )
 

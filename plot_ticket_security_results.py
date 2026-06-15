@@ -4,8 +4,9 @@
 import glob
 import os
 
-import matplotlib.pyplot as plt
 import pandas as pd
+
+from gmcp.plot_style import save_bar_chart
 
 
 INPUT_CSV = "results/ticket_security/ticket_security_results.csv"
@@ -27,15 +28,7 @@ def bool_series(series):
 
 
 def save_bar(series, xlabel, ylabel, title, output_path, rotation=45) -> None:
-    plt.figure(figsize=(8, 5))
-    series.plot(kind="bar")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.xticks(rotation=rotation)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    save_bar_chart(series, xlabel, ylabel, title, output_path, rotation=rotation)
 
 
 def main() -> None:
@@ -49,18 +42,18 @@ def main() -> None:
     detection = df.groupby("attack_type")["attack_detected_bool"].mean()
     save_bar(
         detection,
-        "Ticket type",
-        "Attack detection rate",
-        "MemoryTicket Attack Detection Rate",
+        "票据类型",
+        "攻击检测率",
+        "MemoryTicket 安全实验：票据攻击检测率",
         os.path.join(OUTPUT_DIR, "ticket_fig1_ticket_attack_detection_rate.png"),
     )
 
     allowed = df.groupby("attack_type")["recovery_allowed_bool"].mean()
     save_bar(
         allowed,
-        "Ticket type",
-        "Recovery allowed rate",
-        "Recovery Allowed by MemoryTicket Type",
+        "票据类型",
+        "允许恢复比例",
+        "MemoryTicket 安全实验：不同票据类型的恢复授权结果",
         os.path.join(OUTPUT_DIR, "ticket_fig2_recovery_allowed_by_ticket_type.png"),
     )
 

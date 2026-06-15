@@ -4,7 +4,8 @@
 import os
 import glob
 import pandas as pd
-import matplotlib.pyplot as plt
+
+from gmcp.plot_style import save_bar_chart, save_line_chart
 
 
 def ensure_output_dir(output_dir: str):
@@ -17,39 +18,15 @@ def clean_old_figures(output_dir: str):
 
 
 def save_bar(series, xlabel, ylabel, title, output_path, rotation=45):
-    plt.figure(figsize=(8, 5))
-    series.plot(kind="bar")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.xticks(rotation=rotation)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    save_bar_chart(series, xlabel, ylabel, title, output_path, rotation=rotation)
 
 
 def save_line_table(table, xlabel, ylabel, title, output_path):
-    plt.figure(figsize=(8, 5))
-    table.plot(kind="line", marker="o")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    save_line_chart(table, xlabel, ylabel, title, output_path)
 
 
 def save_grouped_bar(table, xlabel, ylabel, title, output_path, rotation=45):
-    plt.figure(figsize=(9, 5))
-    table.plot(kind="bar")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.xticks(rotation=rotation)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    save_line_chart(table, xlabel, ylabel, title, output_path, figsize=(9, 5))
 
 
 def bool_mean(series):
@@ -94,9 +71,9 @@ def main():
     fig1 = normal_df.groupby("protocol")["recovery_latency_ms"].mean()
     save_bar(
         fig1,
-        "Protocol",
-        "Recovery latency (ms)",
-        "Fig.1 Average Recovery Latency by Protocol",
+        "协议类型",
+        "恢复时延（ms）",
+        "图1 不同协议的平均恢复时延",
         os.path.join(output_dir, "fig1_recovery_latency_by_protocol.png"),
     )
 
@@ -105,9 +82,9 @@ def main():
     fig2 = gmcp_normal.groupby("checkpoint_interval")["recovery_latency_ms"].mean()
     save_bar(
         fig2,
-        "Checkpoint interval",
-        "Recovery latency (ms)",
-        "Fig.2 GMCP-R Recovery Latency under Different Checkpoint Intervals",
+        "检查点间隔",
+        "恢复时延（ms）",
+        "图2 GMCP-R 在不同检查点间隔下的恢复时延",
         os.path.join(output_dir, "fig2_checkpoint_interval_latency.png"),
         rotation=0,
     )
@@ -118,9 +95,9 @@ def main():
     )
     save_bar(
         fig3,
-        "Protocol",
-        "Detection rate",
-        "Fig.3 Attack Detection Rate by Protocol",
+        "协议类型",
+        "检测率",
+        "图3 不同协议的攻击检测率",
         os.path.join(output_dir, "fig3_detection_rate_by_protocol.png"),
     )
 
@@ -131,9 +108,9 @@ def main():
     )
     save_bar(
         fig4,
-        "Attack type",
-        "Detection rate",
-        "Fig.4 GMCP-R Detection Rate by Attack Type",
+        "攻击类型",
+        "检测率",
+        "图4 GMCP-R 对不同攻击类型的检测率",
         os.path.join(output_dir, "fig4_gmcp_detection_rate_by_attack.png"),
     )
 
@@ -141,9 +118,9 @@ def main():
     fig5 = formal_df.groupby("protocol")["extra_bytes"].mean()
     save_bar(
         fig5,
-        "Protocol",
-        "Extra bytes",
-        "Fig.5 Average Extra Communication Overhead by Protocol",
+        "协议类型",
+        "额外通信开销（字节）",
+        "图5 不同协议的平均额外通信开销",
         os.path.join(output_dir, "fig5_extra_bytes_by_protocol.png"),
     )
 
@@ -151,9 +128,9 @@ def main():
     fig6 = normal_df.groupby("protocol")["throughput_msg_per_s"].mean()
     save_bar(
         fig6,
-        "Protocol",
-        "Throughput (msg/s)",
-        "Fig.6 Average Throughput by Protocol",
+        "协议类型",
+        "吞吐量（条/秒）",
+        "图6 不同协议的平均吞吐量",
         os.path.join(output_dir, "fig6_throughput_by_protocol.png"),
     )
 
@@ -161,9 +138,9 @@ def main():
     fig7 = formal_df.groupby("protocol")["memory_recovered_bool"].mean()
     save_bar(
         fig7,
-        "Protocol",
-        "Memory recovery rate",
-        "Fig.7 Memory State Recovery Capability by Protocol",
+        "协议类型",
+        "记忆恢复率",
+        "图7 不同协议的记忆状态恢复能力",
         os.path.join(output_dir, "fig7_memory_recovery_rate_by_protocol.png"),
     )
 
@@ -177,9 +154,9 @@ def main():
         )
         save_line_table(
             fig8,
-            "Loss rate",
-            "Recovery success rate",
-            "Fig.8 Recovery Success Rate under Different Loss Rates",
+            "丢包率",
+            "恢复成功率",
+            "图8 不同丢包率下的恢复成功率",
             os.path.join(output_dir, "fig8_loss_rate_recovery_success.png"),
         )
 
@@ -187,9 +164,9 @@ def main():
     fig9 = gmcp_normal.groupby("checkpoint_interval")["recovery_replay_count"].mean()
     save_bar(
         fig9,
-        "Checkpoint interval",
-        "Replay count",
-        "Fig.9 GMCP-R Replay Count under Different Checkpoint Intervals",
+        "检查点间隔",
+        "回放消息数量",
+        "图9 GMCP-R 在不同检查点间隔下的回放数量",
         os.path.join(output_dir, "fig9_checkpoint_interval_replay_count.png"),
         rotation=0,
     )

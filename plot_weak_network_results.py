@@ -6,8 +6,9 @@
 import glob
 import os
 
-import matplotlib.pyplot as plt
 import pandas as pd
+
+from gmcp.plot_style import save_line_chart
 
 
 INPUT_CSV = "results/weak_network/weak_network_results.csv"
@@ -25,15 +26,7 @@ def clean_old_figures() -> None:
 
 
 def save_line(table, xlabel, ylabel, title, output_path) -> None:
-    plt.figure(figsize=(8, 5))
-    table.plot(kind="line", marker="o")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    save_line_chart(table, xlabel, ylabel, title, output_path)
 
 
 def main() -> None:
@@ -50,9 +43,9 @@ def main() -> None:
     )
     save_line(
         loss_success,
-        "Loss rate",
-        "Recovery success rate",
-        "Controlled Weak-Network Simulation Recovery Success under Loss",
+        "丢包率",
+        "恢复成功率",
+        "弱网模拟：不同丢包率下的恢复成功率",
         os.path.join(OUTPUT_DIR, "weak_fig1_loss_rate_recovery_success.png"),
     )
 
@@ -64,9 +57,9 @@ def main() -> None:
     )
     save_line(
         loss_memory,
-        "Loss rate",
-        "Memory match rate",
-        "Controlled Weak-Network Simulation Memory Match under Loss",
+        "丢包率",
+        "记忆一致率",
+        "弱网模拟：不同丢包率下的记忆一致性",
         os.path.join(OUTPUT_DIR, "weak_fig2_loss_rate_memory_match.png"),
     )
 
@@ -78,9 +71,9 @@ def main() -> None:
     )
     save_line(
         delay_latency,
-        "Delay (ms)",
-        "Average recovery latency (ms)",
-        "Controlled Weak-Network Simulation Recovery Latency under Delay",
+        "网络时延（ms）",
+        "平均恢复时延（ms）",
+        "弱网模拟：网络时延对恢复时延的影响",
         os.path.join(OUTPUT_DIR, "weak_fig3_delay_recovery_latency.png"),
     )
 
@@ -92,9 +85,9 @@ def main() -> None:
     )
     save_line(
         reorder_detection,
-        "Reorder rate",
-        "Attack detection rate",
-        "Controlled Weak-Network Simulation Detection under Reordering",
+        "乱序率",
+        "攻击检测率",
+        "弱网模拟：乱序条件下的攻击检测率",
         os.path.join(OUTPUT_DIR, "weak_fig4_reorder_attack_detection.png"),
     )
 
@@ -106,9 +99,9 @@ def main() -> None:
     )
     save_line(
         extra_bytes,
-        "Loss rate",
-        "Extra bytes",
-        "Controlled Weak-Network Simulation Extra Bytes under Loss",
+        "丢包率",
+        "额外通信开销（字节）",
+        "弱网模拟：丢包条件下的额外通信开销",
         os.path.join(OUTPUT_DIR, "weak_fig5_extra_bytes_under_loss.png"),
     )
 
@@ -120,9 +113,9 @@ def main() -> None:
     )
     save_line(
         throughput,
-        "Loss rate",
-        "Relative throughput score",
-        "Controlled Weak-Network Simulation Throughput under Weak Network",
+        "丢包率",
+        "相对吞吐评分",
+        "弱网模拟：不同丢包率下的吞吐表现",
         os.path.join(OUTPUT_DIR, "weak_fig6_throughput_under_weak_network.png"),
     )
 

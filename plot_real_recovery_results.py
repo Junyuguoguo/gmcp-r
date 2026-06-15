@@ -4,7 +4,8 @@
 import os
 import glob
 import pandas as pd
-import matplotlib.pyplot as plt
+
+from gmcp.plot_style import save_bar_chart
 
 
 INPUT_CSV = "results/real_recovery/real_recovery_results.csv"
@@ -21,15 +22,7 @@ def clean_old_figures():
 
 
 def save_bar(series, xlabel, ylabel, title, output_path, rotation=45):
-    plt.figure(figsize=(8, 5))
-    series.plot(kind="bar")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.xticks(rotation=rotation)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    save_bar_chart(series, xlabel, ylabel, title, output_path, rotation=rotation)
 
 
 def main():
@@ -55,54 +48,54 @@ def main():
     fig1 = df.groupby("attack_type")["full_recovery_success_bool"].mean()
     save_bar(
         fig1,
-        "Attack type",
-        "Success rate",
-        "Recovery Success Rate after Attack",
+        "攻击类型",
+        "恢复成功率",
+        "真实恢复实验：攻击后恢复成功率",
         os.path.join(OUTPUT_DIR, "recovery_fig1_success_rate_by_attack.png"),
     )
 
     fig2 = df.groupby("attack_type")["recovery_latency_ms"].mean()
     save_bar(
         fig2,
-        "Attack type",
-        "Recovery latency (ms)",
-        "Recovery Latency by Attack Type",
+        "攻击类型",
+        "恢复时延（ms）",
+        "真实恢复实验：不同攻击类型下的恢复时延",
         os.path.join(OUTPUT_DIR, "recovery_fig2_latency_by_attack.png"),
     )
 
     fig3 = df.groupby("attack_type")["memory_match_after_recovery_bool"].mean()
     save_bar(
         fig3,
-        "Attack type",
-        "Memory match rate",
-        "Memory Match Rate after Recovery",
+        "攻击类型",
+        "恢复后记忆一致率",
+        "真实恢复实验：恢复后记忆状态一致性",
         os.path.join(OUTPUT_DIR, "recovery_fig3_memory_match_after_recovery.png"),
     )
 
     fig4 = df.groupby("attack_type")["post_recovery_accepted"].mean()
     save_bar(
         fig4,
-        "Attack type",
-        "Accepted messages",
-        "Post-Recovery Accepted Messages by Attack Type",
+        "攻击类型",
+        "恢复后接受消息数",
+        "真实恢复实验：恢复后继续接受的消息数量",
         os.path.join(OUTPUT_DIR, "recovery_fig4_post_recovery_accepted.png"),
     )
 
     fig5 = df.groupby("attack_type")["final_seq_consistent_bool"].mean()
     save_bar(
         fig5,
-        "Attack type",
-        "Final seq consistency rate",
-        "Final Sequence Consistency after Recovery",
+        "攻击类型",
+        "最终序号一致率",
+        "真实恢复实验：恢复后的最终序号一致性",
         os.path.join(OUTPUT_DIR, "recovery_fig5_final_seq_consistency.png"),
     )
 
     fig6 = df.groupby("attack_type")["recovery_extra_bytes"].mean()
     save_bar(
         fig6,
-        "Attack type",
-        "Recovery extra bytes",
-        "Recovery Overhead by Attack Type",
+        "攻击类型",
+        "恢复额外开销（字节）",
+        "真实恢复实验：不同攻击类型下的恢复通信开销",
         os.path.join(OUTPUT_DIR, "recovery_fig6_recovery_overhead_by_attack.png"),
     )
 

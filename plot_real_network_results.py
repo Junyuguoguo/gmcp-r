@@ -5,7 +5,8 @@ import os
 import glob
 
 import pandas as pd
-import matplotlib.pyplot as plt
+
+from gmcp.plot_style import save_bar_chart, save_line_chart
 
 
 INPUT_CSV = "results/real_network/real_network_results.csv"
@@ -22,27 +23,11 @@ def clean_old_figures():
 
 
 def save_bar(series, xlabel, ylabel, title, output_path, rotation=45):
-    plt.figure(figsize=(8, 5))
-    series.plot(kind="bar")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.xticks(rotation=rotation)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    save_bar_chart(series, xlabel, ylabel, title, output_path, rotation=rotation)
 
 
 def save_line(table, xlabel, ylabel, title, output_path):
-    plt.figure(figsize=(8, 5))
-    table.plot(kind="line", marker="o")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
+    save_line_chart(table, xlabel, ylabel, title, output_path)
 
 
 def flatten_columns(columns):
@@ -76,9 +61,9 @@ def main():
     fig1 = normal_df.groupby("message_count")["avg_rtt_ms"].mean()
     save_bar(
         fig1,
-        "Message count",
-        "Application RTT (ms)",
-        "Real Network Application-level RTT by Message Count",
+        "消息数量",
+        "应用层 RTT（ms）",
+        "真实网络：不同消息数量下的应用层 RTT",
         os.path.join(OUTPUT_DIR, "real_fig1_avg_rtt_by_message_count.png"),
         rotation=0,
     )
@@ -87,9 +72,9 @@ def main():
     fig2 = normal_df.groupby("payload_size")["throughput_msg_per_s"].mean()
     save_bar(
         fig2,
-        "Payload size",
-        "Throughput (msg/s)",
-        "Real Network Throughput by Payload Size",
+        "载荷大小（字节）",
+        "吞吐量（条/秒）",
+        "真实网络：不同载荷大小下的吞吐量",
         os.path.join(OUTPUT_DIR, "real_fig2_throughput_by_payload_size.png"),
         rotation=0,
     )
@@ -98,9 +83,9 @@ def main():
     fig3 = attack_df.groupby("attack_type")["attack_detected_bool"].mean()
     save_bar(
         fig3,
-        "Attack type",
-        "Detection rate",
-        "Real Network Attack Detection Rate by Attack Type",
+        "攻击类型",
+        "检测率",
+        "真实网络：不同攻击类型的检测率",
         os.path.join(OUTPUT_DIR, "real_fig3_detection_rate_by_attack_type.png"),
     )
 
@@ -108,9 +93,9 @@ def main():
     fig4 = attack_df.groupby("attack_type")["rejected_count"].mean()
     save_bar(
         fig4,
-        "Attack type",
-        "Average rejected count",
-        "Real Network Rejected Count by Attack Type",
+        "攻击类型",
+        "平均拒绝消息数",
+        "真实网络：不同攻击类型下的服务端拒绝数量",
         os.path.join(OUTPUT_DIR, "real_fig4_rejected_count_by_attack_type.png"),
     )
 
@@ -123,9 +108,9 @@ def main():
     )
     save_line(
         fig5,
-        "Message count",
-        "Throughput (msg/s)",
-        "Real Network Throughput under Different Payload Sizes",
+        "消息数量",
+        "吞吐量（条/秒）",
+        "真实网络：不同载荷大小下的吞吐量趋势",
         os.path.join(OUTPUT_DIR, "real_fig5_throughput_trend.png"),
     )
 
@@ -133,9 +118,9 @@ def main():
     fig6 = normal_df.groupby("message_count")["recovery_success_bool"].mean()
     save_bar(
         fig6,
-        "Message count",
-        "Success rate",
-        "Real Network Normal Communication Success Rate",
+        "消息数量",
+        "成功率",
+        "真实网络：正常通信成功率",
         os.path.join(OUTPUT_DIR, "real_fig6_normal_success_rate.png"),
         rotation=0,
     )
