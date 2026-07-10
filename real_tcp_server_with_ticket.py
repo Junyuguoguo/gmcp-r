@@ -270,6 +270,10 @@ def handle_client(conn, addr, registry: SessionRegistry):
     enable_tcp_nodelay(conn)
     print(f"[REAL_TCP_SERVER] connected from {addr}", flush=True)
 
+    # --- Connection-level binding for cross-session attack detection ---
+    bound_session_id = None
+    bound_sender_id = None
+
     file_obj = None
 
     try:
@@ -312,11 +316,48 @@ def handle_client(conn, addr, registry: SessionRegistry):
                 continue
 
             if packet_type == "RECOVERY_REQUEST":
+                rec_session_id = packet.get("session_id", "unknown-session")
+                rec_sender_id = packet.get("sender_id", "unknown-sender")
+                # --- Connection-level binding for RECOVERY_REQUEST ---
+                if bound_session_id is None:
+                    bound_session_id = rec_session_id
+                    bound_sender_id = rec_sender_id
+                else:
+                    if rec_session_id != bound_session_id:
+                        send_json_line(conn, {
+                            "ok": False,
+                            "type": "RECOVERY_RESPONSE",
+                            "reason": f"connection session mismatch: bound={bound_session_id}, got={rec_session_id}",
+                            "server_time": recv_time,
+                        })
+                        continue
                 response = handle_recovery_request(packet, registry)
                 send_json_line(conn, response)
                 continue
 
             session_id = packet.get("session_id", "unknown-session")
+            sender_id = packet.get("sender_id", "unknown-sender")
+
+            # --- Connection-level binding: first DATA binds, subsequent must match ---
+            if bound_session_id is None:
+                bound_session_id = session_id
+                bound_sender_id = sender_id
+            else:
+                if session_id != bound_session_id:
+                    send_json_line(conn, {
+                        "ok": False,
+                        "reason": f"connection session mismatch: bound={bound_session_id}, got={session_id}",
+                        "server_time": recv_time,
+                    })
+                    continue
+                if sender_id != bound_sender_id:
+                    send_json_line(conn, {
+                        "ok": False,
+                        "reason": f"connection sender mismatch: bound={bound_sender_id}, got={sender_id}",
+                        "server_time": recv_time,
+                    })
+                    continue
+
             client_ckpt_interval = int(packet.get("checkpoint_interval", CHECKPOINT_INTERVAL))
             if client_ckpt_interval < 10 or client_ckpt_interval > 1000:
                 client_ckpt_interval = CHECKPOINT_INTERVAL

@@ -277,6 +277,8 @@ def _classify_rejection_reason(reason: str) -> str:
     if not reason:
         return "unknown"
     r = reason.lower()
+    if "connection" in r and "mismatch" in r:
+        return "malicious_client_detected"
     if "auth_tag" in r or "mac mismatch" in r or "chain_hash" in r or "payload_hash" in r:
         return "network_attacker_detected"
     if "session_id" in r or "epoch" in r or "seq" in r or "prev_mem" in r or "prev_hash" in r:
@@ -287,6 +289,11 @@ def _classify_rejection_reason(reason: str) -> str:
 def handle_client(conn, addr, registry: SessionRegistry):
     enable_tcp_nodelay(conn)
     print(f"[BASELINE_SERVER] connected from {addr}", flush=True)
+
+    # --- Connection-level binding for cross-session attack detection ---
+    bound_protocol = None
+    bound_session_id = None
+    bound_sender_id = None
 
     file_obj = None
 
@@ -329,6 +336,31 @@ def handle_client(conn, addr, registry: SessionRegistry):
 
             # RECOVERY_REQUEST
             if packet_type == "RECOVERY_REQUEST":
+                rec_session_id = packet.get("session_id", "unknown-session")
+                rec_protocol = packet.get("protocol", "gmcp")
+                rec_sender_id = packet.get("sender_id", "unknown-sender")
+                # --- Connection-level binding for RECOVERY_REQUEST ---
+                if bound_protocol is None:
+                    bound_protocol = rec_protocol
+                    bound_session_id = rec_session_id
+                    bound_sender_id = rec_sender_id
+                else:
+                    if rec_protocol != bound_protocol:
+                        send_json_line(conn, {
+                            "ok": False,
+                            "type": "RECOVERY_RESPONSE",
+                            "reason": f"connection protocol mismatch: bound={bound_protocol}, got={rec_protocol}",
+                            "server_time": recv_time,
+                        })
+                        continue
+                    if rec_session_id != bound_session_id:
+                        send_json_line(conn, {
+                            "ok": False,
+                            "type": "RECOVERY_RESPONSE",
+                            "reason": f"connection session mismatch: bound={bound_session_id}, got={rec_session_id}",
+                            "server_time": recv_time,
+                        })
+                        continue
                 response = handle_recovery_request(packet, registry)
                 send_json_line(conn, response)
                 continue
@@ -344,6 +376,36 @@ def handle_client(conn, addr, registry: SessionRegistry):
                 continue
 
             session_id = packet.get("session_id", "unknown-session")
+            sender_id = packet.get("sender_id", "unknown-sender")
+
+            # --- Connection-level binding: first DATA binds, subsequent must match ---
+            if bound_protocol is None:
+                bound_protocol = protocol
+                bound_session_id = session_id
+                bound_sender_id = sender_id
+            else:
+                if protocol != bound_protocol:
+                    send_json_line(conn, {
+                        "ok": False,
+                        "reason": f"connection protocol mismatch: bound={bound_protocol}, got={protocol}",
+                        "server_time": recv_time,
+                    })
+                    continue
+                if session_id != bound_session_id:
+                    send_json_line(conn, {
+                        "ok": False,
+                        "reason": f"connection session mismatch: bound={bound_session_id}, got={session_id}",
+                        "server_time": recv_time,
+                    })
+                    continue
+                if sender_id != bound_sender_id:
+                    send_json_line(conn, {
+                        "ok": False,
+                        "reason": f"connection sender mismatch: bound={bound_sender_id}, got={sender_id}",
+                        "server_time": recv_time,
+                    })
+                    continue
+
             registry_key = f"{protocol}:{session_id}"
 
             ctx = registry.get_or_create(registry_key, checkpoint_interval=100)

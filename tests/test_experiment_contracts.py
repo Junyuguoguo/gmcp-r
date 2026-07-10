@@ -288,15 +288,21 @@ class PaperDataConsistencyTests(unittest.TestCase):
         expected_strings = []
         for protocol, rows in grouped.items():
             normal = [row for row in rows if row["attack_type"] == "none"]
-            attacks = [row for row in rows if row["attack_type"] != "none"]
+            # Only count applicable AND injected attacks for detection rate
+            applicable_attacks = [
+                row for row in rows
+                if row["attack_type"] != "none"
+                and str(row.get("attack_applicable", "True")).lower() == "true"
+                and str(row.get("attack_injected", "False")).lower() == "true"
+            ]
             detected = [
                 str(row["attack_detected_by_server"]).lower() == "true"
-                for row in attacks
+                for row in applicable_attacks
             ]
             throughput = sum(float(row["throughput_msg_per_sec"]) for row in normal) / len(normal)
             rtt = sum(float(row["rtt_mean_ms"]) for row in normal) / len(normal)
-            detection_rate = sum(detected) / len(detected) * 100
-            false_accept = sum(not value for value in detected) / len(detected) * 100
+            detection_rate = sum(detected) / len(detected) * 100 if detected else 0
+            false_accept = sum(not value for value in detected) / len(detected) * 100 if detected else 0
 
             summary = summary_rows[protocol]
             self.assertAlmostEqual(float(summary["normal_throughput"]), throughput, delta=1)

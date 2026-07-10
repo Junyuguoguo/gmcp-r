@@ -219,6 +219,18 @@ def run_control(sock, file_obj, session_id, checkpoint_interval, payload_size):
     resp_ticket_last_seq = int(response.get("ticket_last_seq", 0))
     resp_nonce_match = (response.get("recovery_nonce", "") == req_nonce)
 
+    # Verify nonce consumed by re-submitting the same ticket
+    nonce_consumed = False
+    if ok and saved_ticket:
+        ok2, resp2, _, _, _, _ = _send_recovery(
+            sock, file_obj, session_id,
+            client_last_seq=ticket_seq,
+            client_last_mem=saved_ticket["last_mem"],
+            reason="nonce-verify",
+            ticket=saved_ticket,
+        )
+        nonce_consumed = not ok2 and "replay" in resp2.get("reason", "").lower()
+
     return {
         "scenario": "control",
         "checkpoint_interval": checkpoint_interval,
@@ -230,14 +242,15 @@ def run_control(sock, file_obj, session_id, checkpoint_interval, payload_size):
         "response_seq": resp_server_seq,
         "gap": server_seq - ticket_seq,
         "response_advance": resp_server_seq - server_seq,
-        "request_auth_ok": resp_reason != "invalid recovery request auth_tag",
+        "request_auth_ok": response.get("reason") != "invalid recovery request auth_tag",
         "response_auth_ok": resp_auth,
         "nonce_match": resp_nonce_match,
-        "nonce_consumed": ok,
+        "nonce_consumed": nonce_consumed,
         "race_winner_count": 0,
-        "state_unchanged": False,
+        "state_unchanged": resp_server_seq == server_seq,
         "success": ok,
-        "reason": resp_reason if not ok else response.get("reason", "ok"),
+        "reason": response.get("reason", "unknown"),
+        "response_verify_reason": resp_reason,
         "recovery_latency_ms": round(latency_ms, 3),
         "recovery_floor": resp_floor_seq,
         "ticket_last_seq": resp_ticket_last_seq,
@@ -296,6 +309,18 @@ def run_ack_loss(sock, file_obj, session_id, checkpoint_interval, payload_size):
     resp_ticket_last_seq = int(response.get("ticket_last_seq", 0))
     resp_nonce_match = (response.get("recovery_nonce", "") == req_nonce)
 
+    # Verify nonce consumed by re-submitting the same ticket
+    nonce_consumed = False
+    if ok and saved_ticket:
+        ok2, resp2, _, _, _, _ = _send_recovery(
+            sock, file_obj, session_id,
+            client_last_seq=ticket_seq,
+            client_last_mem=saved_ticket["last_mem"],
+            reason="nonce-verify",
+            ticket=saved_ticket,
+        )
+        nonce_consumed = not ok2 and "replay" in resp2.get("reason", "").lower()
+
     return {
         "scenario": "ack_loss",
         "checkpoint_interval": checkpoint_interval,
@@ -307,14 +332,15 @@ def run_ack_loss(sock, file_obj, session_id, checkpoint_interval, payload_size):
         "response_seq": resp_server_seq,
         "gap": server_seq - ticket_seq,
         "response_advance": resp_server_seq - server_seq,
-        "request_auth_ok": resp_reason != "invalid recovery request auth_tag",
+        "request_auth_ok": response.get("reason") != "invalid recovery request auth_tag",
         "response_auth_ok": resp_auth,
         "nonce_match": resp_nonce_match,
-        "nonce_consumed": ok,
+        "nonce_consumed": nonce_consumed,
         "race_winner_count": 0,
-        "state_unchanged": False,
+        "state_unchanged": resp_server_seq == server_seq,
         "success": ok,
-        "reason": resp_reason if not ok else response.get("reason", "ok"),
+        "reason": response.get("reason", "unknown"),
+        "response_verify_reason": resp_reason,
         "recovery_latency_ms": round(latency_ms, 3),
         "recovery_floor": resp_floor_seq,
         "ticket_last_seq": resp_ticket_last_seq,
@@ -378,6 +404,18 @@ def run_old_ticket_within_window(sock, file_obj, session_id, checkpoint_interval
     resp_ticket_last_seq = int(response.get("ticket_last_seq", 0))
     resp_nonce_match = (response.get("recovery_nonce", "") == req_nonce)
 
+    # Verify nonce consumed by re-submitting the same ticket
+    nonce_consumed = False
+    if ok and saved_ticket:
+        ok2, resp2, _, _, _, _ = _send_recovery(
+            sock, file_obj, session_id,
+            client_last_seq=ticket_seq,
+            client_last_mem=saved_ticket["last_mem"],
+            reason="nonce-verify",
+            ticket=saved_ticket,
+        )
+        nonce_consumed = not ok2 and "replay" in resp2.get("reason", "").lower()
+
     return {
         "scenario": "old_ticket_within_window",
         "checkpoint_interval": checkpoint_interval,
@@ -389,14 +427,15 @@ def run_old_ticket_within_window(sock, file_obj, session_id, checkpoint_interval
         "response_seq": resp_server_seq,
         "gap": server_seq - ticket_seq,
         "response_advance": resp_server_seq - server_seq,
-        "request_auth_ok": resp_reason != "invalid recovery request auth_tag",
+        "request_auth_ok": response.get("reason") != "invalid recovery request auth_tag",
         "response_auth_ok": resp_auth,
         "nonce_match": resp_nonce_match,
-        "nonce_consumed": ok,
+        "nonce_consumed": nonce_consumed,
         "race_winner_count": 0,
-        "state_unchanged": False,
+        "state_unchanged": resp_server_seq == server_seq,
         "success": ok,
-        "reason": resp_reason if not ok else response.get("reason", "ok"),
+        "reason": response.get("reason", "unknown"),
+        "response_verify_reason": resp_reason,
         "recovery_latency_ms": round(latency_ms, 3),
         "recovery_floor": resp_floor_seq,
         "ticket_last_seq": resp_ticket_last_seq,
@@ -454,6 +493,18 @@ def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_siz
     resp_ticket_last_seq = int(response.get("ticket_last_seq", 0))
     resp_nonce_match = (response.get("recovery_nonce", "") == req_nonce)
 
+    # Verify nonce consumed by re-submitting the same ticket
+    nonce_consumed = False
+    if saved_ticket:
+        ok2, resp2, _, _, _, _ = _send_recovery(
+            sock, file_obj, session_id,
+            client_last_seq=100,
+            client_last_mem=saved_ticket["last_mem"],
+            reason="nonce-verify",
+            ticket=saved_ticket,
+        )
+        nonce_consumed = not ok2 and "replay" in resp2.get("reason", "").lower()
+
     return {
         "scenario": "below_floor",
         "checkpoint_interval": checkpoint_interval,
@@ -464,15 +515,16 @@ def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_siz
         "floor_seq": resp_floor_seq,
         "response_seq": resp_server_seq,
         "gap": server_seq - ticket_seq,
-        "response_advance": resp_server_seq - server_seq,
-        "request_auth_ok": resp_reason != "invalid recovery request auth_tag",
+        "response_advance": "N/A",
+        "request_auth_ok": response.get("reason") != "invalid recovery request auth_tag",
         "response_auth_ok": resp_auth,
         "nonce_match": resp_nonce_match,
-        "nonce_consumed": ok,
+        "nonce_consumed": nonce_consumed,
         "race_winner_count": 0,
-        "state_unchanged": not ok,
+        "state_unchanged": resp_server_seq == server_seq,
         "success": ok,
-        "reason": resp_reason if not ok else response.get("reason", "ok"),
+        "reason": response.get("reason", "unknown"),
+        "response_verify_reason": resp_reason,
         "recovery_latency_ms": round(latency_ms, 3),
         "recovery_floor": resp_floor_seq,
         "ticket_last_seq": resp_ticket_last_seq,
@@ -554,19 +606,26 @@ def run_nonce_race(host, port, session_id, checkpoint_interval, payload_size):
 
     winners = sum(1 for r in results if r and r["ok"])
     loser_reason = ""
+    loser_verify_reason = ""
     for r in results:
         if r and not r["ok"]:
-            loser_reason = r["reason"]
+            loser_reason = r.get("response", {}).get("reason", r["reason"])
+            loser_verify_reason = r["reason"]
             break
 
     # Get floor/nonce info from winner's response if available
     winner_resp = {}
+    winner_verify_reason = ""
     for r in results:
         if r and r["ok"]:
             winner_resp = r.get("response", {})
+            winner_verify_reason = r["reason"]
             break
     race_floor = int(winner_resp.get("recovery_floor", winner_resp.get("checkpoint_seq", ticket_seq)))
     race_ticket_last = int(winner_resp.get("ticket_last_seq", ticket_seq))
+
+    # Collect response_verify_reason from all workers
+    all_verify_reasons = [r["reason"] for r in results if r]
 
     return {
         "scenario": "nonce_race",
@@ -579,7 +638,10 @@ def run_nonce_race(host, port, session_id, checkpoint_interval, payload_size):
         "response_seq": 100 if winners > 0 else 0,
         "gap": 0,
         "response_advance": 0,
-        "request_auth_ok": True,
+        "request_auth_ok": all(
+            r.get("response", {}).get("reason") != "invalid recovery request auth_tag"
+            for r in results if r
+        ),
         "response_auth_ok": all(r["auth"] for r in results if r),
         "nonce_match": True,
         "nonce_consumed": winners > 0,
@@ -587,6 +649,7 @@ def run_nonce_race(host, port, session_id, checkpoint_interval, payload_size):
         "state_unchanged": False,
         "success": winners == 1,
         "reason": f"winners={winners}, loser={loser_reason}",
+        "response_verify_reason": "; ".join(all_verify_reasons),
         "recovery_latency_ms": round(
             max(r["latency_ms"] for r in results if r), 3
         ),
@@ -641,6 +704,7 @@ CSV_COLUMNS = [
     "ticket_seq", "client_seq", "server_seq", "floor_seq", "response_seq",
     "gap", "response_advance", "request_auth_ok", "response_auth_ok",
     "nonce_match", "nonce_consumed", "race_winner_count", "state_unchanged",
+    "response_verify_reason",
     "success", "reason", "recovery_latency_ms",
     "recovery_floor", "ticket_last_seq",
 ]

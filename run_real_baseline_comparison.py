@@ -591,5 +591,70 @@ def run_all_experiments():
     return tracker.results
 
 
+def print_attack_matrix(results: list):
+    """
+    输出逐攻击检测矩阵。
+    只统计 attack_applicable=True AND attack_injected=True 的攻击。
+    N/A 攻击不计入漏检率。
+    正常场景验证 accepted_count == message_count。
+    """
+    from collections import defaultdict
+
+    # --- 1. 验证正常场景 ---
+    normal_results = [r for r in results if r["attack_type"] == "none"]
+    normal_failures = []
+    for r in normal_results:
+        if r["accepted_count"] != r["message_count"] or r["success_rate"] != 100:
+            normal_failures.append(r)
+    if normal_failures:
+        print(f"\n⚠️  NORMAL SCENARIO FAILURES ({len(normal_failures)}):")
+        for r in normal_failures:
+            print(f"  protocol={r['protocol']}, msg={r['message_count']}, "
+                  f"accepted={r['accepted_count']}, success_rate={r['success_rate']}%")
+    else:
+        print(f"\n✅ All normal scenarios: accepted_count == message_count, success_rate == 100%")
+
+    # --- 2. 逐攻击检测矩阵 ---
+    attack_results = [r for r in results if r["attack_type"] != "none"]
+
+    # Group by (protocol, attack_type)
+    matrix = defaultdict(lambda: {"applicable": False, "injected_count": 0, "detected_count": 0})
+
+    for r in attack_results:
+        key = (r["protocol"], r["attack_type"])
+        if not r.get("attack_applicable", False):
+            # N/A attack, skip
+            continue
+        matrix[key]["applicable"] = True
+        if r.get("attack_injected", False):
+            matrix[key]["injected_count"] += 1
+            if r.get("attack_detected_by_server", False):
+                matrix[key]["detected_count"] += 1
+
+    print(f"\n{'='*80}")
+    print(f"ATTACK DETECTION MATRIX (only applicable + injected attacks)")
+    print(f"{'='*80}")
+    print(f"{'Protocol':<30} {'Attack Type':<35} {'Injected':>8} {'Detected':>8} {'Rate':>8}")
+    print(f"{'-'*30} {'-'*35} {'-'*8} {'-'*8} {'-'*8}")
+
+    for (protocol, attack_type), stats in sorted(matrix.items()):
+        inj = stats["injected_count"]
+        det = stats["detected_count"]
+        rate = f"{det / inj * 100:.1f}%" if inj > 0 else "N/A"
+        print(f"{protocol:<30} {attack_type:<35} {inj:>8} {det:>8} {rate:>8}")
+
+    # Summary of N/A attacks (not counted)
+    na_attacks = [r for r in attack_results
+                  if r.get("attack_applicable", True) == False]
+    if na_attacks:
+        print(f"\nN/A attacks (not counted): {len(na_attacks)}")
+        na_types = set((r["protocol"], r["attack_type"]) for r in na_attacks)
+        for p, a in sorted(na_types):
+            print(f"  {p:<30} {a:<35} N/A")
+
+    print(f"{'='*80}")
+
+
 if __name__ == "__main__":
-    run_all_experiments()
+    results = run_all_experiments()
+    print_attack_matrix(results)

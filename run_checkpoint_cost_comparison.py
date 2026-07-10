@@ -81,6 +81,11 @@ class RecoveryMeasurement:
     payload_hash_ok: bool = True
     recovery_valid: bool = True
     failure_reason: str = ""
+    records_scanned: int = 0
+    records_replayed: int = 0
+    physical_bytes_read: int = 0
+    logical_bytes_replayed: int = 0
+    seek_offset: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +125,9 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
     with open(history_path, "w", encoding="utf-8") as hf, \
          open(chain_path, "w", encoding="utf-8") as cf:
 
+        # Track byte position after each GMCP line (for seek-based recovery)
+        line_end_offsets: list[int] = []
+
         for seq in range(1, n + 1):
             payload = f"bench-payload-{repeat_id}-{seq}"
             payload_hash = hash_text(payload)
@@ -143,6 +151,7 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
             # Sign with DATA_AUTH_KEY
             gmcp_record = with_hmac(DATA_AUTH_KEY, gmcp_record, tag_field="auth_tag")
             hf.write(canonical_json(gmcp_record) + "\n")
+            line_end_offsets.append(hf.tell())
 
             # Store checkpoint at n-k
             if seq == checkpoint_seq:
@@ -153,6 +162,8 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
                     "seq": checkpoint_seq,
                     "memory": checkpoint_mem,
                     "timestamp": time.time(),
+                    # Byte offset of the END of the checkpoint line = start of next record
+                    "log_byte_offset": line_end_offsets[checkpoint_seq - 1],
                 }
                 checkpoint_record["signature"] = hmac_sha256_hex(
                     CHECKPOINT_AUTH_KEY, checkpoint_record
@@ -208,7 +219,8 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
 
 def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMeasurement:
     """
-    GMCP-R recovery: read checkpoint + replay `offset` messages.
+    GMCP-R recovery: seek-based O(k) recovery.
+    Use binary seek to skip to checkpoint position, then replay `offset` messages.
     replay_count = offset
     """
     target_seq = prepared.checkpoint_seq + offset
@@ -245,35 +257,44 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
             failure_reason="checkpoint_auth_failed",
         )
 
-    # 2. Replay from history.jsonl: records at checkpoint_seq+1 .. target_seq
+    # 2. Seek-based replay: binary seek to checkpoint's log_byte_offset
+    seek_offset = prepared.checkpoint_record["log_byte_offset"]
     reconstructed_mem = prepared.checkpoint_record["memory"]
     prev_mem = reconstructed_mem
     replay_count = 0
+    records_scanned = 0
     material_bytes = checkpoint_bytes
     logical_bytes = checkpoint_bytes
     auth_records = 1  # checkpoint verification
+    physical_bytes = 0
+    logical_bytes_replayed = 0
 
-    session_prefix = f'"session_id":"{session_id}"'
-    with open(prepared.history_path, "r", encoding="utf-8") as f:
-        for line in f:
+    with open(prepared.history_path, "rb") as f:
+        f.seek(seek_offset)
+        while True:
+            raw = f.readline()
+            if not raw:
+                break
+            physical_bytes += len(raw)
+            line = raw.decode("utf-8").rstrip("\n")
+            if not line:
+                break
             record = json.loads(line)
             seq = record["seq"]
-            if seq <= prepared.checkpoint_seq:
-                continue
+            records_scanned += 1
             if seq > target_seq:
+                records_scanned -= 1  # don't count overshoot
                 break
 
             # Verify auth_tag
             received_tag = record.pop("auth_tag", "")
             unsigned = dict(record)
-            # Re-verify
             tag_ok = verify_hmac(DATA_AUTH_KEY, unsigned, received_tag)
             record["auth_tag"] = received_tag
 
-            # Check auth_tag validity
             if not tag_ok:
                 t1 = time.perf_counter_ns()
-                line_bytes = len(line.encode("utf-8"))
+                line_bytes = len(raw)
                 return RecoveryMeasurement(
                     protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
                     repeat_id=prepared.repeat_id, replay_count=replay_count,
@@ -288,13 +309,16 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
                     chain_continuity_ok=True, payload_hash_ok=True,
                     recovery_valid=False,
                     failure_reason=f"record_auth_failed_seq_{seq}",
+                    records_scanned=records_scanned, records_replayed=replay_count,
+                    physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
+                    seek_offset=seek_offset,
                 )
 
             # Verify prev_mem chain continuity
             chain_ok = (record["prev_mem"] == prev_mem)
             if not chain_ok:
                 t1 = time.perf_counter_ns()
-                line_bytes = len(line.encode("utf-8"))
+                line_bytes = len(raw)
                 return RecoveryMeasurement(
                     protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
                     repeat_id=prepared.repeat_id, replay_count=replay_count,
@@ -309,6 +333,9 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
                     chain_continuity_ok=False, payload_hash_ok=True,
                     recovery_valid=False,
                     failure_reason=f"chain_continuity_failed_seq_{seq}",
+                    records_scanned=records_scanned, records_replayed=replay_count,
+                    physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
+                    seek_offset=seek_offset,
                 )
 
             # Verify payload_hash
@@ -316,7 +343,7 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
             ph_ok = (computed_hash == record["payload_hash"])
             if not ph_ok:
                 t1 = time.perf_counter_ns()
-                line_bytes = len(line.encode("utf-8"))
+                line_bytes = len(raw)
                 return RecoveryMeasurement(
                     protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
                     repeat_id=prepared.repeat_id, replay_count=replay_count,
@@ -331,6 +358,9 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
                     chain_continuity_ok=True, payload_hash_ok=False,
                     recovery_valid=False,
                     failure_reason=f"payload_hash_failed_seq_{seq}",
+                    records_scanned=records_scanned, records_replayed=replay_count,
+                    physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
+                    seek_offset=seek_offset,
                 )
 
             # Reconstruct memory via update_memory() (not reading stored mem)
@@ -340,10 +370,11 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
             )
             prev_mem = reconstructed_mem
             replay_count += 1
-            line_bytes = len(line.encode("utf-8"))
+            line_bytes = len(raw)
             material_bytes += line_bytes
             logical_bytes += line_bytes
             auth_records += 1
+            logical_bytes_replayed += line_bytes
 
     t1 = time.perf_counter_ns()
 
@@ -368,6 +399,9 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
         checkpoint_auth_ok=True, record_auth_ok=True,
         chain_continuity_ok=True, payload_hash_ok=True,
         recovery_valid=True, failure_reason="",
+        records_scanned=records_scanned, records_replayed=replay_count,
+        physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
+        seek_offset=seek_offset,
     )
 
 
@@ -479,6 +513,8 @@ CSV_COLUMNS = [
     "target_state_match",
     "checkpoint_auth_ok", "record_auth_ok", "chain_continuity_ok",
     "payload_hash_ok", "recovery_valid", "failure_reason",
+    "records_scanned", "records_replayed", "physical_bytes_read",
+    "logical_bytes_replayed", "seek_offset",
 ]
 
 
@@ -506,6 +542,11 @@ def measurement_to_row(m: RecoveryMeasurement) -> Dict[str, Any]:
         "payload_hash_ok": m.payload_hash_ok,
         "recovery_valid": m.recovery_valid,
         "failure_reason": m.failure_reason,
+        "records_scanned": m.records_scanned,
+        "records_replayed": m.records_replayed,
+        "physical_bytes_read": m.physical_bytes_read,
+        "logical_bytes_replayed": m.logical_bytes_replayed,
+        "seek_offset": m.seek_offset,
     }
 
 

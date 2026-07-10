@@ -165,7 +165,7 @@ def validate_all(
         bl_path = os.path.join(output_root, "real_baseline_comparison_results.csv")
     bl_rows = read_csv(bl_path)
     if bl_rows:
-        violations.extend(_validate_baseline(bl_rows))
+        violations.extend(_validate_baseline(bl_rows, expected_repeats))
 
     # 6. Validate all PNGs are nonempty
     if os.path.isdir(output_root):
@@ -209,12 +209,12 @@ def _validate_recovery_window(rows, expected_repeats):
     race = [r for r in rows if r.get("scenario") == "nonce_race"]
 
     if expected_repeats == 30:
-        if len(rows) != 540:
-            violations.append(f"recovery_window: expected 540 rows, got {len(rows)}")
-        if len(non_race) != 480:
-            violations.append(f"recovery_window: expected 480 non-race rows, got {len(non_race)}")
-        if len(race) != 60:
-            violations.append(f"recovery_window: expected 60 race rows, got {len(race)}")
+        if len(rows) != 760:
+            violations.append(f"recovery_window: expected 760 rows, got {len(rows)}")
+        if len(non_race) != 720:
+            violations.append(f"recovery_window: expected 720 non-race rows, got {len(non_race)}")
+        if len(race) != 40:
+            violations.append(f"recovery_window: expected 40 race rows, got {len(race)}")
 
     # Below-floor invariants
     for row in rows:
@@ -223,6 +223,13 @@ def _validate_recovery_window(rows, expected_repeats):
                 violations.append("below_floor should be rejected")
             if str(row.get("state_unchanged", "")).lower() != "true":
                 violations.append("below_floor should leave state unchanged")
+            # recovery_floor must exceed ticket_last_seq (ticket is below the floor)
+            rf = safe_int(row.get("recovery_floor", 0))
+            tl = safe_int(row.get("ticket_last_seq", 0))
+            if rf > 0 and tl > 0 and rf <= tl:
+                violations.append(
+                    f"below_floor: recovery_floor ({rf}) must be > ticket_last_seq ({tl})"
+                )
 
     # Race invariants
     for row in race:
@@ -263,6 +270,29 @@ def _validate_checkpoint_cost(rows, expected_repeats):
             f"checkpoint_cost: {len(mismatches)} rows have state mismatch"
         )
 
+    # recovery_valid must be True for all rows (if column exists)
+    if rows and "recovery_valid" in rows[0]:
+        invalid = [
+            r for r in rows if str(r.get("recovery_valid", "")).lower() != "true"
+        ]
+        if invalid:
+            violations.append(
+                f"checkpoint_cost: {len(invalid)} rows have recovery_valid=False"
+            )
+
+    # records_scanned == offset for gmcp_r (if columns exist)
+    if rows and "records_scanned" in rows[0] and "offset" in rows[0]:
+        scan_mismatches = [
+            r for r in rows
+            if r.get("protocol") == "gmcp_r"
+            and safe_int(r.get("records_scanned")) != safe_int(r.get("offset"))
+        ]
+        if scan_mismatches:
+            violations.append(
+                f"checkpoint_cost: {len(scan_mismatches)} gmcp_r rows have "
+                f"records_scanned != offset"
+            )
+
     # Matrix coverage
     combos = set((r.get("n"), r.get("k")) for r in rows)
     n_values = sorted(set(safe_int(r.get("n")) for r in rows))
@@ -276,11 +306,11 @@ def _validate_checkpoint_cost(rows, expected_repeats):
     if missing_combos:
         violations.append(f"checkpoint_cost: missing matrix combos {missing_combos}")
 
-    # Row count check
+    # Row count check — expected_count = len(expected_combos) × len(offsets) × len(protocols) × repeats
     if expected_repeats == 30 and len(expected_combos) > 0:
         offsets = set(safe_int(r.get("offset")) for r in rows)
         protocols = set(r.get("protocol") for r in rows)
-        expected_count = len(n_values) * len(expected_combos) * len(offsets) * len(protocols) * 30
+        expected_count = len(expected_combos) * len(offsets) * len(protocols) * 30
         if expected_count == 2160 and len(rows) != 2160:
             violations.append(f"checkpoint_cost: expected 2160 rows, got {len(rows)}")
 
@@ -317,7 +347,7 @@ def _validate_adaptive_attack(rows):
     return violations
 
 
-def _validate_baseline(rows):
+def _validate_baseline(rows, expected_repeats=30):
     """Validate baseline comparison CSV contracts."""
     violations = []
 
@@ -327,6 +357,39 @@ def _validate_baseline(rows):
         if missing:
             violations.append(f"baseline CSV missing columns: {missing}")
 
+    # Total row count check (full run only)
+    if expected_repeats == 30:
+        if len(rows) != 7200:
+            violations.append(f"baseline: expected 7200 rows, got {len(rows)}")
+
+    # Normal rows: attack_type == "none"
+    normal = [r for r in rows if r.get("attack_type") == "none"]
+    if expected_repeats == 30 and len(normal) != 900:
+        violations.append(f"baseline: expected 900 normal rows, got {len(normal)}")
+
+    # All normal rows must be 100% successful
+    for row in normal:
+        sr = safe_float(row.get("success_rate", 100))
+        if sr < 100.0:
+            violations.append(
+                f"baseline: normal row not 100% successful "
+                f"(protocol={row.get('protocol')}, msg={row.get('message_count')}, "
+                f"repeat={row.get('repeat_id')}, success_rate={sr})"
+            )
+            break  # one violation is enough to flag
+
+    # No timeout or error rows
+    for row in rows:
+        tc = safe_int(row.get("timeout_count", 0))
+        ec = safe_int(row.get("error_count", 0))
+        if tc > 0 or ec > 0:
+            violations.append(
+                f"baseline: timeout/error in row "
+                f"(protocol={row.get('protocol')}, attack={row.get('attack_type')}, "
+                f"repeat={row.get('repeat_id')}, timeout={tc}, error={ec})"
+            )
+            break
+
     # N/A attack semantics
     na_protocols = {"seq_mac", "ticket_only"}
     for row in rows:
@@ -335,6 +398,20 @@ def _validate_baseline(rows):
         injected = str(row.get("attack_injected", "")).lower()
         if proto in na_protocols and attack == "prev_mem" and injected == "true":
             violations.append(f"N/A attack should not be injected for {proto}/{attack}")
+
+    # Applicable attacks must be injected (if attack_applicable column exists)
+    if rows and "attack_applicable" in rows[0]:
+        for row in rows:
+            applicable = str(row.get("attack_applicable", "")).lower()
+            injected = str(row.get("attack_injected", "")).lower()
+            attack = row.get("attack_type", "")
+            if attack != "none" and applicable == "true" and injected != "true":
+                violations.append(
+                    f"baseline: applicable attack not injected "
+                    f"(protocol={row.get('protocol')}, attack={attack}, "
+                    f"repeat={row.get('repeat_id')})"
+                )
+                break
 
     return violations
 
