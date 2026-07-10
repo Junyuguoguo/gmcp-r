@@ -30,6 +30,7 @@ from gmcp.baselines.authenticated_hash_chain import (
 from gmcp.baselines.hash_chain import (
     create_initial_state as plain_chain_initial_state,
 )
+from gmcp.experiment_stats import get_git_commit
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +715,7 @@ CSV_COLUMNS = [
     "checkpoint_auth_ok", "record_auth_ok", "chain_continuity_ok",
     "payload_hash_ok", "stored_mem_ok", "recovery_valid", "failure_reason",
     "records_scanned", "records_replayed", "physical_bytes_read",
-    "logical_bytes_replayed", "seek_offset",
+    "logical_bytes_replayed", "seek_offset", "git_commit",
 ]
 
 
@@ -748,6 +749,7 @@ def measurement_to_row(m: RecoveryMeasurement) -> Dict[str, Any]:
         "physical_bytes_read": m.physical_bytes_read,
         "logical_bytes_replayed": m.logical_bytes_replayed,
         "seek_offset": m.seek_offset,
+        "git_commit": get_git_commit(),
     }
 
 

@@ -45,6 +45,7 @@ from gmcp.recovery_protocol import (
     verify_recovery_response,
 )
 from gmcp.ticket import build_memory_ticket
+from gmcp.experiment_stats import get_git_commit
 
 # ── defaults ────────────────────────────────────────────────────────────
 CHECKPOINT_INTERVALS = [50, 100, 200]
@@ -761,7 +762,7 @@ CSV_COLUMNS = [
     "server_last_mem_before", "server_last_mem_after",
     "request_auth_ok", "response_auth_ok", "response_verify_reason",
     "nonce_match", "nonce_consumed", "race_winner_count", "state_unchanged",
-    "success", "reason", "recovery_latency_ms",
+    "success", "reason", "recovery_latency_ms", "git_commit",
 ]
 
 NON_RACE_SCENARIOS = ["control", "ack_loss", "old_ticket_within_window", "below_floor"]
@@ -858,6 +859,9 @@ def main():
                         })
 
         # Write CSV
+        git_commit = get_git_commit()
+        for row in all_rows:
+            row["git_commit"] = git_commit
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
             writer.writeheader()
