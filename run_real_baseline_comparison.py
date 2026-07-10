@@ -34,7 +34,7 @@ from gmcp.config import (
     EPOCH,
     DATA_AUTH_KEY,
 )
-from gmcp.crypto_utils import hash_text, hmac_sha256_hex
+from gmcp.crypto_utils import hash_text, hmac_sha256_hex, with_hmac, verify_tagged_hmac
 from gmcp.memory import initial_memory, update_memory
 from gmcp.packet import build_data_packet as gmcp_build_data_packet
 from gmcp.experiment_stats import (
@@ -130,6 +130,38 @@ def recv_json_line(file_obj):
     if not line:
         raise ConnectionError("server closed connection")
     return json.loads(line)
+def send_hello(sock, file_obj, protocol, session_id, sender_id, epoch):
+    """Send HELLO handshake and wait for HELLO_ACK."""
+    # Normalize protocol name to match what packet builders produce
+    hello_protocol = "gmcp" if protocol == "gmcp_r" else protocol
+    hello = with_hmac(DATA_AUTH_KEY, {
+        "type": "HELLO",
+        "protocol": hello_protocol,
+        "session_id": session_id,
+        "sender_id": sender_id,
+        "epoch": epoch,
+        "client_nonce": str(int(time.time() * 1000000)),
+        "timestamp": time.time(),
+    })
+    send_json_line(sock, hello)
+    ack = recv_json_line(file_obj)
+    return ack
+
+
+def _classify_rejection(reason: str) -> str:
+    """Classify rejection reason into attack detection category."""
+    if not reason:
+        return ""
+    r = reason.lower()
+    if "connection" in r and "mismatch" in r:
+        return "malicious_client_detected"
+    if "auth_tag" in r or "mac mismatch" in r or "chain_hash" in r or "payload_hash" in r:
+        return "network_attacker_detected"
+    if "session_id" in r or "epoch" in r or "seq" in r or "prev_mem" in r or "prev_hash" in r:
+        return "malicious_client_detected"
+    return "other"
+
+
 
 
 def close_tcp(sock, file_obj):
@@ -388,6 +420,15 @@ def run_one_baseline_experiment(
     attack_detected_by_server = False
     attack_seq = min(50, max(2, message_count // 2))
     attack_done = False
+
+    # Audit fields
+    last_rejection_reason = ""
+    last_rejection_class = ""
+    expected_session_id = session_id
+    packet_session_id = session_id
+    connection_bound_session_id = session_id
+    attack_expected_reason = ""
+    attack_reason_match = False
     
     # exact_replay: 保存第1条完整合法报文
     saved_first_packet = None
@@ -402,6 +443,30 @@ def run_one_baseline_experiment(
     
     try:
         sock, file_obj = open_tcp()
+
+        # Send HELLO handshake (required by server)
+        hello_ack = send_hello(sock, file_obj, protocol, session_id, CLIENT_ID, EPOCH)
+        if not hello_ack.get("ok"):
+            print(f"  [WARN] HELLO failed: {hello_ack.get('reason')}")
+            close_tcp(sock, file_obj)
+            return {
+                "session_id": session_id, "protocol": protocol,
+                "attack_type": attack_type, "attack_category": category,
+                "attack_applicable": applicable,
+                "message_count": message_count, "payload_size": payload_size,
+                "repeat_id": repeat_id, "sent_count": 0, "accepted_count": 0,
+                "rejected_count": 0, "timeout_count": 0, "error_count": 1,
+                "success_rate": 0, "attack_injected": False,
+                "attack_detected_by_server": False,
+                "throughput_msg_per_sec": 0,
+                "rtt_mean_ms": 0, "rtt_std_ms": 0, "rtt_min_ms": 0,
+                "rtt_max_ms": 0, "rtt_median_ms": 0, "elapsed_seconds": 0,
+                "expected_session_id": session_id,
+                "packet_session_id": session_id,
+                "connection_bound_session_id": session_id,
+                "rejection_reason": "", "rejection_class": "",
+                "attack_expected_reason": "", "attack_reason_match": False,
+            }
         
         for seq in range(1, message_count + 1):
             payload = make_payload(seq, payload_size)
@@ -423,27 +488,77 @@ def run_one_baseline_experiment(
             
             # 攻击注入
             if attack_type != "none" and seq == attack_seq and not attack_done:
-                modified_packet, is_applicable = apply_attack(
-                    attack_type=attack_type,
-                    protocol=protocol,
-                    packet=packet,
-                    seq=seq,
-                    session_id=session_id,
-                    sender_id=CLIENT_ID,
-                    epoch=EPOCH,
-                    payload=payload,
-                    state=state,
-                    saved_first_packet=saved_first_packet,
-                )
-                
-                if is_applicable and modified_packet is not None:
-                    packet = modified_packet
-                    attack_done = True
-                    attack_injected = True
-                elif not is_applicable:
-                    # 攻击不适用于此协议，跳过注入
-                    attack_done = True
-                    attack_injected = False
+                # cross_session_valid_mac: server rejects via connection binding (not protocol verifier)
+                if attack_type == "cross_session_valid_mac":
+                    build_fn = _get_build_fn(protocol)
+                    fake_session = "attacker-cross-session"
+                    modified_packet, is_applicable = apply_attack(
+                        attack_type=attack_type,
+                        protocol=protocol,
+                        packet=packet,
+                        seq=seq,
+                        session_id=session_id,
+                        sender_id=CLIENT_ID,
+                        epoch=EPOCH,
+                        payload=payload,
+                        state=state,
+                        saved_first_packet=saved_first_packet,
+                    )
+                    if is_applicable and modified_packet is not None:
+                        # Record audit fields for cross_session
+                        expected_session_id = session_id
+                        packet_session_id = fake_session
+                        connection_bound_session_id = session_id
+                        attack_expected_reason = "connection session mismatch"
+
+                        send_start = time.time()
+                        send_json_line(sock, modified_packet)
+                        sent_count += 1
+                        try:
+                            response = recv_json_line(file_obj)
+                            send_end = time.time()
+                            rtt_ms = (send_end - send_start) * 1000
+                            rtt_list.append(rtt_ms)
+
+                            reason = response.get("reason", "")
+                            # Lock audit fields to attack packet response
+                            last_rejection_reason = reason
+                            last_rejection_class = _classify_rejection(reason)
+                            attack_reason_match = "connection session mismatch" in reason
+
+                            if not response.get("ok"):
+                                rejected_count += 1
+                                attack_detected_by_server = True
+                                attack_injected = True
+                            else:
+                                accepted_count += 1
+                                attack_injected = True
+                        except socket.timeout:
+                            timeout_count += 1
+                        attack_done = True
+                        continue
+                else:
+                    modified_packet, is_applicable = apply_attack(
+                        attack_type=attack_type,
+                        protocol=protocol,
+                        packet=packet,
+                        seq=seq,
+                        session_id=session_id,
+                        sender_id=CLIENT_ID,
+                        epoch=EPOCH,
+                        payload=payload,
+                        state=state,
+                        saved_first_packet=saved_first_packet,
+                    )
+                    
+                    if is_applicable and modified_packet is not None:
+                        packet = modified_packet
+                        attack_done = True
+                        attack_injected = True
+                    elif not is_applicable:
+                        # 攻击不适用于此协议，跳过注入
+                        attack_done = True
+                        attack_injected = False
             
             # 发送数据包
             send_start = time.time()
@@ -471,9 +586,13 @@ def run_one_baseline_experiment(
                 else:
                     rejected_count += 1
                     reason = response.get("reason", "unknown")
+                    last_rejection_reason = reason
+                    last_rejection_class = _classify_rejection(reason)
                     # 只有当攻击已注入且服务端拒绝时，才算检测到攻击
                     if attack_injected and not response.get("ok"):
                         attack_detected_by_server = True
+                        if attack_expected_reason:
+                            attack_reason_match = attack_expected_reason in reason
                         
             except socket.timeout:
                 timeout_count += 1
@@ -522,6 +641,13 @@ def run_one_baseline_experiment(
         "rtt_max_ms": round(rtt_stats["max"], 2),
         "rtt_median_ms": round(rtt_stats["median"], 2),
         "elapsed_seconds": round(elapsed, 2),
+        "expected_session_id": expected_session_id,
+        "packet_session_id": packet_session_id,
+        "connection_bound_session_id": connection_bound_session_id,
+        "rejection_reason": last_rejection_reason,
+        "rejection_class": last_rejection_class,
+        "attack_expected_reason": attack_expected_reason,
+        "attack_reason_match": attack_reason_match,
     }
 
 
@@ -539,6 +665,9 @@ def run_all_experiments():
         "error_count", "success_rate", "attack_injected", "attack_detected_by_server",
         "throughput_msg_per_sec", "rtt_mean_ms", "rtt_std_ms", "rtt_min_ms",
         "rtt_max_ms", "rtt_median_ms", "elapsed_seconds",
+        "expected_session_id", "packet_session_id", "connection_bound_session_id",
+        "rejection_reason", "rejection_class",
+        "attack_expected_reason", "attack_reason_match",
     ]
     
     total_experiments = len(PROTOCOLS) * len(ATTACK_TYPES) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * len(REPEATS)

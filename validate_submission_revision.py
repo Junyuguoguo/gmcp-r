@@ -186,8 +186,10 @@ def _validate_recovery_window(rows, expected_repeats):
     # Required columns
     required = {
         "scenario", "checkpoint_interval", "payload_size", "repeat_id",
-        "ticket_seq", "client_seq", "server_seq", "floor_seq", "response_seq",
-        "gap", "response_advance", "request_auth_ok", "response_auth_ok",
+        "ticket_seq", "client_seq", "server_seq", "recovery_floor", "ticket_last_seq",
+        "server_last_seq_before", "server_last_seq_after",
+        "server_last_mem_before", "server_last_mem_after",
+        "request_auth_ok", "response_auth_ok", "response_verify_reason",
         "nonce_match", "nonce_consumed", "race_winner_count", "state_unchanged",
         "success", "reason",
     }
@@ -216,6 +218,15 @@ def _validate_recovery_window(rows, expected_repeats):
         if len(race) != 40:
             violations.append(f"recovery_window: expected 40 race rows, got {len(race)}")
 
+    # All response_auth_ok must be True
+    for row in rows:
+        if str(row.get("response_auth_ok", "")).lower() != "true":
+            violations.append(
+                f"response_auth_ok should be True "
+                f"(scenario={row.get('scenario')}, repeat={row.get('repeat_id')})"
+            )
+            break
+
     # Below-floor invariants
     for row in rows:
         if row.get("scenario") == "below_floor":
@@ -230,12 +241,18 @@ def _validate_recovery_window(rows, expected_repeats):
                 violations.append(
                     f"below_floor: recovery_floor ({rf}) must be > ticket_last_seq ({tl})"
                 )
+            # reason must NOT be "ok" — must contain rollback/below floor/recovery floor
+            reason = row.get("reason", "").lower()
+            if reason == "ok":
+                violations.append("below_floor: reason must not be 'ok'")
+            break  # one violation is enough
 
     # Race invariants
     for row in race:
         winners = safe_int(row.get("race_winner_count"))
         if winners != 1:
             violations.append(f"nonce_race should have exactly 1 winner, got {winners}")
+            break
 
     return violations
 
@@ -306,13 +323,18 @@ def _validate_checkpoint_cost(rows, expected_repeats):
     if missing_combos:
         violations.append(f"checkpoint_cost: missing matrix combos {missing_combos}")
 
-    # Row count check — expected_count = len(expected_combos) × len(offsets) × len(protocols) × repeats
-    if expected_repeats == 30 and len(expected_combos) > 0:
-        offsets = set(safe_int(r.get("offset")) for r in rows)
-        protocols = set(r.get("protocol") for r in rows)
-        expected_count = len(expected_combos) * len(offsets) * len(protocols) * 30
-        if expected_count == 2160 and len(rows) != 2160:
+    # Row count check — deterministic formula:
+    # for each (n, k): offsets = {1, k//2, k-1}; count += len(offsets) * 2 * repeats
+    if expected_repeats > 0 and len(expected_combos) > 0:
+        total_count = 0
+        for (n_str, k_str) in expected_combos:
+            k_val = safe_int(k_str)
+            offsets_set = {1, k_val // 2, k_val - 1}
+            total_count += len(offsets_set) * 2 * expected_repeats
+        if total_count == 2160 and len(rows) != 2160:
             violations.append(f"checkpoint_cost: expected 2160 rows, got {len(rows)}")
+        elif total_count != 2160 and len(rows) != total_count:
+            violations.append(f"checkpoint_cost: expected {total_count} rows, got {len(rows)}")
 
     return violations
 

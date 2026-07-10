@@ -186,24 +186,28 @@ def _spawn_server(port=None):
 # ── Scenario runners ────────────────────────────────────────────────────
 
 def run_control(sock, file_obj, session_id, checkpoint_interval, payload_size):
-    """control: ticket=100, server=100 → success.
+    """control: ticket=100, server=100, client=100 → success.
 
     floor_seq is extracted from the server recovery response (not hardcoded).
     """
     prefix = "x" * max(0, payload_size - 20)
     current_mem = initial_memory(session_id, CLIENT_ID, EPOCH, "demo-seed")
     saved_ticket = None
+    last_data_resp = None
 
     for seq in range(1, 101):
         payload = f"ctrl-{seq:04d}-{prefix}"
         resp, current_mem = _send_data_packet(
             sock, file_obj, session_id, seq, current_mem, payload, checkpoint_interval
         )
+        last_data_resp = resp
         if "memory_ticket" in resp:
             saved_ticket = resp["memory_ticket"]
 
     ticket_seq = int(saved_ticket["last_seq"]) if saved_ticket else 100
-    server_seq = 100
+    server_seq = int(last_data_resp.get("last_seq", 100)) if last_data_resp else 100
+    server_last_seq_before = server_seq
+    server_last_mem_before = last_data_resp.get("last_mem", current_mem) if last_data_resp else current_mem
 
     # Recover
     ok, response, latency_ms, resp_auth, resp_reason, req_nonce = _send_recovery(
@@ -218,6 +222,8 @@ def run_control(sock, file_obj, session_id, checkpoint_interval, payload_size):
     resp_floor_seq = int(response.get("recovery_floor", response.get("checkpoint_seq", 0)))
     resp_ticket_last_seq = int(response.get("ticket_last_seq", 0))
     resp_nonce_match = (response.get("recovery_nonce", "") == req_nonce)
+    server_last_seq_after = resp_server_seq
+    server_last_mem_after = response.get("server_last_mem", "")
 
     # Verify nonce consumed by re-submitting the same ticket
     nonce_consumed = False
@@ -231,6 +237,9 @@ def run_control(sock, file_obj, session_id, checkpoint_interval, payload_size):
         )
         nonce_consumed = not ok2 and "replay" in resp2.get("reason", "").lower()
 
+    state_unchanged = (server_last_seq_before == server_last_seq_after and
+                       server_last_mem_before == server_last_mem_after)
+
     return {
         "scenario": "control",
         "checkpoint_interval": checkpoint_interval,
@@ -238,22 +247,22 @@ def run_control(sock, file_obj, session_id, checkpoint_interval, payload_size):
         "ticket_seq": ticket_seq,
         "client_seq": 100,
         "server_seq": server_seq,
-        "floor_seq": resp_floor_seq,
-        "response_seq": resp_server_seq,
-        "gap": server_seq - ticket_seq,
-        "response_advance": resp_server_seq - server_seq,
-        "request_auth_ok": response.get("reason") != "invalid recovery request auth_tag",
+        "recovery_floor": resp_floor_seq,
+        "ticket_last_seq": resp_ticket_last_seq,
+        "server_last_seq_before": server_last_seq_before,
+        "server_last_seq_after": server_last_seq_after,
+        "server_last_mem_before": server_last_mem_before,
+        "server_last_mem_after": server_last_mem_after,
+        "request_auth_ok": response.get("request_auth_ok", True),
         "response_auth_ok": resp_auth,
+        "response_verify_reason": resp_reason,
         "nonce_match": resp_nonce_match,
         "nonce_consumed": nonce_consumed,
         "race_winner_count": 0,
-        "state_unchanged": resp_server_seq == server_seq,
+        "state_unchanged": state_unchanged,
         "success": ok,
         "reason": response.get("reason", "unknown"),
-        "response_verify_reason": resp_reason,
         "recovery_latency_ms": round(latency_ms, 3),
-        "recovery_floor": resp_floor_seq,
-        "ticket_last_seq": resp_ticket_last_seq,
     }
 
 
@@ -278,18 +287,20 @@ def run_ack_loss(sock, file_obj, session_id, checkpoint_interval, payload_size):
     ticket_seq = int(saved_ticket["last_seq"]) if saved_ticket else 100
 
     # Phase 2: server accepts 101-149 (client discards responses)
+    last_data_resp = None
     for seq in range(101, 150):
         payload = f"ack-{seq:04d}-{prefix}"
         _send_json(sock, build_data_packet(
             session_id=session_id, sender_id=CLIENT_ID, epoch=EPOCH,
             seq=seq, prev_mem=current_mem, payload=payload,
         ))
-        # Discard response
-        _recv_json(file_obj)
+        last_data_resp = _recv_json(file_obj)
         payload_hash = hash_text(payload)
         current_mem = update_memory(current_mem, session_id, EPOCH, seq, payload_hash, CLIENT_ID)
 
-    server_seq = 149
+    server_seq = int(last_data_resp.get("last_seq", 149)) if last_data_resp else 149
+    server_last_seq_before = server_seq
+    server_last_mem_before = last_data_resp.get("last_mem", current_mem) if last_data_resp else current_mem
 
     # Client thinks it's at seq=100 (ACKs for 101-149 were lost)
     # But client's actual state variable was advanced; for the experiment
@@ -308,6 +319,8 @@ def run_ack_loss(sock, file_obj, session_id, checkpoint_interval, payload_size):
     resp_floor_seq = int(response.get("recovery_floor", response.get("checkpoint_seq", 0)))
     resp_ticket_last_seq = int(response.get("ticket_last_seq", 0))
     resp_nonce_match = (response.get("recovery_nonce", "") == req_nonce)
+    server_last_seq_after = resp_server_seq
+    server_last_mem_after = response.get("server_last_mem", "")
 
     # Verify nonce consumed by re-submitting the same ticket
     nonce_consumed = False
@@ -321,6 +334,9 @@ def run_ack_loss(sock, file_obj, session_id, checkpoint_interval, payload_size):
         )
         nonce_consumed = not ok2 and "replay" in resp2.get("reason", "").lower()
 
+    state_unchanged = (server_last_seq_before == server_last_seq_after and
+                       server_last_mem_before == server_last_mem_after)
+
     return {
         "scenario": "ack_loss",
         "checkpoint_interval": checkpoint_interval,
@@ -328,22 +344,22 @@ def run_ack_loss(sock, file_obj, session_id, checkpoint_interval, payload_size):
         "ticket_seq": ticket_seq,
         "client_seq": 100,
         "server_seq": server_seq,
-        "floor_seq": resp_floor_seq,
-        "response_seq": resp_server_seq,
-        "gap": server_seq - ticket_seq,
-        "response_advance": resp_server_seq - server_seq,
-        "request_auth_ok": response.get("reason") != "invalid recovery request auth_tag",
+        "recovery_floor": resp_floor_seq,
+        "ticket_last_seq": resp_ticket_last_seq,
+        "server_last_seq_before": server_last_seq_before,
+        "server_last_seq_after": server_last_seq_after,
+        "server_last_mem_before": server_last_mem_before,
+        "server_last_mem_after": server_last_mem_after,
+        "request_auth_ok": response.get("request_auth_ok", True),
         "response_auth_ok": resp_auth,
+        "response_verify_reason": resp_reason,
         "nonce_match": resp_nonce_match,
         "nonce_consumed": nonce_consumed,
         "race_winner_count": 0,
-        "state_unchanged": resp_server_seq == server_seq,
+        "state_unchanged": state_unchanged,
         "success": ok,
         "reason": response.get("reason", "unknown"),
-        "response_verify_reason": resp_reason,
         "recovery_latency_ms": round(latency_ms, 3),
-        "recovery_floor": resp_floor_seq,
-        "ticket_last_seq": resp_ticket_last_seq,
     }
 
 
@@ -381,15 +397,19 @@ def run_old_ticket_within_window(sock, file_obj, session_id, checkpoint_interval
     advance_target = next_ckpt - 1
     server_seq = advance_target
 
+    last_data_resp = None
     for seq in range(101, advance_target + 1):
         payload = f"oldw-{seq:04d}-{prefix}"
         _send_json(sock, build_data_packet(
             session_id=session_id, sender_id=CLIENT_ID, epoch=EPOCH,
             seq=seq, prev_mem=current_mem, payload=payload,
         ))
-        _recv_json(file_obj)
+        last_data_resp = _recv_json(file_obj)
         payload_hash = hash_text(payload)
         current_mem = update_memory(current_mem, session_id, EPOCH, seq, payload_hash, CLIENT_ID)
+
+    server_last_seq_before = int(last_data_resp.get("last_seq", server_seq)) if last_data_resp else server_seq
+    server_last_mem_before = last_data_resp.get("last_mem", current_mem) if last_data_resp else current_mem
 
     ok, response, latency_ms, resp_auth, resp_reason, req_nonce = _send_recovery(
         sock, file_obj, session_id,
@@ -403,6 +423,8 @@ def run_old_ticket_within_window(sock, file_obj, session_id, checkpoint_interval
     resp_floor_seq = int(response.get("recovery_floor", response.get("checkpoint_seq", 0)))
     resp_ticket_last_seq = int(response.get("ticket_last_seq", 0))
     resp_nonce_match = (response.get("recovery_nonce", "") == req_nonce)
+    server_last_seq_after = resp_server_seq
+    server_last_mem_after = response.get("server_last_mem", "")
 
     # Verify nonce consumed by re-submitting the same ticket
     nonce_consumed = False
@@ -416,6 +438,9 @@ def run_old_ticket_within_window(sock, file_obj, session_id, checkpoint_interval
         )
         nonce_consumed = not ok2 and "replay" in resp2.get("reason", "").lower()
 
+    state_unchanged = (server_last_seq_before == server_last_seq_after and
+                       server_last_mem_before == server_last_mem_after)
+
     return {
         "scenario": "old_ticket_within_window",
         "checkpoint_interval": checkpoint_interval,
@@ -423,22 +448,22 @@ def run_old_ticket_within_window(sock, file_obj, session_id, checkpoint_interval
         "ticket_seq": ticket_seq,
         "client_seq": 100,
         "server_seq": server_seq,
-        "floor_seq": resp_floor_seq,
-        "response_seq": resp_server_seq,
-        "gap": server_seq - ticket_seq,
-        "response_advance": resp_server_seq - server_seq,
-        "request_auth_ok": response.get("reason") != "invalid recovery request auth_tag",
+        "recovery_floor": resp_floor_seq,
+        "ticket_last_seq": resp_ticket_last_seq,
+        "server_last_seq_before": server_last_seq_before,
+        "server_last_seq_after": server_last_seq_after,
+        "server_last_mem_before": server_last_mem_before,
+        "server_last_mem_after": server_last_mem_after,
+        "request_auth_ok": response.get("request_auth_ok", True),
         "response_auth_ok": resp_auth,
+        "response_verify_reason": resp_reason,
         "nonce_match": resp_nonce_match,
         "nonce_consumed": nonce_consumed,
         "race_winner_count": 0,
-        "state_unchanged": resp_server_seq == server_seq,
+        "state_unchanged": state_unchanged,
         "success": ok,
         "reason": response.get("reason", "unknown"),
-        "response_verify_reason": resp_reason,
         "recovery_latency_ms": round(latency_ms, 3),
-        "recovery_floor": resp_floor_seq,
-        "ticket_last_seq": resp_ticket_last_seq,
     }
 
 
@@ -468,17 +493,20 @@ def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_siz
     ticket_seq = int(saved_ticket["last_seq"]) if saved_ticket else 100
 
     # Phase 2: advance to seq=200 so a new checkpoint at 200 is created
+    last_data_resp = None
     for seq in range(101, 201):
         payload = f"blwf-{seq:04d}-{prefix}"
         _send_json(sock, build_data_packet(
             session_id=session_id, sender_id=CLIENT_ID, epoch=EPOCH,
             seq=seq, prev_mem=current_mem, payload=payload,
         ))
-        _recv_json(file_obj)
+        last_data_resp = _recv_json(file_obj)
         payload_hash = hash_text(payload)
         current_mem = update_memory(current_mem, session_id, EPOCH, seq, payload_hash, CLIENT_ID)
 
-    server_seq = 200
+    server_seq = int(last_data_resp.get("last_seq", 200)) if last_data_resp else 200
+    server_last_seq_before = server_seq
+    server_last_mem_before = last_data_resp.get("last_mem", current_mem) if last_data_resp else current_mem
 
     ok, response, latency_ms, resp_auth, resp_reason, req_nonce = _send_recovery(
         sock, file_obj, session_id,
@@ -492,6 +520,8 @@ def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_siz
     resp_floor_seq = int(response.get("recovery_floor", response.get("checkpoint_seq", 0)))
     resp_ticket_last_seq = int(response.get("ticket_last_seq", 0))
     resp_nonce_match = (response.get("recovery_nonce", "") == req_nonce)
+    server_last_seq_after = resp_server_seq
+    server_last_mem_after = response.get("server_last_mem", "")
 
     # Verify nonce consumed by re-submitting the same ticket
     nonce_consumed = False
@@ -505,6 +535,9 @@ def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_siz
         )
         nonce_consumed = not ok2 and "replay" in resp2.get("reason", "").lower()
 
+    state_unchanged = (server_last_seq_before == server_last_seq_after and
+                       server_last_mem_before == server_last_mem_after)
+
     return {
         "scenario": "below_floor",
         "checkpoint_interval": checkpoint_interval,
@@ -512,22 +545,22 @@ def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_siz
         "ticket_seq": ticket_seq,
         "client_seq": 100,
         "server_seq": server_seq,
-        "floor_seq": resp_floor_seq,
-        "response_seq": resp_server_seq,
-        "gap": server_seq - ticket_seq,
-        "response_advance": "N/A",
-        "request_auth_ok": response.get("reason") != "invalid recovery request auth_tag",
+        "recovery_floor": resp_floor_seq,
+        "ticket_last_seq": resp_ticket_last_seq,
+        "server_last_seq_before": server_last_seq_before,
+        "server_last_seq_after": server_last_seq_after,
+        "server_last_mem_before": server_last_mem_before,
+        "server_last_mem_after": server_last_mem_after,
+        "request_auth_ok": response.get("request_auth_ok", True),
         "response_auth_ok": resp_auth,
+        "response_verify_reason": resp_reason,
         "nonce_match": resp_nonce_match,
         "nonce_consumed": nonce_consumed,
         "race_winner_count": 0,
-        "state_unchanged": resp_server_seq == server_seq,
+        "state_unchanged": state_unchanged,
         "success": ok,
         "reason": response.get("reason", "unknown"),
-        "response_verify_reason": resp_reason,
         "recovery_latency_ms": round(latency_ms, 3),
-        "recovery_floor": resp_floor_seq,
-        "ticket_last_seq": resp_ticket_last_seq,
     }
 
 
@@ -559,12 +592,12 @@ def run_nonce_race(host, port, session_id, checkpoint_interval, payload_size):
             "ticket_seq": ticket_seq,
             "client_seq": 100,
             "server_seq": 100,
-            "floor_seq": 0,
-            "response_seq": 0,
-            "gap": 0,
-            "response_advance": 0,
+            "recovery_floor": 0, "ticket_last_seq": 0,
+            "server_last_seq_before": 0, "server_last_seq_after": 0,
+            "server_last_mem_before": "", "server_last_mem_after": "",
             "request_auth_ok": False,
             "response_auth_ok": False,
+            "response_verify_reason": "",
             "nonce_match": False,
             "nonce_consumed": False,
             "race_winner_count": 0,
@@ -572,7 +605,6 @@ def run_nonce_race(host, port, session_id, checkpoint_interval, payload_size):
             "success": False,
             "reason": "no ticket obtained",
             "recovery_latency_ms": 0,
-            "recovery_floor": 0, "ticket_last_seq": 0,
         }
 
     # Phase 2: two threads race with the same ticket
@@ -627,6 +659,11 @@ def run_nonce_race(host, port, session_id, checkpoint_interval, payload_size):
     # Collect response_verify_reason from all workers
     all_verify_reasons = [r["reason"] for r in results if r]
 
+    # Get request_auth_ok from all workers
+    all_req_auth_ok = all(
+        r.get("response", {}).get("request_auth_ok", True) for r in results if r
+    )
+
     return {
         "scenario": "nonce_race",
         "checkpoint_interval": checkpoint_interval,
@@ -634,27 +671,24 @@ def run_nonce_race(host, port, session_id, checkpoint_interval, payload_size):
         "ticket_seq": ticket_seq,
         "client_seq": 100,
         "server_seq": 100,
-        "floor_seq": race_floor,
-        "response_seq": 100 if winners > 0 else 0,
-        "gap": 0,
-        "response_advance": 0,
-        "request_auth_ok": all(
-            r.get("response", {}).get("reason") != "invalid recovery request auth_tag"
-            for r in results if r
-        ),
+        "recovery_floor": race_floor,
+        "ticket_last_seq": race_ticket_last,
+        "server_last_seq_before": 100,
+        "server_last_seq_after": 100 if winners > 0 else 0,
+        "server_last_mem_before": "",
+        "server_last_mem_after": winner_resp.get("server_last_mem", ""),
+        "request_auth_ok": all_req_auth_ok,
         "response_auth_ok": all(r["auth"] for r in results if r),
+        "response_verify_reason": "; ".join(all_verify_reasons),
         "nonce_match": True,
         "nonce_consumed": winners > 0,
         "race_winner_count": winners,
         "state_unchanged": False,
         "success": winners == 1,
         "reason": f"winners={winners}, loser={loser_reason}",
-        "response_verify_reason": "; ".join(all_verify_reasons),
         "recovery_latency_ms": round(
             max(r["latency_ms"] for r in results if r), 3
         ),
-        "recovery_floor": race_floor,
-        "ticket_last_seq": race_ticket_last,
     }
 
 
@@ -701,12 +735,12 @@ def run_window_scenario(
 
 CSV_COLUMNS = [
     "scenario", "checkpoint_interval", "payload_size", "repeat_id",
-    "ticket_seq", "client_seq", "server_seq", "floor_seq", "response_seq",
-    "gap", "response_advance", "request_auth_ok", "response_auth_ok",
+    "ticket_seq", "client_seq", "server_seq", "recovery_floor", "ticket_last_seq",
+    "server_last_seq_before", "server_last_seq_after",
+    "server_last_mem_before", "server_last_mem_after",
+    "request_auth_ok", "response_auth_ok", "response_verify_reason",
     "nonce_match", "nonce_consumed", "race_winner_count", "state_unchanged",
-    "response_verify_reason",
     "success", "reason", "recovery_latency_ms",
-    "recovery_floor", "ticket_last_seq",
 ]
 
 NON_RACE_SCENARIOS = ["control", "ack_loss", "old_ticket_within_window", "below_floor"]
@@ -754,15 +788,16 @@ def main():
                                 "payload_size": ps,
                                 "repeat_id": rep,
                                 "ticket_seq": 0, "client_seq": 0, "server_seq": 0,
-                                "floor_seq": 0, "response_seq": 0,
-                                "gap": 0, "response_advance": 0,
+                                "recovery_floor": 0, "ticket_last_seq": 0,
+                                "server_last_seq_before": 0, "server_last_seq_after": 0,
+                                "server_last_mem_before": "", "server_last_mem_after": "",
                                 "request_auth_ok": False, "response_auth_ok": False,
+                                "response_verify_reason": "",
                                 "nonce_match": False, "nonce_consumed": False,
                                 "race_winner_count": 0, "state_unchanged": False,
                                 "success": False,
                                 "reason": f"error: {e}",
                                 "recovery_latency_ms": 0,
-                                "recovery_floor": 0, "ticket_last_seq": 0,
                             })
 
         # Race scenario: fewer configs, RACE_REPEATS each
@@ -789,15 +824,16 @@ def main():
                             "payload_size": ps,
                             "repeat_id": rep,
                             "ticket_seq": 0, "client_seq": 0, "server_seq": 0,
-                            "floor_seq": 0, "response_seq": 0,
-                            "gap": 0, "response_advance": 0,
+                            "recovery_floor": 0, "ticket_last_seq": 0,
+                            "server_last_seq_before": 0, "server_last_seq_after": 0,
+                            "server_last_mem_before": "", "server_last_mem_after": "",
                             "request_auth_ok": False, "response_auth_ok": False,
+                            "response_verify_reason": "",
                             "nonce_match": False, "nonce_consumed": False,
                             "race_winner_count": 0, "state_unchanged": False,
                             "success": False,
                             "reason": f"error: {e}",
                             "recovery_latency_ms": 0,
-                            "recovery_floor": 0, "ticket_last_seq": 0,
                         })
 
         # Write CSV

@@ -122,7 +122,7 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
     chain_checkpoint_hash = ""
     target_hash_by_seq: Dict[int, str] = {}
 
-    with open(history_path, "w", encoding="utf-8") as hf, \
+    with open(history_path, "wb") as hf, \
          open(chain_path, "w", encoding="utf-8") as cf:
 
         # Track byte position after each GMCP line (for seek-based recovery)
@@ -150,7 +150,8 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
             }
             # Sign with DATA_AUTH_KEY
             gmcp_record = with_hmac(DATA_AUTH_KEY, gmcp_record, tag_field="auth_tag")
-            hf.write(canonical_json(gmcp_record) + "\n")
+            raw = (canonical_json(gmcp_record) + '\n').encode('utf-8')
+            hf.write(raw)
             line_end_offsets.append(hf.tell())
 
             # Store checkpoint at n-k
@@ -164,6 +165,8 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
                     "timestamp": time.time(),
                     # Byte offset of the END of the checkpoint line = start of next record
                     "log_byte_offset": line_end_offsets[checkpoint_seq - 1],
+                    # Seq of the first record to replay after checkpoint
+                    "next_seq": checkpoint_seq + 1,
                 }
                 checkpoint_record["signature"] = hmac_sha256_hex(
                     CHECKPOINT_AUTH_KEY, checkpoint_record
@@ -268,6 +271,8 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
     auth_records = 1  # checkpoint verification
     physical_bytes = 0
     logical_bytes_replayed = 0
+    sender_id = "bench-client"
+    epoch = 1
 
     with open(prepared.history_path, "rb") as f:
         f.seek(seek_offset)
@@ -309,6 +314,97 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
                     chain_continuity_ok=True, payload_hash_ok=True,
                     recovery_valid=False,
                     failure_reason=f"record_auth_failed_seq_{seq}",
+                    records_scanned=records_scanned, records_replayed=replay_count,
+                    physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
+                    seek_offset=seek_offset,
+                )
+
+            # Verify session_id, sender_id, epoch
+            if record.get("session_id") != session_id:
+                t1 = time.perf_counter_ns()
+                line_bytes = len(raw)
+                return RecoveryMeasurement(
+                    protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
+                    repeat_id=prepared.repeat_id, replay_count=replay_count,
+                    recovery_material_bytes=material_bytes + line_bytes,
+                    logical_bytes_read=logical_bytes + line_bytes,
+                    auth_records_verified=auth_records + 1,
+                    recovery_time_ns=t1 - t0,
+                    target_seq=target_seq,
+                    reconstructed_mem=reconstructed_mem, reconstructed_hash="",
+                    target_state_match=False,
+                    checkpoint_auth_ok=True, record_auth_ok=False,
+                    chain_continuity_ok=True, payload_hash_ok=True,
+                    recovery_valid=False,
+                    failure_reason=f"session_id_mismatch_seq_{seq}",
+                    records_scanned=records_scanned, records_replayed=replay_count,
+                    physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
+                    seek_offset=seek_offset,
+                )
+
+            if record.get("sender_id") != sender_id:
+                t1 = time.perf_counter_ns()
+                line_bytes = len(raw)
+                return RecoveryMeasurement(
+                    protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
+                    repeat_id=prepared.repeat_id, replay_count=replay_count,
+                    recovery_material_bytes=material_bytes + line_bytes,
+                    logical_bytes_read=logical_bytes + line_bytes,
+                    auth_records_verified=auth_records + 1,
+                    recovery_time_ns=t1 - t0,
+                    target_seq=target_seq,
+                    reconstructed_mem=reconstructed_mem, reconstructed_hash="",
+                    target_state_match=False,
+                    checkpoint_auth_ok=True, record_auth_ok=False,
+                    chain_continuity_ok=True, payload_hash_ok=True,
+                    recovery_valid=False,
+                    failure_reason=f"sender_id_mismatch_seq_{seq}",
+                    records_scanned=records_scanned, records_replayed=replay_count,
+                    physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
+                    seek_offset=seek_offset,
+                )
+
+            if record.get("epoch") != epoch:
+                t1 = time.perf_counter_ns()
+                line_bytes = len(raw)
+                return RecoveryMeasurement(
+                    protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
+                    repeat_id=prepared.repeat_id, replay_count=replay_count,
+                    recovery_material_bytes=material_bytes + line_bytes,
+                    logical_bytes_read=logical_bytes + line_bytes,
+                    auth_records_verified=auth_records + 1,
+                    recovery_time_ns=t1 - t0,
+                    target_seq=target_seq,
+                    reconstructed_mem=reconstructed_mem, reconstructed_hash="",
+                    target_state_match=False,
+                    checkpoint_auth_ok=True, record_auth_ok=False,
+                    chain_continuity_ok=True, payload_hash_ok=True,
+                    recovery_valid=False,
+                    failure_reason=f"epoch_mismatch_seq_{seq}",
+                    records_scanned=records_scanned, records_replayed=replay_count,
+                    physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
+                    seek_offset=seek_offset,
+                )
+
+            # Verify seq continuity
+            expected_seq = prepared.checkpoint_seq + replay_count + 1
+            if record["seq"] != expected_seq:
+                t1 = time.perf_counter_ns()
+                line_bytes = len(raw)
+                return RecoveryMeasurement(
+                    protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
+                    repeat_id=prepared.repeat_id, replay_count=replay_count,
+                    recovery_material_bytes=material_bytes + line_bytes,
+                    logical_bytes_read=logical_bytes + line_bytes,
+                    auth_records_verified=auth_records + 1,
+                    recovery_time_ns=t1 - t0,
+                    target_seq=target_seq,
+                    reconstructed_mem=reconstructed_mem, reconstructed_hash="",
+                    target_state_match=False,
+                    checkpoint_auth_ok=True, record_auth_ok=True,
+                    chain_continuity_ok=False, payload_hash_ok=True,
+                    recovery_valid=False,
+                    failure_reason=f"seq_continuity_failed_seq_{seq}_expected_{expected_seq}",
                     records_scanned=records_scanned, records_replayed=replay_count,
                     physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
                     seek_offset=seek_offset,
@@ -380,6 +476,13 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
 
     # Target state: compare against pre-computed target from prepare_history
     target_mem = prepared.target_mem_by_seq.get(target_seq, "")
+    target_state_match = (reconstructed_mem == target_mem)
+    # recovery_valid: all checks passed AND state matches AND counts correct
+    recovery_valid = (
+        target_state_match
+        and replay_count == offset
+        and records_scanned == offset
+    )
 
     return RecoveryMeasurement(
         protocol="gmcp_r",
@@ -395,10 +498,10 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
         target_seq=target_seq,
         reconstructed_mem=reconstructed_mem,
         reconstructed_hash="",  # not applicable for GMCP
-        target_state_match=(reconstructed_mem == target_mem),
+        target_state_match=target_state_match,
         checkpoint_auth_ok=True, record_auth_ok=True,
         chain_continuity_ok=True, payload_hash_ok=True,
-        recovery_valid=True, failure_reason="",
+        recovery_valid=recovery_valid, failure_reason="",
         records_scanned=records_scanned, records_replayed=replay_count,
         physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
         seek_offset=seek_offset,
@@ -432,12 +535,19 @@ def measure_authenticated_chain_recovery(prepared: PreparedHistory, offset: int)
     logical_bytes = 0
     auth_records = 0
     reconstructed_hash = current_hash
+    records_scanned = 0
+    physical_bytes = 0
+    logical_bytes_replayed = 0
 
     with open(prepared.chain_path, "r", encoding="utf-8") as f:
         for line in f:
+            line_bytes = len(line.encode("utf-8"))
+            physical_bytes += line_bytes
             packet = json.loads(line)
             seq = packet["seq"]
+            records_scanned += 1
             if seq > target_seq:
+                records_scanned -= 1  # don't count overshoot
                 break
 
             # Verify: HMAC + chain hash + prev_hash
@@ -451,7 +561,6 @@ def measure_authenticated_chain_recovery(prepared: PreparedHistory, offset: int)
 
             if not ok:
                 t1 = time.perf_counter_ns()
-                line_bytes = len(line.encode("utf-8"))
                 return RecoveryMeasurement(
                     protocol="authenticated_hash_chain",
                     n=prepared.n, k=prepared.k, offset=offset,
@@ -467,17 +576,27 @@ def measure_authenticated_chain_recovery(prepared: PreparedHistory, offset: int)
                     chain_continuity_ok=False, payload_hash_ok=True,
                     recovery_valid=False,
                     failure_reason=f"chain_verify_failed_seq_{seq}_{reason}",
+                    records_scanned=records_scanned, records_replayed=replay_count,
+                    physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
+                    seek_offset=0,
                 )
 
             current_hash = packet["chain_hash"]
             reconstructed_hash = current_hash
             replay_count += 1
-            line_bytes = len(line.encode("utf-8"))
             material_bytes += line_bytes
             logical_bytes += line_bytes
             auth_records += 1
+            logical_bytes_replayed += line_bytes
 
     t1 = time.perf_counter_ns()
+
+    target_state_match = (reconstructed_hash == prepared.target_hash_by_seq.get(target_seq, ""))
+    recovery_valid = (
+        target_state_match
+        and replay_count == target_seq
+        and records_scanned == target_seq
+    )
 
     return RecoveryMeasurement(
         protocol="authenticated_hash_chain",
@@ -493,10 +612,13 @@ def measure_authenticated_chain_recovery(prepared: PreparedHistory, offset: int)
         target_seq=target_seq,
         reconstructed_mem="",  # not applicable for chain
         reconstructed_hash=reconstructed_hash,
-        target_state_match=(reconstructed_hash == prepared.target_hash_by_seq.get(target_seq, "")),
+        target_state_match=target_state_match,
         checkpoint_auth_ok=True, record_auth_ok=True,
         chain_continuity_ok=True, payload_hash_ok=True,
-        recovery_valid=True, failure_reason="",
+        recovery_valid=recovery_valid, failure_reason="",
+        records_scanned=records_scanned, records_replayed=replay_count,
+        physical_bytes_read=physical_bytes, logical_bytes_replayed=logical_bytes_replayed,
+        seek_offset=0,
     )
 
 

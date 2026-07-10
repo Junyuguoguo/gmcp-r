@@ -294,6 +294,8 @@ def handle_client(conn, addr, registry: SessionRegistry):
     bound_protocol = None
     bound_session_id = None
     bound_sender_id = None
+    bound_epoch = None
+    hello_done = False
 
     file_obj = None
 
@@ -334,39 +336,91 @@ def handle_client(conn, addr, registry: SessionRegistry):
                 })
                 continue
 
+            # HELLO handshake
+            if packet_type == "HELLO":
+                hello_protocol = packet.get("protocol", "gmcp")
+                hello_session_id = packet.get("session_id", "unknown-session")
+                hello_sender_id = packet.get("sender_id", "unknown-sender")
+                hello_epoch = packet.get("epoch", 0)
+
+                # Verify auth_tag on HELLO
+                hello_tag = packet.get("auth_tag", "")
+                hello_data = dict(packet)
+                hello_data.pop("auth_tag", None)
+                if not verify_hmac(DATA_AUTH_KEY, hello_data, hello_tag):
+                    send_json_line(conn, {
+                        "ok": False,
+                        "type": "HELLO_ACK",
+                        "reason": "HELLO auth_tag invalid",
+                        "server_time": recv_time,
+                    })
+                    continue
+
+                # Bind connection
+                bound_protocol = hello_protocol
+                bound_session_id = hello_session_id
+                bound_sender_id = hello_sender_id
+                bound_epoch = hello_epoch
+                hello_done = True
+
+                send_json_line(conn, {
+                    "ok": True,
+                    "type": "HELLO_ACK",
+                    "reason": "ok",
+                    "protocol": bound_protocol,
+                    "session_id": bound_session_id,
+                    "server_time": recv_time,
+                })
+                continue
+
             # RECOVERY_REQUEST
             if packet_type == "RECOVERY_REQUEST":
+                # Strict mode: require HELLO first
+                if not hello_done:
+                    send_json_line(conn, {
+                        "ok": False,
+                        "type": "RECOVERY_RESPONSE",
+                        "reason": "connection not bound: HELLO required",
+                        "server_time": recv_time,
+                    })
+                    continue
+
                 rec_session_id = packet.get("session_id", "unknown-session")
                 rec_protocol = packet.get("protocol", "gmcp")
                 rec_sender_id = packet.get("sender_id", "unknown-sender")
-                # --- Connection-level binding for RECOVERY_REQUEST ---
-                if bound_protocol is None:
-                    bound_protocol = rec_protocol
-                    bound_session_id = rec_session_id
-                    bound_sender_id = rec_sender_id
-                else:
-                    if rec_protocol != bound_protocol:
-                        send_json_line(conn, {
-                            "ok": False,
-                            "type": "RECOVERY_RESPONSE",
-                            "reason": f"connection protocol mismatch: bound={bound_protocol}, got={rec_protocol}",
-                            "server_time": recv_time,
-                        })
-                        continue
-                    if rec_session_id != bound_session_id:
-                        send_json_line(conn, {
-                            "ok": False,
-                            "type": "RECOVERY_RESPONSE",
-                            "reason": f"connection session mismatch: bound={bound_session_id}, got={rec_session_id}",
-                            "server_time": recv_time,
-                        })
-                        continue
+                # --- Connection-level binding check for RECOVERY_REQUEST ---
+                if rec_protocol != bound_protocol:
+                    send_json_line(conn, {
+                        "ok": False,
+                        "type": "RECOVERY_RESPONSE",
+                        "reason": f"connection protocol mismatch: bound={bound_protocol}, got={rec_protocol}",
+                        "server_time": recv_time,
+                    })
+                    continue
+                if rec_session_id != bound_session_id:
+                    send_json_line(conn, {
+                        "ok": False,
+                        "type": "RECOVERY_RESPONSE",
+                        "reason": f"connection session mismatch: bound={bound_session_id}, got={rec_session_id}",
+                        "server_time": recv_time,
+                    })
+                    continue
                 response = handle_recovery_request(packet, registry)
                 send_json_line(conn, response)
                 continue
 
             # DATA packet — route by protocol
             protocol = packet.get("protocol", "gmcp")
+
+            # Strict mode: require HELLO first
+            if not hello_done:
+                send_json_line(conn, {
+                    "ok": False,
+                    "reason": "connection not bound: HELLO required",
+                    "server_time": recv_time,
+                })
+                continue
+
             if protocol not in SUPPORTED_PROTOCOLS:
                 send_json_line(conn, {
                     "ok": False,
@@ -377,34 +431,37 @@ def handle_client(conn, addr, registry: SessionRegistry):
 
             session_id = packet.get("session_id", "unknown-session")
             sender_id = packet.get("sender_id", "unknown-sender")
+            epoch = packet.get("epoch", 0)
 
-            # --- Connection-level binding: first DATA binds, subsequent must match ---
-            if bound_protocol is None:
-                bound_protocol = protocol
-                bound_session_id = session_id
-                bound_sender_id = sender_id
-            else:
-                if protocol != bound_protocol:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "reason": f"connection protocol mismatch: bound={bound_protocol}, got={protocol}",
-                        "server_time": recv_time,
-                    })
-                    continue
-                if session_id != bound_session_id:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "reason": f"connection session mismatch: bound={bound_session_id}, got={session_id}",
-                        "server_time": recv_time,
-                    })
-                    continue
-                if sender_id != bound_sender_id:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "reason": f"connection sender mismatch: bound={bound_sender_id}, got={sender_id}",
-                        "server_time": recv_time,
-                    })
-                    continue
+            # --- Connection-level binding check ---
+            if protocol != bound_protocol:
+                send_json_line(conn, {
+                    "ok": False,
+                    "reason": f"connection protocol mismatch: bound={bound_protocol}, got={protocol}",
+                    "server_time": recv_time,
+                })
+                continue
+            if session_id != bound_session_id:
+                send_json_line(conn, {
+                    "ok": False,
+                    "reason": f"connection session mismatch: bound={bound_session_id}, got={session_id}",
+                    "server_time": recv_time,
+                })
+                continue
+            if sender_id != bound_sender_id:
+                send_json_line(conn, {
+                    "ok": False,
+                    "reason": f"connection sender mismatch: bound={bound_sender_id}, got={sender_id}",
+                    "server_time": recv_time,
+                })
+                continue
+            if epoch != bound_epoch:
+                send_json_line(conn, {
+                    "ok": False,
+                    "reason": f"connection epoch mismatch: bound={bound_epoch}, got={epoch}",
+                    "server_time": recv_time,
+                })
+                continue
 
             registry_key = f"{protocol}:{session_id}"
 

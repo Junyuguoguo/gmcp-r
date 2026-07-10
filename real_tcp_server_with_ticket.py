@@ -106,9 +106,10 @@ def handle_recovery_request(packet, registry: SessionRegistry):
     if not ok_req:
         return _reject(session_id, recovery_nonce, "invalid recovery request auth_tag",
                         recv_time, extra={
-                            "server_last_seq": 0, "recovery_floor": 0, "ticket_last_seq": 0,
+                            "request_auth_ok": False,
+                            "server_last_seq": 0, "server_last_mem": "",
+                            "recovery_floor": 0, "ticket_last_seq": 0,
                         })
-
     client_ckpt_interval = int(packet.get("checkpoint_interval", CHECKPOINT_INTERVAL))
     # Validate range — fall back to default if out of bounds
     if client_ckpt_interval < 10 or client_ckpt_interval > 1000:
@@ -128,8 +129,9 @@ def handle_recovery_request(packet, registry: SessionRegistry):
             # 缺少票据，拒绝请求
             print(f"[SERVER] 恢复请求缺少MemoryTicket", flush=True)
             return _reject(session_id, recovery_nonce, "missing memory_ticket", recv_time,
-                            extra={"server_last_seq": state.last_seq, "recovery_floor": 0,
-                                   "ticket_last_seq": 0})
+                            extra={"request_auth_ok": True,
+                                   "server_last_seq": state.last_seq, "server_last_mem": state.last_mem,
+                                   "recovery_floor": 0, "ticket_last_seq": 0})
         
         from gmcp.ticket import validate_memory_ticket, consume_ticket_nonce
         # 获取最近的Checkpoint，使用其seq作为recovery_floor
@@ -154,8 +156,9 @@ def handle_recovery_request(packet, registry: SessionRegistry):
         if not ticket_valid:
             print(f"[SERVER] MemoryTicket验证失败: {ticket_reason}", flush=True)
             return _reject(session_id, recovery_nonce, f"memory_ticket invalid: {ticket_reason}", recv_time,
-                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
-                                   "ticket_last_seq": ticket_last_seq})
+                            extra={"request_auth_ok": True,
+                                   "server_last_seq": state.last_seq, "server_last_mem": state.last_mem,
+                                   "recovery_floor": recovery_floor, "ticket_last_seq": ticket_last_seq})
         
         print(f"[SERVER] MemoryTicket验证成功", flush=True)
         
@@ -169,48 +172,55 @@ def handle_recovery_request(packet, registry: SessionRegistry):
             # 找不到Checkpoint，拒绝恢复
             print(f"[SERVER] 未找到Checkpoint seq={ticket_checkpoint_seq}，拒绝恢复", flush=True)
             return _reject(session_id, recovery_nonce, "checkpoint not found", recv_time,
-                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
-                                   "ticket_last_seq": ticket_last_seq})
+                            extra={"request_auth_ok": True,
+                                   "server_last_seq": state.last_seq, "server_last_mem": state.last_mem,
+                                   "recovery_floor": recovery_floor, "ticket_last_seq": ticket_last_seq})
         
         # 验证Checkpoint认证标签
         checkpoint_ok, checkpoint_reason = checkpoint_mgr.verify_checkpoint(stored_checkpoint)
         if not checkpoint_ok:
             print(f"[SERVER] Checkpoint认证标签验证失败: {checkpoint_reason}", flush=True)
             return _reject(session_id, recovery_nonce, f"checkpoint authentication failed: {checkpoint_reason}", recv_time,
-                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
-                                   "ticket_last_seq": ticket_last_seq})
+                            extra={"request_auth_ok": True,
+                                   "server_last_seq": state.last_seq, "server_last_mem": state.last_mem,
+                                   "recovery_floor": recovery_floor, "ticket_last_seq": ticket_last_seq})
         
         # 比较Checkpoint的session_id、epoch、seq和memory
         if stored_checkpoint.session_id != session_id:
             print(f"[SERVER] Checkpoint session_id不匹配", flush=True)
             return _reject(session_id, recovery_nonce, "checkpoint session_id mismatch", recv_time,
-                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
-                                   "ticket_last_seq": ticket_last_seq})
+                            extra={"request_auth_ok": True,
+                                   "server_last_seq": state.last_seq, "server_last_mem": state.last_mem,
+                                   "recovery_floor": recovery_floor, "ticket_last_seq": ticket_last_seq})
         
         if stored_checkpoint.epoch != EPOCH:
             print(f"[SERVER] Checkpoint epoch不匹配", flush=True)
             return _reject(session_id, recovery_nonce, "checkpoint epoch mismatch", recv_time,
-                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
-                                   "ticket_last_seq": ticket_last_seq})
+                            extra={"request_auth_ok": True,
+                                   "server_last_seq": state.last_seq, "server_last_mem": state.last_mem,
+                                   "recovery_floor": recovery_floor, "ticket_last_seq": ticket_last_seq})
         
         if stored_checkpoint.seq != ticket_checkpoint_seq:
             print(f"[SERVER] Checkpoint seq不匹配: stored={stored_checkpoint.seq}, ticket={ticket_checkpoint_seq}", flush=True)
             return _reject(session_id, recovery_nonce, "checkpoint seq mismatch", recv_time,
-                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
-                                   "ticket_last_seq": ticket_last_seq})
+                            extra={"request_auth_ok": True,
+                                   "server_last_seq": state.last_seq, "server_last_mem": state.last_mem,
+                                   "recovery_floor": recovery_floor, "ticket_last_seq": ticket_last_seq})
         
         if stored_checkpoint.memory != ticket_checkpoint_mem:
             print(f"[SERVER] Checkpoint memory不匹配: stored={stored_checkpoint.memory[:16]}..., ticket={ticket_checkpoint_mem[:16]}...", flush=True)
             return _reject(session_id, recovery_nonce, "checkpoint memory mismatch", recv_time,
-                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
-                                   "ticket_last_seq": ticket_last_seq})
+                            extra={"request_auth_ok": True,
+                                   "server_last_seq": state.last_seq, "server_last_mem": state.last_mem,
+                                   "recovery_floor": recovery_floor, "ticket_last_seq": ticket_last_seq})
         
         # 验证ticket.checkpoint_seq <= ticket.last_seq <= server.last_seq
         if ticket_checkpoint_seq > ticket_last_seq or ticket_last_seq > state.last_seq:
             print(f"[SERVER] Checkpoint序列不一致: ckpt_seq={ticket_checkpoint_seq}, ticket_last={ticket_last_seq}, server_last={state.last_seq}", flush=True)
             return _reject(session_id, recovery_nonce, "checkpoint sequence inconsistency", recv_time,
-                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
-                                   "ticket_last_seq": ticket_last_seq})
+                            extra={"request_auth_ok": True,
+                                   "server_last_seq": state.last_seq, "server_last_mem": state.last_mem,
+                                   "recovery_floor": recovery_floor, "ticket_last_seq": ticket_last_seq})
         
         print(f"[SERVER] Checkpoint验证成功: seq={ticket_checkpoint_seq}", flush=True)
         
@@ -218,8 +228,9 @@ def handle_recovery_request(packet, registry: SessionRegistry):
         if not consume_ticket_nonce(client_ticket):
             print(f"[SERVER] nonce消费失败（可能已被使用）", flush=True)
             return _reject(session_id, recovery_nonce, "ticket replay detected during nonce consumption", recv_time,
-                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
-                                   "ticket_last_seq": ticket_last_seq})
+                            extra={"request_auth_ok": True,
+                                   "server_last_seq": state.last_seq, "server_last_mem": state.last_mem,
+                                   "recovery_floor": recovery_floor, "ticket_last_seq": ticket_last_seq})
         print(f"[SERVER] nonce已消费", flush=True)
         
         # 获取最近的Checkpoint
@@ -250,6 +261,7 @@ def handle_recovery_request(packet, registry: SessionRegistry):
             epoch=EPOCH,
             recovery_nonce=recovery_nonce,
             extra={
+                "request_auth_ok": True,
                 "recovery_mode": "memory_ticket_checkpoint",
                 "server_last_seq": state.last_seq,
                 "server_last_mem": state.last_mem,
@@ -273,6 +285,8 @@ def handle_client(conn, addr, registry: SessionRegistry):
     # --- Connection-level binding for cross-session attack detection ---
     bound_session_id = None
     bound_sender_id = None
+    bound_epoch = None
+    hello_done = False
 
     file_obj = None
 
@@ -315,48 +329,100 @@ def handle_client(conn, addr, registry: SessionRegistry):
                 })
                 continue
 
+            # HELLO handshake
+            if packet_type == "HELLO":
+                from gmcp.crypto_utils import verify_tagged_hmac
+                hello_protocol = packet.get("protocol", "gmcp")
+                hello_session_id = packet.get("session_id", "unknown-session")
+                hello_sender_id = packet.get("sender_id", "unknown-sender")
+                hello_epoch = packet.get("epoch", 0)
+
+                # Verify auth_tag on HELLO
+                if not verify_tagged_hmac(DATA_AUTH_KEY, packet):
+                    send_json_line(conn, {
+                        "ok": False,
+                        "type": "HELLO_ACK",
+                        "reason": "HELLO auth_tag invalid",
+                        "server_time": recv_time,
+                    })
+                    continue
+
+                # Bind connection
+                bound_session_id = hello_session_id
+                bound_sender_id = hello_sender_id
+                bound_epoch = hello_epoch
+                hello_done = True
+
+                send_json_line(conn, {
+                    "ok": True,
+                    "type": "HELLO_ACK",
+                    "reason": "ok",
+                    "session_id": bound_session_id,
+                    "server_time": recv_time,
+                })
+                continue
+
             if packet_type == "RECOVERY_REQUEST":
+                # Strict mode: require HELLO first
+                if not hello_done:
+                    send_json_line(conn, {
+                        "ok": False,
+                        "type": "RECOVERY_RESPONSE",
+                        "reason": "connection not bound: HELLO required",
+                        "server_time": recv_time,
+                    })
+                    continue
+
                 rec_session_id = packet.get("session_id", "unknown-session")
                 rec_sender_id = packet.get("sender_id", "unknown-sender")
-                # --- Connection-level binding for RECOVERY_REQUEST ---
-                if bound_session_id is None:
-                    bound_session_id = rec_session_id
-                    bound_sender_id = rec_sender_id
-                else:
-                    if rec_session_id != bound_session_id:
-                        send_json_line(conn, {
-                            "ok": False,
-                            "type": "RECOVERY_RESPONSE",
-                            "reason": f"connection session mismatch: bound={bound_session_id}, got={rec_session_id}",
-                            "server_time": recv_time,
-                        })
-                        continue
+                # --- Connection-level binding check for RECOVERY_REQUEST ---
+                if rec_session_id != bound_session_id:
+                    send_json_line(conn, {
+                        "ok": False,
+                        "type": "RECOVERY_RESPONSE",
+                        "reason": f"connection session mismatch: bound={bound_session_id}, got={rec_session_id}",
+                        "server_time": recv_time,
+                    })
+                    continue
                 response = handle_recovery_request(packet, registry)
                 send_json_line(conn, response)
                 continue
 
             session_id = packet.get("session_id", "unknown-session")
             sender_id = packet.get("sender_id", "unknown-sender")
+            epoch = packet.get("epoch", 0)
 
-            # --- Connection-level binding: first DATA binds, subsequent must match ---
-            if bound_session_id is None:
-                bound_session_id = session_id
-                bound_sender_id = sender_id
-            else:
-                if session_id != bound_session_id:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "reason": f"connection session mismatch: bound={bound_session_id}, got={session_id}",
-                        "server_time": recv_time,
-                    })
-                    continue
-                if sender_id != bound_sender_id:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "reason": f"connection sender mismatch: bound={bound_sender_id}, got={sender_id}",
-                        "server_time": recv_time,
-                    })
-                    continue
+            # Strict mode: require HELLO first
+            if not hello_done:
+                send_json_line(conn, {
+                    "ok": False,
+                    "reason": "connection not bound: HELLO required",
+                    "server_time": recv_time,
+                })
+                continue
+
+            # --- Connection-level binding check ---
+            if session_id != bound_session_id:
+                send_json_line(conn, {
+                    "ok": False,
+                    "reason": f"connection session mismatch: bound={bound_session_id}, got={session_id}",
+                    "server_time": recv_time,
+                })
+                continue
+            if sender_id != bound_sender_id:
+                send_json_line(conn, {
+                    "ok": False,
+                    "reason": f"connection sender mismatch: bound={bound_sender_id}, got={sender_id}",
+                    "server_time": recv_time,
+                })
+                continue
+            if epoch != bound_epoch:
+                send_json_line(conn, {
+                    "ok": False,
+                    "reason": f"connection epoch mismatch: bound={bound_epoch}, got={epoch}",
+                    "server_time": recv_time,
+                })
+                continue
 
             client_ckpt_interval = int(packet.get("checkpoint_interval", CHECKPOINT_INTERVAL))
             if client_ckpt_interval < 10 or client_ckpt_interval > 1000:
