@@ -2,7 +2,19 @@
 # run_real_baseline_comparison.py
 #
 # 真实Baseline对比实验
-# 对比GMCP-R与hash_chain、seq_mac、ticket_only协议
+# 对比GMCP-R与hash_chain、seq_mac、ticket_only、authenticated_hash_chain协议
+#
+# 攻击模型拆分为两类：
+#   1. 网络攻击者 (network_attacker) —— 不知道密钥，无法伪造有效MAC
+#      - modify_unsigned:      修改payload，不更新HMAC
+#      - metadata_tamper:      修改seq/session/prev_mem，不更新HMAC
+#      - exact_replay:         保存第1条完整合法报文，原封不动重发
+#
+#   2. 恶意持钥客户端 (malicious_client) —— 知道DATA密钥，可计算有效MAC
+#      - forged_prev_mem_valid_mac:  用合法HMAC构造与历史不连续的消息
+#      - sequence_gap_valid_mac:     跳过序列号
+#      - cross_session_valid_mac:    跨会话
+#      - cross_epoch_valid_mac:      跨epoch
 
 import csv
 import json
@@ -10,7 +22,7 @@ import os
 import socket
 import time
 import sys
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -54,6 +66,22 @@ from gmcp.baselines.authenticated_hash_chain import (
     AuthHashChainVerifier,
 )
 
+# 导入攻击模型
+from gmcp.attack import (
+    CATEGORY_NETWORK_ATTACKER,
+    CATEGORY_MALICIOUS_CLIENT,
+    ALL_ATTACK_TYPES,
+    attack_category,
+    attack_applicable_to_protocol,
+    apply_modify_unsigned,
+    apply_metadata_tamper,
+    apply_exact_replay,
+    build_forged_prev_mem_packet,
+    build_sequence_gap_packet,
+    build_cross_session_packet,
+    build_cross_epoch_packet,
+)
+
 
 OUTPUT_DIR = "results/real_baseline_comparison"
 OUTPUT_CSV = os.path.join(OUTPUT_DIR, "real_baseline_comparison_results.csv")
@@ -62,7 +90,10 @@ OUTPUT_CSV = os.path.join(OUTPUT_DIR, "real_baseline_comparison_results.csv")
 PROTOCOLS = ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]
 MESSAGE_COUNTS = [100, 500, 1000]
 PAYLOAD_SIZES = [128, 512]
-ATTACK_TYPES = ["none", "drop", "modify", "replay", "prev_mem"]
+
+# 攻击类型：两类攻击者模型
+ATTACK_TYPES = list(ALL_ATTACK_TYPES)
+
 REPEAT_COUNT = int(os.getenv("GMCP_REPEATS", "30"))
 REPEATS = list(range(1, REPEAT_COUNT + 1))
 
@@ -189,6 +220,112 @@ def build_packet_for_protocol(
         raise ValueError(f"Unknown protocol: {protocol}")
 
 
+def _get_build_fn(protocol: str):
+    """获取协议对应的build函数"""
+    if protocol == "gmcp_r":
+        return gmcp_build_data_packet
+    elif protocol == "hash_chain":
+        return hash_chain_build_packet
+    elif protocol == "authenticated_hash_chain":
+        return auth_hc_build_packet
+    elif protocol == "seq_mac":
+        return seq_mac_build_packet
+    elif protocol == "ticket_only":
+        return ticket_only_build_packet
+    raise ValueError(f"Unknown protocol: {protocol}")
+
+
+def apply_attack(
+    attack_type: str,
+    protocol: str,
+    packet: Dict[str, Any],
+    seq: int,
+    session_id: str,
+    sender_id: str,
+    epoch: int,
+    payload: str,
+    state: Any,
+    saved_first_packet: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """
+    应用攻击修改，返回 (modified_packet, attack_applicable)。
+    如果attack_applicable为False，表示该攻击对当前协议不适用。
+    返回None表示该包应该被跳过（drop场景，此处不使用）。
+    """
+    if attack_type == "none":
+        return packet, True
+
+    # ---- Category 1: 网络攻击者（不重算MAC） ----
+
+    if attack_type == "modify_unsigned":
+        return apply_modify_unsigned(packet), True
+
+    if attack_type == "metadata_tamper":
+        return apply_metadata_tamper(packet), True
+
+    if attack_type == "exact_replay":
+        if saved_first_packet is None:
+            # 没有保存的首包，攻击无法执行
+            return packet, False
+        return apply_exact_replay(saved_first_packet), True
+
+    # ---- Category 2: 恶意持钥客户端（重算有效MAC） ----
+
+    if attack_type == "forged_prev_mem_valid_mac":
+        if not attack_applicable_to_protocol(attack_type, protocol):
+            return None, False
+        build_fn = _get_build_fn(protocol)
+        forged = build_forged_prev_mem_packet(
+            protocol=protocol,
+            build_fn=build_fn,
+            session_id=session_id,
+            sender_id=sender_id,
+            epoch=epoch,
+            seq=seq,
+            payload=payload,
+        )
+        return forged, True
+
+    if attack_type == "sequence_gap_valid_mac":
+        build_fn = _get_build_fn(protocol)
+        return build_sequence_gap_packet(
+            protocol=protocol,
+            build_fn=build_fn,
+            session_id=session_id,
+            sender_id=sender_id,
+            epoch=epoch,
+            seq=seq,
+            payload=payload,
+            state=state,
+        ), True
+
+    if attack_type == "cross_session_valid_mac":
+        build_fn = _get_build_fn(protocol)
+        return build_cross_session_packet(
+            protocol=protocol,
+            build_fn=build_fn,
+            sender_id=sender_id,
+            epoch=epoch,
+            seq=seq,
+            payload=payload,
+            state=state,
+        ), True
+
+    if attack_type == "cross_epoch_valid_mac":
+        build_fn = _get_build_fn(protocol)
+        return build_cross_epoch_packet(
+            protocol=protocol,
+            build_fn=build_fn,
+            session_id=session_id,
+            sender_id=sender_id,
+            seq=seq,
+            payload=payload,
+            state=state,
+        ), True
+
+    raise ValueError(f"Unknown attack_type: {attack_type}")
+
+
 def create_state_for_protocol(
     protocol: str,
     session_id: str,
@@ -229,6 +366,10 @@ def run_one_baseline_experiment(
 ) -> Dict[str, Any]:
     """运行单个baseline实验"""
     
+    # 检查攻击是否适用于当前协议
+    applicable = attack_applicable_to_protocol(attack_type, protocol)
+    category = attack_category(attack_type)
+    
     session_id = (
         f"baseline-{protocol}-{attack_type}-m{message_count}-p{payload_size}-"
         f"r{repeat_id}-{int(time.time() * 1000000)}"
@@ -248,6 +389,9 @@ def run_one_baseline_experiment(
     attack_seq = min(50, max(2, message_count // 2))
     attack_done = False
     
+    # exact_replay: 保存第1条完整合法报文
+    saved_first_packet = None
+    
     # 记录RTT
     rtt_list = []
     
@@ -262,7 +406,7 @@ def run_one_baseline_experiment(
         for seq in range(1, message_count + 1):
             payload = make_payload(seq, payload_size)
             
-            # 构建数据包
+            # 构建正常数据包
             packet = build_packet_for_protocol(
                 protocol=protocol,
                 session_id=session_id,
@@ -273,30 +417,33 @@ def run_one_baseline_experiment(
                 state=state,
             )
             
-            # 攻击模拟
-            if attack_type == "drop" and seq == attack_seq and not attack_done:
-                attack_done = True
-                attack_injected = True
-                continue  # 跳过这个包
+            # 保存第1条合法报文（供exact_replay使用）
+            if seq == 1 and saved_first_packet is None:
+                saved_first_packet = dict(packet)
             
-            if attack_type == "modify" and seq == attack_seq and not attack_done:
-                attack_done = True
-                attack_injected = True
-                packet["payload"] = "modified-payload"
-            
-            if attack_type == "replay" and seq == attack_seq and not attack_done:
-                attack_done = True
-                attack_injected = True
-                # 重放第一个包
-                packet["seq"] = 1
-            
-            if attack_type == "prev_mem" and seq == attack_seq and not attack_done:
-                attack_done = True
-                attack_injected = True
-                if "prev_mem" in packet:
-                    packet["prev_mem"] = "fake-memory"
-                elif "prev_hash" in packet:
-                    packet["prev_hash"] = "fake-hash"
+            # 攻击注入
+            if attack_type != "none" and seq == attack_seq and not attack_done:
+                modified_packet, is_applicable = apply_attack(
+                    attack_type=attack_type,
+                    protocol=protocol,
+                    packet=packet,
+                    seq=seq,
+                    session_id=session_id,
+                    sender_id=CLIENT_ID,
+                    epoch=EPOCH,
+                    payload=payload,
+                    state=state,
+                    saved_first_packet=saved_first_packet,
+                )
+                
+                if is_applicable and modified_packet is not None:
+                    packet = modified_packet
+                    attack_done = True
+                    attack_injected = True
+                elif not is_applicable:
+                    # 攻击不适用于此协议，跳过注入
+                    attack_done = True
+                    attack_injected = False
             
             # 发送数据包
             send_start = time.time()
@@ -355,6 +502,8 @@ def run_one_baseline_experiment(
         "session_id": session_id,
         "protocol": protocol,
         "attack_type": attack_type,
+        "attack_category": category,
+        "attack_applicable": applicable,
         "message_count": message_count,
         "payload_size": payload_size,
         "repeat_id": repeat_id,
@@ -383,7 +532,9 @@ def run_all_experiments():
     tracker = ExperimentTracker("real_baseline_comparison")
     
     fieldnames = [
-        "session_id", "protocol", "attack_type", "message_count", "payload_size",
+        "session_id", "protocol", "attack_type", "attack_category",
+        "attack_applicable",
+        "message_count", "payload_size",
         "repeat_id", "sent_count", "accepted_count", "rejected_count", "timeout_count",
         "error_count", "success_rate", "attack_injected", "attack_detected_by_server",
         "throughput_msg_per_sec", "rtt_mean_ms", "rtt_std_ms", "rtt_min_ms",
@@ -399,8 +550,11 @@ def run_all_experiments():
                 for payload_size in PAYLOAD_SIZES:
                     for repeat_id in REPEATS:
                         completed += 1
+                        category = attack_category(attack_type)
+                        applicable = attack_applicable_to_protocol(attack_type, protocol)
                         print(f"\n[{completed}/{total_experiments}] "
-                              f"protocol={protocol}, attack={attack_type}, "
+                              f"protocol={protocol}, attack={attack_type} "
+                              f"[{category}]{'(N/A)' if not applicable else ''}, "
                               f"msg={message_count}, payload={payload_size}, "
                               f"repeat={repeat_id}")
                         

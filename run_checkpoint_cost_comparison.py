@@ -51,6 +51,8 @@ class PreparedHistory:
     # chain state
     chain_checkpoint_hash: str
     chain_final_hash: str
+    target_mem_by_seq: Dict[int, str]
+    target_hash_by_seq: Dict[int, str]
     # file paths
     history_path: str
     chain_path: str
@@ -102,10 +104,12 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
     mem = initial_memory(session_id, sender_id, epoch, mem_seed)
     checkpoint_record: Optional[Dict[str, Any]] = None
     checkpoint_mem = ""
+    target_mem_by_seq: Dict[int, str] = {}
 
     # Auth chain state
     chain_state = auth_chain_initial_state(session_id, sender_id, epoch)
     chain_checkpoint_hash = ""
+    target_hash_by_seq: Dict[int, str] = {}
 
     with open(history_path, "w", encoding="utf-8") as hf, \
          open(chain_path, "w", encoding="utf-8") as cf:
@@ -116,6 +120,8 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
 
             # GMCP memory update
             new_mem = update_memory(mem, session_id, epoch, seq, payload_hash, sender_id)
+
+            target_mem_by_seq[seq] = new_mem
 
             # Build GMCP record
             gmcp_record = {
@@ -156,6 +162,8 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
             if seq == checkpoint_seq:
                 chain_checkpoint_hash = auth_packet["chain_hash"]
 
+            target_hash_by_seq[seq] = auth_packet["chain_hash"]
+
             # Update chain state
             chain_state.last_seq = seq
             chain_state.last_hash = auth_packet["chain_hash"]
@@ -181,6 +189,8 @@ def prepare_history(n: int, k: int, repeat_id: int, workdir: str) -> PreparedHis
         final_mem=mem,
         chain_checkpoint_hash=chain_checkpoint_hash,
         chain_final_hash=chain_state.last_hash,
+        target_mem_by_seq=target_mem_by_seq,
+        target_hash_by_seq=target_hash_by_seq,
         history_path=history_path,
         chain_path=chain_path,
     )
@@ -214,6 +224,7 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
 
     # 2. Replay from history.jsonl: records at checkpoint_seq+1 .. target_seq
     reconstructed_mem = prepared.checkpoint_record["memory"]
+    prev_mem = reconstructed_mem
     replay_count = 0
     material_bytes = checkpoint_bytes
     logical_bytes = checkpoint_bytes
@@ -236,8 +247,12 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
             tag_ok = verify_hmac(DATA_AUTH_KEY, unsigned, received_tag)
             record["auth_tag"] = received_tag
 
-            # Reconstruct memory
-            reconstructed_mem = record["mem"]
+            # Reconstruct memory via update_memory() (not reading stored mem)
+            reconstructed_mem = update_memory(
+                prev_mem, session_id, record["epoch"],
+                record["seq"], record["payload_hash"], record["sender_id"],
+            )
+            prev_mem = reconstructed_mem
             replay_count += 1
             line_bytes = len(line.encode("utf-8"))
             material_bytes += line_bytes
@@ -246,8 +261,8 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
 
     t1 = time.perf_counter_ns()
 
-    # Target state: read the record at target_seq
-    target_mem = reconstructed_mem  # already reconstructed
+    # Target state: compare against pre-computed target from prepare_history
+    target_mem = prepared.target_mem_by_seq.get(target_seq, "")
 
     return RecoveryMeasurement(
         protocol="gmcp_r",
@@ -335,7 +350,7 @@ def measure_authenticated_chain_recovery(prepared: PreparedHistory, offset: int)
         target_seq=target_seq,
         reconstructed_mem="",  # not applicable for chain
         reconstructed_hash=reconstructed_hash,
-        target_state_match=(reconstructed_hash == reconstructed_hash),  # always True; verify externally
+        target_state_match=(reconstructed_hash == prepared.target_hash_by_seq.get(target_seq, "")),
     )
 
 

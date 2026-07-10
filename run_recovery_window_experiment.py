@@ -6,8 +6,8 @@
 # Scenarios:
 #   control     – ticket=100, server=100, client=100 → success
 #   ack_loss    – server accepted 101-149, ACK lost, client holds seq=100 ticket
-#   old_ticket  – old ticket within current checkpoint window → accepted
-#   below_floor – ticket older than latest checkpoint floor → rejected
+#   old_ticket_within_window – ticket within current checkpoint window → accepted
+#   below_floor           – ticket older than latest checkpoint floor → rejected
 #   nonce_race  – two threads consume same nonce → exactly one success
 #
 # Produces 540 CSV rows: 480 non-race + 60 race.
@@ -185,7 +185,10 @@ def _spawn_server(port=None):
 # ── Scenario runners ────────────────────────────────────────────────────
 
 def run_control(sock, file_obj, session_id, checkpoint_interval, payload_size):
-    """control: advance to seq=100, get ticket, recover with it."""
+    """control: ticket=100, server=100 → success.
+
+    floor_seq is extracted from the server recovery response (not hardcoded).
+    """
     prefix = "x" * max(0, payload_size - 20)
     current_mem = initial_memory(session_id, CLIENT_ID, EPOCH, "demo-seed")
     saved_ticket = None
@@ -211,6 +214,7 @@ def run_control(sock, file_obj, session_id, checkpoint_interval, payload_size):
     )
 
     resp_server_seq = int(response.get("server_last_seq", 0)) if ok else 0
+    resp_floor_seq = int(response.get("checkpoint_seq", 0))
 
     return {
         "scenario": "control",
@@ -219,7 +223,7 @@ def run_control(sock, file_obj, session_id, checkpoint_interval, payload_size):
         "ticket_seq": ticket_seq,
         "client_seq": 100,
         "server_seq": server_seq,
-        "floor_seq": ticket_seq,
+        "floor_seq": resp_floor_seq,
         "response_seq": resp_server_seq,
         "gap": server_seq - ticket_seq,
         "response_advance": resp_server_seq - server_seq,
@@ -236,7 +240,10 @@ def run_control(sock, file_obj, session_id, checkpoint_interval, payload_size):
 
 
 def run_ack_loss(sock, file_obj, session_id, checkpoint_interval, payload_size):
-    """ack_loss: advance to seq=100 (get ticket), then to seq=149 (discard ACKs)."""
+    """ack_loss: server accepted 101-149, ACK lost, client holds seq=100 ticket.
+
+    floor_seq is extracted from the server recovery response (not hardcoded).
+    """
     prefix = "x" * max(0, payload_size - 20)
     current_mem = initial_memory(session_id, CLIENT_ID, EPOCH, "demo-seed")
     saved_ticket = None
@@ -280,6 +287,7 @@ def run_ack_loss(sock, file_obj, session_id, checkpoint_interval, payload_size):
     )
 
     resp_server_seq = int(response.get("server_last_seq", 0)) if ok else 0
+    resp_floor_seq = int(response.get("checkpoint_seq", 0))
 
     return {
         "scenario": "ack_loss",
@@ -288,7 +296,7 @@ def run_ack_loss(sock, file_obj, session_id, checkpoint_interval, payload_size):
         "ticket_seq": ticket_seq,
         "client_seq": 100,
         "server_seq": server_seq,
-        "floor_seq": ticket_seq,
+        "floor_seq": resp_floor_seq,
         "response_seq": resp_server_seq,
         "gap": server_seq - ticket_seq,
         "response_advance": resp_server_seq - server_seq,
@@ -304,15 +312,24 @@ def run_ack_loss(sock, file_obj, session_id, checkpoint_interval, payload_size):
     }
 
 
-def run_old_ticket(sock, file_obj, session_id, checkpoint_interval, payload_size):
-    """old_ticket: get ticket at seq=100, advance server to seq=200, recover."""
+def run_old_ticket_within_window(sock, file_obj, session_id, checkpoint_interval, payload_size):
+    """old_ticket_within_window: ticket within current checkpoint window → accepted.
+
+    Phase 1: advance to seq=100, capture ticket (checkpoint_seq=100).
+    Phase 2: advance to seq = 100 + checkpoint_interval - 1
+             (just before the *next* checkpoint), so the server's latest
+             checkpoint is still 100 — same as the ticket's checkpoint_seq.
+             The ticket is old but still within the recovery window.
+
+    floor_seq is extracted from the server recovery response (not hardcoded).
+    """
     prefix = "x" * max(0, payload_size - 20)
     current_mem = initial_memory(session_id, CLIENT_ID, EPOCH, "demo-seed")
     saved_ticket = None
 
     # Phase 1: advance to seq=100 and get ticket
     for seq in range(1, 101):
-        payload = f"old-{seq:04d}-{prefix}"
+        payload = f"oldw-{seq:04d}-{prefix}"
         resp, current_mem = _send_data_packet(
             sock, file_obj, session_id, seq, current_mem, payload, checkpoint_interval
         )
@@ -321,9 +338,16 @@ def run_old_ticket(sock, file_obj, session_id, checkpoint_interval, payload_size
 
     ticket_seq = int(saved_ticket["last_seq"]) if saved_ticket else 100
 
-    # Phase 2: advance server to seq=200 (new checkpoint may be created)
-    for seq in range(101, 201):
-        payload = f"old-{seq:04d}-{prefix}"
+    # Phase 2: advance server just before the next checkpoint boundary.
+    # For k=100 → 199; k=50 → 149; k=200 → 199.
+    # This ensures no new checkpoint is created, so the server's latest
+    # checkpoint remains at 100 — the ticket's checkpoint_seq.
+    next_ckpt = ((100 // checkpoint_interval) + 1) * checkpoint_interval
+    advance_target = next_ckpt - 1
+    server_seq = advance_target
+
+    for seq in range(101, advance_target + 1):
+        payload = f"oldw-{seq:04d}-{prefix}"
         _send_json(sock, build_data_packet(
             session_id=session_id, sender_id=CLIENT_ID, epoch=EPOCH,
             seq=seq, prev_mem=current_mem, payload=payload,
@@ -332,30 +356,25 @@ def run_old_ticket(sock, file_obj, session_id, checkpoint_interval, payload_size
         payload_hash = hash_text(payload)
         current_mem = update_memory(current_mem, session_id, EPOCH, seq, payload_hash, CLIENT_ID)
 
-    server_seq = 200
-
-    # Recovery floor: ticket checkpoint_seq should still be >= floor
-    # if checkpoint_interval=100, floor=100 (checkpoint at seq=100)
-    floor_seq = 100  # ticket's checkpoint
-
     ok, response, latency_ms, resp_auth, resp_reason = _send_recovery(
         sock, file_obj, session_id,
         client_last_seq=100,
         client_last_mem=saved_ticket["last_mem"] if saved_ticket else current_mem,
-        reason="old_ticket test",
+        reason="old_ticket_within_window test",
         ticket=saved_ticket,
     )
 
     resp_server_seq = int(response.get("server_last_seq", 0)) if ok else 0
+    resp_floor_seq = int(response.get("checkpoint_seq", 0))
 
     return {
-        "scenario": "old_ticket",
+        "scenario": "old_ticket_within_window",
         "checkpoint_interval": checkpoint_interval,
         "payload_size": payload_size,
         "ticket_seq": ticket_seq,
         "client_seq": 100,
         "server_seq": server_seq,
-        "floor_seq": floor_seq,
+        "floor_seq": resp_floor_seq,
         "response_seq": resp_server_seq,
         "gap": server_seq - ticket_seq,
         "response_advance": resp_server_seq - server_seq,
@@ -372,15 +391,22 @@ def run_old_ticket(sock, file_obj, session_id, checkpoint_interval, payload_size
 
 
 def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_size):
-    """below_floor: get ticket at seq=100, advance to seq=200+ (new checkpoint), try old ticket."""
+    """below_floor: ticket older than latest checkpoint floor → rejected.
+
+    Phase 1: advance to seq=100, capture ticket (checkpoint_seq=100).
+    Phase 2: advance to seq=200, creating a new checkpoint at 200.
+             The server's latest checkpoint is now 200, but the ticket's
+             checkpoint_seq is 100 < 200 → rejected.
+
+    floor_seq is extracted from the server recovery response (not hardcoded).
+    """
     prefix = "x" * max(0, payload_size - 20)
     current_mem = initial_memory(session_id, CLIENT_ID, EPOCH, "demo-seed")
     saved_ticket = None
-    server_seq_before = 0
 
     # Phase 1: advance to seq=100 and get ticket
     for seq in range(1, 101):
-        payload = f"floor-{seq:04d}-{prefix}"
+        payload = f"blwf-{seq:04d}-{prefix}"
         resp, current_mem = _send_data_packet(
             sock, file_obj, session_id, seq, current_mem, payload, checkpoint_interval
         )
@@ -391,7 +417,7 @@ def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_siz
 
     # Phase 2: advance to seq=200 so a new checkpoint at 200 is created
     for seq in range(101, 201):
-        payload = f"floor-{seq:04d}-{prefix}"
+        payload = f"blwf-{seq:04d}-{prefix}"
         _send_json(sock, build_data_packet(
             session_id=session_id, sender_id=CLIENT_ID, epoch=EPOCH,
             seq=seq, prev_mem=current_mem, payload=payload,
@@ -401,10 +427,6 @@ def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_siz
         current_mem = update_memory(current_mem, session_id, EPOCH, seq, payload_hash, CLIENT_ID)
 
     server_seq = 200
-    server_seq_before = server_seq
-
-    # The latest checkpoint is at seq=200, but ticket.last_seq=100 < 200 → reject
-    floor_seq = 200
 
     ok, response, latency_ms, resp_auth, resp_reason = _send_recovery(
         sock, file_obj, session_id,
@@ -415,6 +437,9 @@ def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_siz
     )
 
     resp_server_seq = int(response.get("server_last_seq", 0)) if ok else 0
+    # For rejected requests, checkpoint_seq is not in the response;
+    # report 0 as an honest "unknown floor" rather than hardcoding.
+    resp_floor_seq = int(response.get("checkpoint_seq", 0))
 
     return {
         "scenario": "below_floor",
@@ -423,7 +448,7 @@ def run_below_floor(sock, file_obj, session_id, checkpoint_interval, payload_siz
         "ticket_seq": ticket_seq,
         "client_seq": 100,
         "server_seq": server_seq,
-        "floor_seq": floor_seq,
+        "floor_seq": resp_floor_seq,
         "response_seq": resp_server_seq,
         "gap": server_seq - ticket_seq,
         "response_advance": resp_server_seq - server_seq,
@@ -568,7 +593,7 @@ def run_window_scenario(
         runners = {
             "control": run_control,
             "ack_loss": run_ack_loss,
-            "old_ticket": run_old_ticket,
+            "old_ticket_within_window": run_old_ticket_within_window,
             "below_floor": run_below_floor,
         }
         if scenario not in runners:
@@ -590,7 +615,7 @@ CSV_COLUMNS = [
     "success", "reason", "recovery_latency_ms",
 ]
 
-NON_RACE_SCENARIOS = ["control", "ack_loss", "old_ticket", "below_floor"]
+NON_RACE_SCENARIOS = ["control", "ack_loss", "old_ticket_within_window", "below_floor"]
 
 
 def main():

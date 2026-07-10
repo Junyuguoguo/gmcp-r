@@ -154,8 +154,8 @@ class RecoveryWindowContractTests(unittest.TestCase):
         )
         self.assertTrue(ok, f"ack_loss ticket validation failed: {reason}")
 
-    def test_old_ticket_recovery(self):
-        """old_ticket: ticket from seq=100, server at seq=200, checkpoint=100 → accepted."""
+    def test_old_ticket_within_window_recovery(self):
+        """old_ticket_within_window: ticket from seq=100, server at seq=199, checkpoint=100 → accepted."""
         sid = f"old-ticket-{int(time.time()*1e6)}"
         ctx = _build_server_context(sid, checkpoint_interval=100)
 
@@ -172,20 +172,26 @@ class RecoveryWindowContractTests(unittest.TestCase):
                 checkpoint_seq=ckpt_100.seq,
                 checkpoint_mem=ckpt_100.memory,
             )
-            for seq in range(101, 201):
+            # Advance just before next checkpoint (199 < 200),
+            # so latest checkpoint remains at 100.
+            for seq in range(101, 200):
                 _send_data(ctx.state, ctx.verifier, ctx.checkpoint_manager, seq)
 
         self.assertEqual(int(ticket["last_seq"]), 100)
-        self.assertEqual(ctx.state.last_seq, 200)
+        self.assertEqual(ctx.state.last_seq, 199)
+
+        # Latest checkpoint is still 100 — ticket is within the window
+        latest_ckpt = ctx.checkpoint_manager.get_latest_checkpoint()
+        self.assertEqual(latest_ckpt.seq, 100)
 
         ok, reason = validate_memory_ticket(
             ticket,
             expected_session_id=sid,
             expected_client_id=CLIENT_ID,
             expected_epoch=EPOCH,
-            min_last_seq=ckpt_100.seq,
+            min_last_seq=latest_ckpt.seq,
         )
-        self.assertTrue(ok, f"old_ticket validation failed: {reason}")
+        self.assertTrue(ok, f"old_ticket_within_window validation failed: {reason}")
 
     def test_below_floor_rejected(self):
         """below_floor: ticket seq=100, checkpoint floor=200 → rejected."""
@@ -314,8 +320,8 @@ class RecoveryWindowCSVContractTests(unittest.TestCase):
                 self.assertEqual(row["ticket_seq"], row["server_seq"])
             elif scenario == "ack_loss":
                 self.assertTrue(success, f"ack_loss should succeed: {row}")
-            elif scenario == "old_ticket":
-                self.assertTrue(success, f"old_ticket should succeed: {row}")
+            elif scenario == "old_ticket_within_window":
+                self.assertTrue(success, f"old_ticket_within_window should succeed: {row}")
             elif scenario == "below_floor":
                 self.assertFalse(success, f"below_floor should fail: {row}")
                 self.assertTrue(

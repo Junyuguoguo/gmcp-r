@@ -2,9 +2,19 @@
 # real_baseline_server.py
 #
 # Baseline 对比实验服务器
-# 支持多种协议：gmcp_r, hash_chain, seq_mac, ticket_only
+# 支持多种协议：gmcp_r, hash_chain, seq_mac, ticket_only, authenticated_hash_chain
 # 根据数据包中的 protocol 字段选择对应的验证器
 # 监听端口 9001
+#
+# 攻击检测模型（两类攻击者）：
+#   1. 网络攻击者 (network_attacker) —— 不知道密钥
+#      检测手段：HMAC/MAC/chain_hash验证失败
+#      攻击类型：modify_unsigned, metadata_tamper, exact_replay
+#
+#   2. 恶意持钥客户端 (malicious_client) —— 知道DATA密钥
+#      检测手段：协议级约束（session_id/epoch/seq连续性/prev_mem链）
+#      攻击类型：forged_prev_mem_valid_mac, sequence_gap_valid_mac,
+#                cross_session_valid_mac, cross_epoch_valid_mac
 
 import json
 import socket
@@ -45,6 +55,13 @@ from gmcp.baselines.authenticated_hash_chain import (
 )
 from gmcp.session_registry import SessionContext, SessionRegistry
 from gmcp.config import LOCK_STRATEGY
+
+# 导入攻击模型常量（用于日志和文档）
+from gmcp.attack import (
+    ALL_ATTACK_TYPES,
+    NETWORK_ATTACK_TYPES,
+    MALICIOUS_CLIENT_ATTACK_TYPES,
+)
 
 BASELINE_PORT = 9001
 
@@ -251,6 +268,22 @@ def handle_recovery_request(packet, registry: SessionRegistry):
 # Client handler
 # =========================
 
+def _classify_rejection_reason(reason: str) -> str:
+    """
+    根据拒绝原因推断攻击类别（用于日志）。
+    - HMAC/MAC/chain_hash失败 → 网络攻击者检测
+    - session_id/epoch/seq/prev_mem约束失败 → 恶意客户端检测
+    """
+    if not reason:
+        return "unknown"
+    r = reason.lower()
+    if "auth_tag" in r or "mac mismatch" in r or "chain_hash" in r or "payload_hash" in r:
+        return "network_attacker_detected"
+    if "session_id" in r or "epoch" in r or "seq" in r or "prev_mem" in r or "prev_hash" in r:
+        return "malicious_client_detected"
+    return "other"
+
+
 def handle_client(conn, addr, registry: SessionRegistry):
     enable_tcp_nodelay(conn)
     print(f"[BASELINE_SERVER] connected from {addr}", flush=True)
@@ -319,7 +352,7 @@ def handle_client(conn, addr, registry: SessionRegistry):
                 verifier = ctx.verifier
                 stats = ctx.stats
 
-                # 不再移除protocol，而是让所有协议的验证器忽略它
+                # 验证数据包（所有协议的验证器处理protocol字段）
                 ok, reason = verifier.verify_data_packet(packet)
 
                 stats["total"] += 1
@@ -334,9 +367,12 @@ def handle_client(conn, addr, registry: SessionRegistry):
                         )
                 else:
                     stats["rejected"] += 1
+                    # 分类拒绝原因（区分网络攻击者 vs 恶意客户端）
+                    attack_class = _classify_rejection_reason(reason)
                     print(
                         f"[BASELINE_SERVER] reject protocol={protocol}, session={session_id}, "
-                        f"seq={packet.get('seq')}, reason={reason}",
+                        f"seq={packet.get('seq')}, reason={reason}, "
+                        f"attack_class={attack_class}",
                         flush=True,
                     )
 
@@ -389,7 +425,11 @@ def main():
 
     print(f"[BASELINE_SERVER] Listening on {SERVER_BIND_HOST}:{BASELINE_PORT}")
     print(f"[BASELINE_SERVER] Supported protocols: {', '.join(SUPPORTED_PROTOCOLS)}")
-    print(f"[BASELINE_SERVER] Lock strategy: {LOCK_STRATEGY}", flush=True)
+    print(f"[BASELINE_SERVER] Lock strategy: {LOCK_STRATEGY}")
+    print(f"[BASELINE_SERVER] Attack model:")
+    print(f"  Network attacker attacks: {', '.join(NETWORK_ATTACK_TYPES)}")
+    print(f"  Malicious client attacks: {', '.join(MALICIOUS_CLIENT_ATTACK_TYPES)}")
+    print(flush=True)
 
     while True:
         conn, addr = sock.accept()
