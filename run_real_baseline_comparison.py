@@ -172,7 +172,7 @@ def build_packet_for_protocol(
 ) -> Dict[str, Any]:
     """根据协议类型构建数据包"""
     
-    if protocol == "gmcp_r":
+    if protocol == "gmcp_r" or protocol == "gmcp":
         return gmcp_build_data_packet(
             session_id=session_id,
             sender_id=sender_id,
@@ -222,7 +222,7 @@ def build_packet_for_protocol(
 
 def _get_build_fn(protocol: str):
     """获取协议对应的build函数"""
-    if protocol == "gmcp_r":
+    if protocol == "gmcp_r" or protocol == "gmcp":
         return gmcp_build_data_packet
     elif protocol == "hash_chain":
         return hash_chain_build_packet
@@ -334,7 +334,7 @@ def create_state_for_protocol(
 ) -> Any:
     """根据协议类型创建初始状态"""
     
-    if protocol == "gmcp_r":
+    if protocol == "gmcp_r" or protocol == "gmcp":
         from gmcp.memory import initial_memory
         initial_mem = initial_memory(session_id, sender_id, epoch, "demo-seed")
         from gmcp.protocol import GMCPState
@@ -460,7 +460,7 @@ def run_one_baseline_experiment(
                 if response.get("ok"):
                     accepted_count += 1
                     # 更新状态
-                    if protocol == "gmcp_r":
+                    if protocol == "gmcp_r" or protocol == "gmcp":
                         state.last_seq = int(response.get("last_seq", state.last_seq))
                         state.last_mem = response.get("last_mem", state.last_mem)
                     elif protocol in ("hash_chain", "authenticated_hash_chain"):
