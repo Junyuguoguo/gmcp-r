@@ -286,6 +286,7 @@ def handle_client(conn, addr, registry: SessionRegistry):
     bound_session_id = None
     bound_sender_id = None
     bound_epoch = None
+    bound_protocol = None
     hello_done = False
 
     file_obj = None
@@ -348,6 +349,7 @@ def handle_client(conn, addr, registry: SessionRegistry):
                     continue
 
                 # Bind connection
+                bound_protocol = hello_protocol
                 bound_session_id = hello_session_id
                 bound_sender_id = hello_sender_id
                 bound_epoch = hello_epoch
@@ -357,32 +359,50 @@ def handle_client(conn, addr, registry: SessionRegistry):
                     "ok": True,
                     "type": "HELLO_ACK",
                     "reason": "ok",
+                    "protocol": bound_protocol,
                     "session_id": bound_session_id,
                     "server_time": recv_time,
                 })
                 continue
 
             if packet_type == "RECOVERY_REQUEST":
+                rec_session_id = packet.get("session_id", "unknown-session")
+                rec_sender_id = packet.get("sender_id", packet.get("client_id", "unknown-sender"))
+                rec_epoch = packet.get("epoch", 0)
+                rec_protocol = packet.get("protocol", "gmcp")
+                rec_nonce = packet.get("recovery_nonce", "")
                 # Strict mode: require HELLO first
                 if not hello_done:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "type": "RECOVERY_RESPONSE",
-                        "reason": "connection not bound: HELLO required",
-                        "server_time": recv_time,
-                    })
+                    send_json_line(conn, build_recovery_response(
+                        False, "connection not bound: HELLO required",
+                        rec_session_id, rec_epoch, rec_nonce,
+                    ))
                     continue
 
-                rec_session_id = packet.get("session_id", "unknown-session")
-                rec_sender_id = packet.get("sender_id", "unknown-sender")
                 # --- Connection-level binding check for RECOVERY_REQUEST ---
+                if rec_protocol != bound_protocol:
+                    send_json_line(conn, build_recovery_response(
+                        False, f"connection protocol mismatch: bound={bound_protocol}, got={rec_protocol}",
+                        rec_session_id, rec_epoch, rec_nonce,
+                    ))
+                    continue
                 if rec_session_id != bound_session_id:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "type": "RECOVERY_RESPONSE",
-                        "reason": f"connection session mismatch: bound={bound_session_id}, got={rec_session_id}",
-                        "server_time": recv_time,
-                    })
+                    send_json_line(conn, build_recovery_response(
+                        False, f"connection session mismatch: bound={bound_session_id}, got={rec_session_id}",
+                        rec_session_id, rec_epoch, rec_nonce,
+                    ))
+                    continue
+                if rec_sender_id != bound_sender_id:
+                    send_json_line(conn, build_recovery_response(
+                        False, f"connection sender mismatch: bound={bound_sender_id}, got={rec_sender_id}",
+                        rec_session_id, rec_epoch, rec_nonce,
+                    ))
+                    continue
+                if rec_epoch != bound_epoch:
+                    send_json_line(conn, build_recovery_response(
+                        False, f"connection epoch mismatch: bound={bound_epoch}, got={rec_epoch}",
+                        rec_session_id, rec_epoch, rec_nonce,
+                    ))
                     continue
                 response = handle_recovery_request(packet, registry)
                 send_json_line(conn, response)
