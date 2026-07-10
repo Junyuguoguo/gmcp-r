@@ -39,6 +39,13 @@ def safe_int(val: str) -> int:
         return 0
 
 
+def parse_bool(value) -> bool:
+    """Parse CSV boolean values without treating bool('False') as true."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
 # ---------------------------------------------------------------------------
 # Summary recomputation helpers
 # ---------------------------------------------------------------------------
@@ -108,6 +115,7 @@ def recompute_recovery_window_summary(
 def validate_all(
     output_root: str,
     expected_repeats: int = 30,
+    mode: str = "smoke",
 ) -> Tuple[bool, List[str]]:
     """
     Validate all submission revision artifacts.
@@ -119,8 +127,9 @@ def validate_all(
     # 1. Manifest exists and hashes match
     manifest_path = os.path.join(output_root, "manifest.json")
     if not os.path.isfile(manifest_path):
-        violations.append("manifest.json not found")
-    else:
+        if mode == "release":
+            violations.append("manifest.json not found")
+    elif os.path.isfile(manifest_path):
         with open(manifest_path, encoding="utf-8") as f:
             manifest = json.load(f)
 
@@ -146,12 +155,16 @@ def validate_all(
     rw_rows = read_csv(rw_path)
     if rw_rows:
         violations.extend(_validate_recovery_window(rw_rows, expected_repeats))
+    elif mode == "release":
+        violations.append("required CSV missing or empty: recovery_window_experiment.csv")
 
     # 3. Validate checkpoint cost CSV
     cc_path = os.path.join(output_root, "checkpoint_cost_comparison.csv")
     cc_rows = read_csv(cc_path)
     if cc_rows:
         violations.extend(_validate_checkpoint_cost(cc_rows, expected_repeats))
+    elif mode == "release":
+        violations.append("required CSV missing or empty: checkpoint_cost_comparison.csv")
 
     # 4. Validate adaptive attack CSV
     aa_path = os.path.join(output_root, "hash_chain_adaptive_attack.csv")
@@ -166,6 +179,8 @@ def validate_all(
     bl_rows = read_csv(bl_path)
     if bl_rows:
         violations.extend(_validate_baseline(bl_rows, expected_repeats))
+    elif mode == "release":
+        violations.append("required CSV missing or empty: baseline_comparison.csv")
 
     # 6. Validate all PNGs are nonempty
     if os.path.isdir(output_root):
@@ -218,11 +233,33 @@ def _validate_recovery_window(rows, expected_repeats):
         if len(race) != 40:
             violations.append(f"recovery_window: expected 40 race rows, got {len(race)}")
 
-    # All response_auth_ok must be True
+    # repeat_id must be present and positive
     for row in rows:
-        if str(row.get("response_auth_ok", "")).lower() != "true":
+        repeat_id = row.get("repeat_id", "")
+        if not str(repeat_id).strip() or safe_int(repeat_id) <= 0:
+            violations.append(
+                f"recovery_window: repeat_id must be a positive integer "
+                f"(scenario={row.get('scenario')}, repeat={repeat_id!r})"
+            )
+            break
+
+    # All request/response auth and nonce binding must be True
+    for row in rows:
+        if not parse_bool(row.get("request_auth_ok", "")):
+            violations.append(
+                f"request_auth_ok should be True "
+                f"(scenario={row.get('scenario')}, repeat={row.get('repeat_id')})"
+            )
+            break
+        if not parse_bool(row.get("response_auth_ok", "")):
             violations.append(
                 f"response_auth_ok should be True "
+                f"(scenario={row.get('scenario')}, repeat={row.get('repeat_id')})"
+            )
+            break
+        if not parse_bool(row.get("nonce_match", "")):
+            violations.append(
+                f"nonce_match should be True "
                 f"(scenario={row.get('scenario')}, repeat={row.get('repeat_id')})"
             )
             break
@@ -230,22 +267,35 @@ def _validate_recovery_window(rows, expected_repeats):
     # Below-floor invariants
     for row in rows:
         if row.get("scenario") == "below_floor":
-            if str(row.get("success", "")).lower() == "true":
-                violations.append("below_floor should be rejected")
-            if str(row.get("state_unchanged", "")).lower() != "true":
-                violations.append("below_floor should leave state unchanged")
+            context = (
+                f"below_floor k={row.get('checkpoint_interval')} "
+                f"p={row.get('payload_size')} repeat={row.get('repeat_id')}"
+            )
+            if parse_bool(row.get("success", "")):
+                violations.append(f"{context}: below_floor should be rejected")
+            if not parse_bool(row.get("state_unchanged", "")):
+                violations.append(f"{context}: below_floor should leave state unchanged")
+            if row.get("server_last_seq_before") != row.get("server_last_seq_after"):
+                violations.append(f"{context}: server sequence changed on reject")
+            if row.get("server_last_mem_before") != row.get("server_last_mem_after"):
+                violations.append(f"{context}: server memory changed on reject")
             # recovery_floor must exceed ticket_last_seq (ticket is below the floor)
             rf = safe_int(row.get("recovery_floor", 0))
             tl = safe_int(row.get("ticket_last_seq", 0))
             if rf > 0 and tl > 0 and rf <= tl:
                 violations.append(
-                    f"below_floor: recovery_floor ({rf}) must be > ticket_last_seq ({tl})"
+                    f"{context}: recovery_floor ({rf}) must be > ticket_last_seq ({tl})"
                 )
             # reason must NOT be "ok" — must contain rollback/below floor/recovery floor
             reason = row.get("reason", "").lower()
-            if reason == "ok":
-                violations.append("below_floor: reason must not be 'ok'")
-            break  # one violation is enough
+            valid_reason = any(
+                needle in reason
+                for needle in ("rollback", "below floor", "recovery floor", "older than required")
+            )
+            if not reason or reason == "ok" or not valid_reason:
+                violations.append(
+                    f"{context}: reason must describe rollback/below floor/recovery floor"
+                )
 
     # Race invariants
     for row in race:
@@ -263,7 +313,11 @@ def _validate_checkpoint_cost(rows, expected_repeats):
 
     required = {
         "protocol", "n", "k", "offset", "repeat_id",
-        "replay_count", "recovery_material_bytes", "target_state_match",
+        "replay_count", "target_seq", "target_state_match",
+        "checkpoint_auth_ok", "record_auth_ok", "chain_continuity_ok",
+        "payload_hash_ok", "stored_mem_ok", "recovery_valid", "failure_reason",
+        "records_scanned", "records_replayed", "physical_bytes_read",
+        "logical_bytes_replayed", "seek_offset",
     }
     if rows:
         missing = required - set(rows[0].keys())
@@ -298,17 +352,53 @@ def _validate_checkpoint_cost(rows, expected_repeats):
             )
 
     # records_scanned == offset for gmcp_r (if columns exist)
-    if rows and "records_scanned" in rows[0] and "offset" in rows[0]:
-        scan_mismatches = [
-            r for r in rows
-            if r.get("protocol") == "gmcp_r"
-            and safe_int(r.get("records_scanned")) != safe_int(r.get("offset"))
-        ]
-        if scan_mismatches:
-            violations.append(
-                f"checkpoint_cost: {len(scan_mismatches)} gmcp_r rows have "
-                f"records_scanned != offset"
-            )
+    for row in rows:
+        protocol = row.get("protocol")
+        if not parse_bool(row.get("target_state_match")):
+            continue
+        if not parse_bool(row.get("recovery_valid")):
+            continue
+        if row.get("failure_reason"):
+            violations.append(f"checkpoint_cost: success row has failure_reason={row.get('failure_reason')}")
+            break
+        if safe_int(row.get("physical_bytes_read")) <= 0:
+            violations.append("checkpoint_cost: physical_bytes_read must be positive")
+            break
+        if safe_int(row.get("physical_bytes_read")) != safe_int(row.get("logical_bytes_replayed")):
+            violations.append("checkpoint_cost: physical_bytes_read != logical_bytes_replayed")
+            break
+        if protocol == "gmcp_r":
+            offset = safe_int(row.get("offset"))
+            if safe_int(row.get("records_scanned")) != offset:
+                violations.append("checkpoint_cost: gmcp_r records_scanned != offset")
+                break
+            if safe_int(row.get("records_replayed")) != offset:
+                violations.append("checkpoint_cost: gmcp_r records_replayed != offset")
+                break
+            if safe_int(row.get("replay_count")) != offset:
+                violations.append("checkpoint_cost: gmcp_r replay_count != offset")
+                break
+            if safe_int(row.get("seek_offset")) <= 0:
+                violations.append("checkpoint_cost: gmcp_r seek_offset must be > 0")
+                break
+            for field in ("checkpoint_auth_ok", "record_auth_ok", "chain_continuity_ok", "payload_hash_ok", "stored_mem_ok"):
+                if not parse_bool(row.get(field)):
+                    violations.append(f"checkpoint_cost: gmcp_r {field} should be True")
+                    break
+        elif protocol == "authenticated_hash_chain":
+            target_seq = safe_int(row.get("target_seq"))
+            if safe_int(row.get("records_scanned")) != target_seq:
+                violations.append("checkpoint_cost: auth chain records_scanned != target_seq")
+                break
+            if safe_int(row.get("records_replayed")) != target_seq:
+                violations.append("checkpoint_cost: auth chain records_replayed != target_seq")
+                break
+            if safe_int(row.get("replay_count")) != target_seq:
+                violations.append("checkpoint_cost: auth chain replay_count != target_seq")
+                break
+            if safe_int(row.get("seek_offset")) != 0:
+                violations.append("checkpoint_cost: auth chain seek_offset must be 0")
+                break
 
     # Matrix coverage
     combos = set((r.get("n"), r.get("k")) for r in rows)
@@ -373,11 +463,21 @@ def _validate_baseline(rows, expected_repeats=30):
     """Validate baseline comparison CSV contracts."""
     violations = []
 
-    required = {"protocol", "attack_type", "message_count", "repeat_id"}
+    required = {
+        "protocol", "attack_type", "message_count", "payload_size", "repeat_id",
+        "attack_applicable", "attack_injected", "sent_count", "accepted_count",
+        "rejected_count", "timeout_count", "error_count",
+        "attack_packet_seq", "attack_packet_sent", "attack_packet_accepted",
+        "attack_packet_rejected", "attack_packet_reason",
+        "attack_packet_reason_class", "attack_expected_reason",
+        "attack_reason_match", "post_attack_resynchronized", "retry_sent",
+        "retry_accepted", "run_valid", "failure_reason",
+    }
     if rows:
         missing = required - set(rows[0].keys())
         if missing:
             violations.append(f"baseline CSV missing columns: {missing}")
+            return violations
 
     # Total row count check (full run only)
     if expected_repeats == 30:
@@ -389,51 +489,150 @@ def _validate_baseline(rows, expected_repeats=30):
     if expected_repeats == 30 and len(normal) != 900:
         violations.append(f"baseline: expected 900 normal rows, got {len(normal)}")
 
-    # All normal rows must be 100% successful
-    for row in normal:
-        sr = safe_float(row.get("success_rate", 100))
-        if sr < 100.0:
-            violations.append(
-                f"baseline: normal row not 100% successful "
-                f"(protocol={row.get('protocol')}, msg={row.get('message_count')}, "
-                f"repeat={row.get('repeat_id')}, success_rate={sr})"
-            )
-            break  # one violation is enough to flag
+    keys = [
+        (r.get("protocol"), r.get("attack_type"), r.get("message_count"),
+         r.get("payload_size"), r.get("repeat_id"))
+        for r in rows
+    ]
+    if len(keys) != len(set(keys)):
+        violations.append("baseline: duplicate composite keys")
 
-    # No timeout or error rows
+    # All rows must have consistent counts and clean execution
     for row in rows:
-        tc = safe_int(row.get("timeout_count", 0))
-        ec = safe_int(row.get("error_count", 0))
-        if tc > 0 or ec > 0:
+        sent = safe_int(row.get("sent_count"))
+        accepted = safe_int(row.get("accepted_count"))
+        rejected = safe_int(row.get("rejected_count"))
+        timeout = safe_int(row.get("timeout_count"))
+        error = safe_int(row.get("error_count"))
+        if sent != accepted + rejected + timeout + error:
+            violations.append(
+                f"baseline: sent_count mismatch protocol={row.get('protocol')} "
+                f"attack={row.get('attack_type')} repeat={row.get('repeat_id')}"
+            )
+            break
+        if timeout != 0 or error != 0:
             violations.append(
                 f"baseline: timeout/error in row "
                 f"(protocol={row.get('protocol')}, attack={row.get('attack_type')}, "
-                f"repeat={row.get('repeat_id')}, timeout={tc}, error={ec})"
+                f"repeat={row.get('repeat_id')}, timeout={timeout}, error={error})"
             )
             break
+        if not parse_bool(row.get("run_valid")):
+            violations.append("baseline: run_valid should be True")
+            break
+        if row.get("failure_reason"):
+            violations.append("baseline: failure_reason should be empty")
+            break
+
+    # All normal rows must be 100% successful
+    for row in normal:
+        message_count = safe_int(row.get("message_count"))
+        if parse_bool(row.get("attack_injected")) or parse_bool(row.get("attack_packet_sent")):
+            violations.append("baseline: normal row must not inject attack")
+            break
+        if safe_int(row.get("accepted_count")) != message_count:
+            violations.append("baseline: normal accepted_count must equal message_count")
+            break
+        if safe_int(row.get("rejected_count")) != 0 or safe_int(row.get("sent_count")) != message_count:
+            violations.append("baseline: normal sent/rejected counts invalid")
+            break
+
+    # Attack audit invariants
+    for row in rows:
+        attack = row.get("attack_type", "")
+        if attack == "none":
+            continue
+
+        applicable = parse_bool(row.get("attack_applicable"))
+        injected = parse_bool(row.get("attack_injected"))
+        sent_attack = parse_bool(row.get("attack_packet_sent"))
+        accepted_attack = parse_bool(row.get("attack_packet_accepted"))
+        rejected_attack = parse_bool(row.get("attack_packet_rejected"))
+        message_count = safe_int(row.get("message_count"))
+
+        if applicable:
+            if not injected or not sent_attack:
+                violations.append(
+                    f"baseline: applicable attack not injected "
+                    f"(protocol={row.get('protocol')}, attack={attack}, repeat={row.get('repeat_id')})"
+                )
+                break
+            if accepted_attack == rejected_attack:
+                violations.append("baseline: attack packet must be accepted XOR rejected")
+                break
+            if rejected_attack:
+                if safe_int(row.get("rejected_count")) < 1:
+                    violations.append("baseline: rejected attack row must count a rejection")
+                    break
+                if not parse_bool(row.get("retry_sent")) or not parse_bool(row.get("retry_accepted")):
+                    violations.append("baseline: rejected attack must send and accept clean retry")
+                    break
+                if not parse_bool(row.get("post_attack_resynchronized")):
+                    violations.append("baseline: rejected attack must be post_attack_resynchronized")
+                    break
+                if safe_int(row.get("accepted_count")) != message_count:
+                    violations.append("baseline: rejected attack accepted_count must equal message_count")
+                    break
+                if safe_int(row.get("sent_count")) != message_count + 1:
+                    violations.append("baseline: rejected attack sent_count must equal message_count + 1")
+                    break
+            if accepted_attack:
+                if safe_int(row.get("sent_count")) != message_count:
+                    violations.append("baseline: accepted attack sent_count must equal message_count")
+                    break
+        else:
+            if injected or sent_attack or accepted_attack or rejected_attack:
+                violations.append("baseline: N/A attack should not be injected or sent")
+                break
+            if safe_int(row.get("accepted_count")) != message_count:
+                violations.append("baseline: N/A row accepted_count must equal message_count")
+                break
+            if safe_int(row.get("rejected_count")) != 0 or safe_int(row.get("sent_count")) != message_count:
+                violations.append("baseline: N/A row sent/rejected counts invalid")
+                break
+
+        if attack == "cross_session_valid_mac":
+            reason = row.get("attack_packet_reason", "")
+            if not rejected_attack or "connection session mismatch" not in reason:
+                violations.append("baseline: cross_session_valid_mac reason must be connection session mismatch")
+                break
+            if not parse_bool(row.get("attack_reason_match")):
+                violations.append("baseline: cross_session_valid_mac attack_reason_match should be True")
+                break
+        if attack == "cross_epoch_valid_mac":
+            reason = row.get("attack_packet_reason", "")
+            if not rejected_attack or "connection epoch mismatch" not in reason:
+                violations.append("baseline: cross_epoch_valid_mac reason must be connection epoch mismatch")
+                break
+            if not parse_bool(row.get("attack_reason_match")):
+                violations.append("baseline: cross_epoch_valid_mac attack_reason_match should be True")
+                break
+
+    # Denominator sanity: applicable+injected+sent attacks must be accepted or rejected.
+    attacks = [
+        row for row in rows
+        if row.get("attack_type") != "none"
+        and parse_bool(row.get("attack_applicable"))
+        and parse_bool(row.get("attack_injected"))
+        and parse_bool(row.get("attack_packet_sent"))
+    ]
+    detected_count = sum(1 for row in attacks if parse_bool(row.get("attack_packet_rejected")))
+    false_accept_count = sum(1 for row in attacks if parse_bool(row.get("attack_packet_accepted")))
+    if attacks and detected_count + false_accept_count != len(attacks):
+        violations.append("baseline: detected + false accepted must equal applicable injected count")
 
     # N/A attack semantics
     na_protocols = {"seq_mac", "ticket_only"}
     for row in rows:
         proto = row.get("protocol", "")
         attack = row.get("attack_type", "")
-        injected = str(row.get("attack_injected", "")).lower()
-        if proto in na_protocols and attack == "prev_mem" and injected == "true":
-            violations.append(f"N/A attack should not be injected for {proto}/{attack}")
-
-    # Applicable attacks must be injected (if attack_applicable column exists)
-    if rows and "attack_applicable" in rows[0]:
-        for row in rows:
-            applicable = str(row.get("attack_applicable", "")).lower()
-            injected = str(row.get("attack_injected", "")).lower()
-            attack = row.get("attack_type", "")
-            if attack != "none" and applicable == "true" and injected != "true":
-                violations.append(
-                    f"baseline: applicable attack not injected "
-                    f"(protocol={row.get('protocol')}, attack={attack}, "
-                    f"repeat={row.get('repeat_id')})"
-                )
-                break
+        injected = parse_bool(row.get("attack_injected"))
+        sent_attack = parse_bool(row.get("attack_packet_sent"))
+        if proto in na_protocols and attack in {"prev_mem", "forged_prev_mem_valid_mac"} and (injected or sent_attack):
+            violations.append(
+                f"N/A attack should not be injected for {proto}/{attack}"
+            )
+            break
 
     return violations
 
@@ -457,9 +656,15 @@ def main():
         default=30,
         help="Expected number of repeats per experiment (30 for full, 1 for smoke)",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["smoke", "release"],
+        default="smoke",
+        help="Validation strictness. release requires all core artifacts.",
+    )
     args = parser.parse_args()
 
-    passed, violations = validate_all(args.output_root, args.expected_repeats)
+    passed, violations = validate_all(args.output_root, args.expected_repeats, args.mode)
 
     if passed:
         print("VALIDATION PASSED")

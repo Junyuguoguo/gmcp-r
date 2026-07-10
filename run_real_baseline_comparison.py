@@ -17,9 +17,11 @@
 #      - cross_epoch_valid_mac:      跨epoch
 
 import csv
+import argparse
 import json
 import os
 import socket
+import subprocess
 import time
 import sys
 from typing import Dict, Any, List, Tuple, Optional
@@ -83,13 +85,18 @@ from gmcp.attack import (
 )
 
 
-OUTPUT_DIR = "results/real_baseline_comparison"
-OUTPUT_CSV = os.path.join(OUTPUT_DIR, "real_baseline_comparison_results.csv")
+_OUTPUT_ROOT = os.getenv("GMCP_OUTPUT_ROOT")
+if _OUTPUT_ROOT:
+    OUTPUT_DIR = _OUTPUT_ROOT
+    OUTPUT_CSV = os.path.join(OUTPUT_DIR, "baseline_comparison.csv")
+else:
+    OUTPUT_DIR = "results/real_baseline_comparison"
+    OUTPUT_CSV = os.path.join(OUTPUT_DIR, "real_baseline_comparison_results.csv")
 
 # 实验参数
 PROTOCOLS = ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]
-MESSAGE_COUNTS = [100, 500, 1000]
-PAYLOAD_SIZES = [128, 512]
+MESSAGE_COUNTS = [int(x) for x in os.getenv("GMCP_MESSAGE_COUNTS", "100,500,1000").split(",")]
+PAYLOAD_SIZES = [int(x) for x in os.getenv("GMCP_PAYLOAD_SIZES", "128,512").split(",")]
 
 # 攻击类型：两类攻击者模型
 ATTACK_TYPES = list(ALL_ATTACK_TYPES)
@@ -101,6 +108,7 @@ REPEATS = list(range(1, REPEAT_COUNT + 1))
 BASELINE_PORT = 9001
 
 SOCKET_TIMEOUT = 10.0
+SERVER_SPAWN_WAIT = 8
 
 
 def ensure_output_dir():
@@ -193,6 +201,35 @@ def open_tcp(port=BASELINE_PORT):
     return sock, file_obj
 
 
+def spawn_baseline_server(port=BASELINE_PORT):
+    """Start real_baseline_server.py and wait until it accepts TCP connections."""
+    env = os.environ.copy()
+    proc = subprocess.Popen(
+        [sys.executable, "real_baseline_server.py"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    deadline = time.time() + SERVER_SPAWN_WAIT
+    while time.time() < deadline:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect((SERVER_TARGET_HOST, port))
+            s.close()
+            print(f"[SPAWN] Baseline server ready on port {port}")
+            return proc
+        except OSError:
+            time.sleep(0.25)
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    raise RuntimeError(f"baseline server did not start on port {port}")
+
+
 def build_packet_for_protocol(
     protocol: str,
     session_id: str,
@@ -250,6 +287,35 @@ def build_packet_for_protocol(
         )
     else:
         raise ValueError(f"Unknown protocol: {protocol}")
+
+
+def update_state_after_accept(protocol: str, state: Any, seq: int, packet: Dict[str, Any], response: Dict[str, Any]) -> None:
+    """Update the local client state after the server accepts a packet."""
+    if protocol == "gmcp_r" or protocol == "gmcp":
+        state.last_seq = int(response.get("last_seq", state.last_seq))
+        state.last_mem = response.get("last_mem", state.last_mem)
+    elif protocol in ("hash_chain", "authenticated_hash_chain"):
+        state.last_seq = seq
+        state.last_hash = packet.get("chain_hash", state.last_hash)
+    else:
+        state.last_seq = seq
+
+
+def expected_attack_reason(attack_type: str) -> str:
+    """Primary reason substring expected for the attack packet response."""
+    if attack_type == "cross_session_valid_mac":
+        return "connection session mismatch"
+    if attack_type == "cross_epoch_valid_mac":
+        return "connection epoch mismatch"
+    if attack_type == "sequence_gap_valid_mac":
+        return "seq"
+    if attack_type == "forged_prev_mem_valid_mac":
+        return "prev"
+    if attack_type in ("modify_unsigned", "metadata_tamper"):
+        return "auth_tag"
+    if attack_type == "exact_replay":
+        return "seq"
+    return ""
 
 
 def _get_build_fn(protocol: str):
@@ -429,6 +495,17 @@ def run_one_baseline_experiment(
     connection_bound_session_id = session_id
     attack_expected_reason = ""
     attack_reason_match = False
+    attack_packet_seq = ""
+    attack_packet_sent = False
+    attack_packet_accepted = False
+    attack_packet_rejected = False
+    attack_packet_reason = ""
+    attack_packet_reason_class = ""
+    post_attack_resynchronized = False
+    retry_sent = False
+    retry_accepted = False
+    run_valid = True
+    failure_reason = ""
     
     # exact_replay: 保存第1条完整合法报文
     saved_first_packet = None
@@ -466,6 +543,12 @@ def run_one_baseline_experiment(
                 "connection_bound_session_id": session_id,
                 "rejection_reason": "", "rejection_class": "",
                 "attack_expected_reason": "", "attack_reason_match": False,
+                "attack_packet_seq": "", "attack_packet_sent": False,
+                "attack_packet_accepted": False, "attack_packet_rejected": False,
+                "attack_packet_reason": "", "attack_packet_reason_class": "",
+                "post_attack_resynchronized": False,
+                "retry_sent": False, "retry_accepted": False,
+                "run_valid": False, "failure_reason": hello_ack.get("reason", "HELLO failed"),
             }
         
         for seq in range(1, message_count + 1):
@@ -481,6 +564,8 @@ def run_one_baseline_experiment(
                 payload=payload,
                 state=state,
             )
+            clean_packet = dict(packet)
+            sent_attack_packet = False
             
             # 保存第1条合法报文（供exact_replay使用）
             if seq == 1 and saved_first_packet is None:
@@ -509,7 +594,9 @@ def run_one_baseline_experiment(
                         expected_session_id = session_id
                         packet_session_id = fake_session
                         connection_bound_session_id = session_id
-                        attack_expected_reason = "connection session mismatch"
+                        attack_expected_reason = expected_attack_reason(attack_type)
+                        attack_packet_seq = seq
+                        attack_packet_sent = True
 
                         send_start = time.time()
                         send_json_line(sock, modified_packet)
@@ -524,17 +611,44 @@ def run_one_baseline_experiment(
                             # Lock audit fields to attack packet response
                             last_rejection_reason = reason
                             last_rejection_class = _classify_rejection(reason)
-                            attack_reason_match = "connection session mismatch" in reason
+                            attack_packet_reason = reason
+                            attack_packet_reason_class = last_rejection_class
+                            attack_reason_match = attack_expected_reason in reason
 
                             if not response.get("ok"):
                                 rejected_count += 1
                                 attack_detected_by_server = True
                                 attack_injected = True
+                                attack_packet_rejected = True
+
+                                retry_sent = True
+                                retry_start = time.time()
+                                send_json_line(sock, clean_packet)
+                                sent_count += 1
+                                retry_response = recv_json_line(file_obj)
+                                retry_end = time.time()
+                                rtt_list.append((retry_end - retry_start) * 1000)
+                                retry_accepted = bool(retry_response.get("ok"))
+                                if retry_accepted:
+                                    accepted_count += 1
+                                    post_attack_resynchronized = True
+                                    update_state_after_accept(protocol, state, seq, clean_packet, retry_response)
+                                else:
+                                    rejected_count += 1
+                                    run_valid = False
+                                    failure_reason = "post_attack_resynchronization_failed"
+                                    last_rejection_reason = retry_response.get("reason", "unknown")
+                                    last_rejection_class = _classify_rejection(last_rejection_reason)
+                                    break
                             else:
                                 accepted_count += 1
                                 attack_injected = True
+                                attack_packet_accepted = True
+                                update_state_after_accept(protocol, state, seq, modified_packet, response)
                         except socket.timeout:
                             timeout_count += 1
+                            run_valid = False
+                            failure_reason = "attack_packet_timeout"
                         attack_done = True
                         continue
                 else:
@@ -553,6 +667,10 @@ def run_one_baseline_experiment(
                     
                     if is_applicable and modified_packet is not None:
                         packet = modified_packet
+                        sent_attack_packet = True
+                        attack_packet_seq = seq
+                        attack_packet_sent = True
+                        attack_expected_reason = expected_attack_reason(attack_type)
                         attack_done = True
                         attack_injected = True
                     elif not is_applicable:
@@ -574,33 +692,57 @@ def run_one_baseline_experiment(
                 
                 if response.get("ok"):
                     accepted_count += 1
-                    # 更新状态
-                    if protocol == "gmcp_r" or protocol == "gmcp":
-                        state.last_seq = int(response.get("last_seq", state.last_seq))
-                        state.last_mem = response.get("last_mem", state.last_mem)
-                    elif protocol in ("hash_chain", "authenticated_hash_chain"):
-                        state.last_seq = seq
-                        state.last_hash = packet.get("chain_hash", state.last_hash)
-                    else:
-                        state.last_seq = seq
+                    if sent_attack_packet:
+                        attack_packet_accepted = True
+                    update_state_after_accept(protocol, state, seq, packet, response)
                 else:
                     rejected_count += 1
                     reason = response.get("reason", "unknown")
                     last_rejection_reason = reason
                     last_rejection_class = _classify_rejection(reason)
                     # 只有当攻击已注入且服务端拒绝时，才算检测到攻击
-                    if attack_injected and not response.get("ok"):
+                    if sent_attack_packet:
                         attack_detected_by_server = True
+                        attack_packet_rejected = True
+                        attack_packet_reason = reason
+                        attack_packet_reason_class = last_rejection_class
                         if attack_expected_reason:
                             attack_reason_match = attack_expected_reason in reason
+
+                        retry_sent = True
+                        retry_start = time.time()
+                        send_json_line(sock, clean_packet)
+                        sent_count += 1
+                        retry_response = recv_json_line(file_obj)
+                        retry_end = time.time()
+                        rtt_list.append((retry_end - retry_start) * 1000)
+                        retry_accepted = bool(retry_response.get("ok"))
+                        if retry_accepted:
+                            accepted_count += 1
+                            post_attack_resynchronized = True
+                            update_state_after_accept(protocol, state, seq, clean_packet, retry_response)
+                        else:
+                            rejected_count += 1
+                            run_valid = False
+                            failure_reason = "post_attack_resynchronization_failed"
+                            last_rejection_reason = retry_response.get("reason", "unknown")
+                            last_rejection_class = _classify_rejection(last_rejection_reason)
+                            break
                         
             except socket.timeout:
                 timeout_count += 1
+                if sent_attack_packet:
+                    failure_reason = "attack_packet_timeout"
+                    run_valid = False
             except Exception as e:
                 error_count += 1
+                run_valid = False
+                failure_reason = str(e)
                 print(f"[ERROR] seq={seq}: {e}")
     
     except Exception as e:
+        run_valid = False
+        failure_reason = str(e)
         print(f"[ERROR] Experiment failed: {e}")
     
     finally:
@@ -648,6 +790,17 @@ def run_one_baseline_experiment(
         "rejection_class": last_rejection_class,
         "attack_expected_reason": attack_expected_reason,
         "attack_reason_match": attack_reason_match,
+        "attack_packet_seq": attack_packet_seq,
+        "attack_packet_sent": attack_packet_sent,
+        "attack_packet_accepted": attack_packet_accepted,
+        "attack_packet_rejected": attack_packet_rejected,
+        "attack_packet_reason": attack_packet_reason,
+        "attack_packet_reason_class": attack_packet_reason_class,
+        "post_attack_resynchronized": post_attack_resynchronized,
+        "retry_sent": retry_sent,
+        "retry_accepted": retry_accepted,
+        "run_valid": run_valid,
+        "failure_reason": failure_reason,
     }
 
 
@@ -668,6 +821,10 @@ def run_all_experiments():
         "expected_session_id", "packet_session_id", "connection_bound_session_id",
         "rejection_reason", "rejection_class",
         "attack_expected_reason", "attack_reason_match",
+        "attack_packet_seq", "attack_packet_sent", "attack_packet_accepted",
+        "attack_packet_rejected", "attack_packet_reason", "attack_packet_reason_class",
+        "post_attack_resynchronized", "retry_sent", "retry_accepted",
+        "run_valid", "failure_reason",
     ]
     
     total_experiments = len(PROTOCOLS) * len(ATTACK_TYPES) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * len(REPEATS)
@@ -784,6 +941,58 @@ def print_attack_matrix(results: list):
     print(f"{'='*80}")
 
 
+def baseline_results_valid(results: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
+    """Return whether baseline rows are execution-valid."""
+    violations: List[str] = []
+    for row in results:
+        sent = int(row.get("sent_count", 0))
+        accepted = int(row.get("accepted_count", 0))
+        rejected = int(row.get("rejected_count", 0))
+        timeout = int(row.get("timeout_count", 0))
+        error = int(row.get("error_count", 0))
+        if sent != accepted + rejected + timeout + error:
+            violations.append(
+                f"sent_count mismatch: protocol={row.get('protocol')} attack={row.get('attack_type')}"
+            )
+        if timeout or error:
+            violations.append(
+                f"timeout/error: protocol={row.get('protocol')} attack={row.get('attack_type')}"
+            )
+        if not row.get("run_valid", False):
+            violations.append(
+                f"run_valid false: protocol={row.get('protocol')} attack={row.get('attack_type')} "
+                f"reason={row.get('failure_reason')}"
+            )
+    return not violations, violations
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run real baseline comparison experiments")
+    parser.add_argument("--spawn-server", action="store_true", help="Start real_baseline_server.py for this run")
+    args = parser.parse_args()
+
+    server_proc = None
+    try:
+        if args.spawn_server:
+            server_proc = spawn_baseline_server()
+        results = run_all_experiments()
+        print_attack_matrix(results)
+        ok, violations = baseline_results_valid(results)
+        if not ok:
+            print("[BASELINE] INVALID RESULTS:", file=sys.stderr)
+            for violation in violations[:20]:
+                print(f"  - {violation}", file=sys.stderr)
+            return 1
+        return 0
+    finally:
+        if server_proc:
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+            print("[SPAWN] Baseline server terminated")
+
+
 if __name__ == "__main__":
-    results = run_all_experiments()
-    print_attack_matrix(results)
+    sys.exit(main())

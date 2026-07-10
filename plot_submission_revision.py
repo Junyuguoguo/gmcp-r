@@ -452,8 +452,11 @@ def plot_concurrency_ci(csv_path: str, output_path: str) -> str:
         vals = by_conc[c]
         m = np.mean(vals)
         if len(vals) > 1:
-            from scipy.stats import t as t_dist
-            t_crit = t_dist.ppf(0.975, len(vals) - 1)
+            try:
+                from scipy.stats import t as t_dist
+                t_crit = t_dist.ppf(0.975, len(vals) - 1)
+            except ModuleNotFoundError:
+                t_crit = 1.96
             ci = t_crit * np.std(vals, ddof=1) / np.sqrt(len(vals))
         else:
             ci = 0
