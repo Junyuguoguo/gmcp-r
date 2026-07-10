@@ -69,6 +69,9 @@ def main():
     if args.mode == "smoke":
         env["GMCP_SESSION_LENGTHS"] = "1000"
         env["GMCP_CHECKPOINT_INTERVALS"] = "10,50"
+        env["GMCP_MESSAGE_COUNTS"] = "20"
+        env["GMCP_PAYLOAD_SIZES"] = "128"
+        env["GMCP_RACE_REPEATS"] = "1"
         env["GMCP_BENCH_REPEATS"] = "3"
     
     steps = [
@@ -79,7 +82,12 @@ def main():
         ("Ticket rejection", [venv_python, "run_real_ticket_recovery_experiment.py", "--spawn-server"]),
         ("Checkpoint cost", [venv_python, "run_checkpoint_cost_comparison.py"]),
         ("Concurrent", [venv_python, "run_concurrent_experiment.py", "--spawn-server"]),
-        ("Validation", [venv_python, "validate_submission_revision.py", "--output-root", output_root, "--expected-repeats", str(repeats)]),
+        ("Validation", [
+            venv_python, "validate_submission_revision.py",
+            "--mode", "smoke" if args.mode == "smoke" else "release",
+            "--output-root", output_root,
+            "--expected-repeats", str(repeats),
+        ]),
         ("Plots", [venv_python, "plot_submission_revision.py", "--output-root", output_root]),
     ]
     

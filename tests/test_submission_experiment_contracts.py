@@ -267,6 +267,34 @@ class RecoveryWindowContractTests(unittest.TestCase):
 class RecoveryWindowCSVContractTests(unittest.TestCase):
     """Verify CSV output schema and row count for run_recovery_window_experiment."""
 
+    def test_nonce_race_dispatcher_preserves_repeat_id(self):
+        """nonce_race returns early, so dispatcher must attach repeat_id itself."""
+        import run_recovery_window_experiment as exp
+
+        original = exp.run_nonce_race
+        self.addCleanup(lambda: setattr(exp, "run_nonce_race", original))
+
+        def fake_race(host, port, session_id, checkpoint_interval, payload_size):
+            return {
+                "scenario": "nonce_race",
+                "checkpoint_interval": checkpoint_interval,
+                "payload_size": payload_size,
+                "race_winner_count": 1,
+                "success": True,
+            }
+
+        exp.run_nonce_race = fake_race
+        row = exp.run_window_scenario(
+            "nonce_race",
+            checkpoint_interval=50,
+            payload_size=128,
+            repeat_id=7,
+            host="127.0.0.1",
+            port=1,
+        )
+
+        self.assertEqual(row["repeat_id"], 7)
+
     def test_csv_has_expected_columns(self):
         csv_path = Path("results/submission_revision/recovery_window_experiment.csv")
         if not csv_path.exists():
@@ -364,6 +392,19 @@ class CheckpointCostComparisonTests(unittest.TestCase):
                              f"offset={offset}: expected replay_count={offset}, got {m.replay_count}")
             self.assertEqual(m.protocol, "gmcp_r")
 
+    def test_gmcp_physical_read_equals_exact_replayed_bytes(self):
+        """GMCP-R must not physically read the record after target_seq."""
+        from run_checkpoint_cost_comparison import measure_gmcp_recovery
+        p = self._make_prepared(20, 10, 1)
+
+        for offset in [1, 5]:
+            m = measure_gmcp_recovery(p, offset)
+            self.assertEqual(m.records_scanned, offset)
+            self.assertEqual(m.records_replayed, offset)
+            self.assertEqual(m.physical_bytes_read, m.logical_bytes_replayed,
+                             f"offset={offset}: physical bytes include an extra record")
+            self.assertIs(getattr(m, "stored_mem_ok", None), True)
+
     def test_chain_replay_count_equals_target_seq(self):
         """For n=20, k=10 and offsets 1/5/9: chain replay count == target seq."""
         from run_checkpoint_cost_comparison import measure_authenticated_chain_recovery
@@ -374,6 +415,16 @@ class CheckpointCostComparisonTests(unittest.TestCase):
             self.assertEqual(m.replay_count, target_seq,
                              f"offset={offset}: expected replay_count={target_seq}, got {m.replay_count}")
             self.assertEqual(m.protocol, "authenticated_hash_chain")
+
+    def test_authenticated_chain_does_not_read_record_after_target(self):
+        """Authenticated Hash Chain must stop after exactly target_seq records."""
+        from run_checkpoint_cost_comparison import measure_authenticated_chain_recovery
+        p = self._make_prepared(20, 10, 1)
+
+        m = measure_authenticated_chain_recovery(p, 1)
+        self.assertEqual(m.records_scanned, m.target_seq)
+        self.assertEqual(m.records_replayed, m.target_seq)
+        self.assertEqual(m.physical_bytes_read, m.logical_bytes_replayed)
 
     def test_both_protocols_reconstruct_correct_state(self):
         """Both GMCP-R and chain reconstruct matching target states."""
@@ -585,6 +636,32 @@ class ValidationContractTests(unittest.TestCase):
         violations = _validate_recovery_window(rows, expected_repeats=1)
         self.assertTrue(any("below_floor" in v.lower() for v in violations))
 
+    def test_checks_all_below_floor_rows(self):
+        """Validator must not stop after the first below_floor row."""
+        from validate_submission_revision import _validate_recovery_window
+
+        good = {
+            "scenario": "below_floor", "checkpoint_interval": "100", "payload_size": "128",
+            "repeat_id": "1", "success": "False", "state_unchanged": "True",
+            "race_winner_count": "0", "recovery_floor": "200", "ticket_last_seq": "100",
+            "ticket_seq": "100", "client_seq": "100", "server_seq": "200",
+            "server_last_seq_before": "200", "server_last_seq_after": "200",
+            "server_last_mem_before": "m200", "server_last_mem_after": "m200",
+            "request_auth_ok": "True", "response_auth_ok": "True",
+            "response_verify_reason": "ok",
+            "nonce_match": "True", "nonce_consumed": "False",
+            "reason": "rollback below floor",
+        }
+        bad = dict(good)
+        bad["repeat_id"] = "2"
+        bad["reason"] = "ok"
+
+        violations = _validate_recovery_window([good, bad], expected_repeats=1)
+        self.assertTrue(
+            any("below_floor" in v.lower() and "reason" in v.lower() for v in violations),
+            f"Expected second below_floor row to be checked, got: {violations}",
+        )
+
     def test_detects_wrong_race_winner_count(self):
         """Validator catches nonce_race with wrong winner count."""
         from validate_submission_revision import _validate_recovery_window
@@ -649,10 +726,57 @@ class ValidationContractTests(unittest.TestCase):
         rows = [
             {"protocol": "seq_mac", "attack_type": "prev_mem",
              "message_count": "100", "repeat_id": "1",
-             "attack_injected": "True", "attack_detected_by_server": "False"},
+             "payload_size": "128", "attack_applicable": "False",
+             "attack_injected": "True", "attack_detected_by_server": "False",
+             "sent_count": "100", "accepted_count": "100", "rejected_count": "0",
+             "timeout_count": "0", "error_count": "0",
+             "attack_packet_seq": "50", "attack_packet_sent": "True",
+             "attack_packet_accepted": "False", "attack_packet_rejected": "False",
+             "attack_packet_reason": "", "attack_packet_reason_class": "",
+             "attack_expected_reason": "", "attack_reason_match": "False",
+             "post_attack_resynchronized": "False",
+             "retry_sent": "False", "retry_accepted": "False",
+             "run_valid": "True", "failure_reason": ""},
         ]
         violations = _validate_baseline(rows)
         self.assertTrue(any("N/A" in v or "na" in v.lower() for v in violations))
+
+    def test_baseline_requires_attack_packet_audit_columns(self):
+        """Old baseline CSVs without attack-packet audit fields must fail."""
+        from validate_submission_revision import _validate_baseline
+
+        rows = [
+            {"protocol": "gmcp_r", "attack_type": "modify_unsigned",
+             "message_count": "100", "payload_size": "128", "repeat_id": "1",
+             "attack_applicable": "True", "attack_injected": "True",
+             "sent_count": "101", "accepted_count": "100", "rejected_count": "1",
+             "timeout_count": "0", "error_count": "0"},
+        ]
+        violations = _validate_baseline(rows, expected_repeats=1)
+        self.assertTrue(any("missing columns" in v.lower() for v in violations),
+                        f"Expected missing audit columns, got: {violations}")
+
+    def test_baseline_rejected_attack_requires_clean_retry_resync(self):
+        """Rejected applicable attacks must retry the same sequence cleanly."""
+        from validate_submission_revision import _validate_baseline
+
+        row = {
+            "protocol": "gmcp_r", "attack_type": "modify_unsigned",
+            "message_count": "100", "payload_size": "128", "repeat_id": "1",
+            "attack_applicable": "True", "attack_injected": "True",
+            "attack_packet_sent": "True", "attack_packet_accepted": "False",
+            "attack_packet_rejected": "True", "attack_packet_reason": "auth_tag mismatch",
+            "attack_packet_reason_class": "network_attacker_detected",
+            "attack_expected_reason": "auth_tag", "attack_reason_match": "True",
+            "sent_count": "100", "accepted_count": "99", "rejected_count": "1",
+            "timeout_count": "0", "error_count": "0", "run_valid": "True",
+            "failure_reason": "", "retry_sent": "False", "retry_accepted": "False",
+            "post_attack_resynchronized": "False",
+            "attack_packet_seq": "50",
+        }
+        violations = _validate_baseline([row], expected_repeats=1)
+        self.assertTrue(any("resynchronized" in v.lower() or "retry" in v.lower() for v in violations),
+                        f"Expected retry/resync violation, got: {violations}")
 
     def test_detects_duplicate_checkpoint_cost_keys(self):
         """Validator catches duplicate composite keys in checkpoint cost."""

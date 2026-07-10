@@ -730,7 +730,9 @@ def run_window_scenario(
     )
 
     if scenario == "nonce_race":
-        return run_nonce_race(host, port, sid, checkpoint_interval, payload_size)
+        result = run_nonce_race(host, port, sid, checkpoint_interval, payload_size)
+        result["repeat_id"] = repeat_id
+        return result
 
     sock, file_obj = _open_tcp(host, port)
     _send_hello(sock, file_obj, sid, CLIENT_ID, EPOCH)
@@ -874,6 +876,32 @@ def main():
         race_winners = sum(1 for r in race if r["race_winner_count"] == 1)
         print(f"  nonce_race: {race_winners}/{len(race)} with exactly 1 winner")
 
+        violations = []
+        for row in all_rows:
+            scenario = row["scenario"]
+            success = bool(row["success"])
+            if not row.get("request_auth_ok"):
+                violations.append(f"{scenario} repeat={row.get('repeat_id')}: request_auth_ok false")
+            if not row.get("response_auth_ok"):
+                violations.append(f"{scenario} repeat={row.get('repeat_id')}: response_auth_ok false")
+            if not row.get("nonce_match"):
+                violations.append(f"{scenario} repeat={row.get('repeat_id')}: nonce_match false")
+            if scenario in ("control", "ack_loss", "old_ticket_within_window") and not success:
+                violations.append(f"{scenario} repeat={row.get('repeat_id')}: expected success")
+            if scenario == "below_floor":
+                if success:
+                    violations.append(f"below_floor repeat={row.get('repeat_id')}: expected rejection")
+                if not row.get("state_unchanged"):
+                    violations.append(f"below_floor repeat={row.get('repeat_id')}: state changed")
+            if scenario == "nonce_race" and int(row.get("race_winner_count", 0)) != 1:
+                violations.append(f"nonce_race repeat={row.get('repeat_id')}: winner count != 1")
+        if violations:
+            print("[RECOVERY_WINDOW] INVALID RESULTS:", file=sys.stderr)
+            for violation in violations[:20]:
+                print(f"  - {violation}", file=sys.stderr)
+            return 1
+        return 0
+
     finally:
         if server_proc:
             server_proc.terminate()
@@ -882,4 +910,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
