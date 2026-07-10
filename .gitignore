@@ -1,25 +1,55 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
+*.egg-info/
+*.egg
+dist/
+build/
 
-# Virtual environment
+# Virtual Environment
 .venv/
 venv/
-env/
+ENV/
 
-# PyCharm
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
 
-# macOS
+# OS
 .DS_Store
+Thumbs.db
 
-# experiment outputs
-results/*.csv
-results/figures/*.png
-logs/
+# Results (large files)
+results/
+checkpoints/
 
-# temporary
+# Logs
 *.log
+
+# Secrets
+.env
+*.pem
+*.key
+
+# Jupyter
+.ipynb_checkpoints/
+
+# LaTeX aux files
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
+# Temporary
+*.tmp
+*.bak

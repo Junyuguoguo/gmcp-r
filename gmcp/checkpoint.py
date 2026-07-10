@@ -1,11 +1,12 @@
 # gmcp/checkpoint.py
+# Deprecated compatibility wrapper – prefer checkpoint_manager.sign_checkpoint_fields
+# and checkpoint_manager.verify_checkpoint_fields directly.
 
 import time
 from typing import Dict, Any
 
-from gmcp.config import SHARED_KEY
+from gmcp.config import CHECKPOINT_AUTH_KEY
 from gmcp.crypto_utils import hmac_sha256_hex, verify_hmac
-
 
 
 def build_checkpoint(
@@ -23,10 +24,9 @@ def build_checkpoint(
         "timestamp": time.time(),
     }
 
-    signature = hmac_sha256_hex(SHARED_KEY, checkpoint)
+    signature = hmac_sha256_hex(CHECKPOINT_AUTH_KEY, checkpoint)
     checkpoint["signature"] = signature
     return checkpoint
-
 
 def verify_checkpoint(checkpoint: Dict[str, Any]) -> bool:
     signature = checkpoint.get("signature")
@@ -36,4 +36,4 @@ def verify_checkpoint(checkpoint: Dict[str, Any]) -> bool:
     data = dict(checkpoint)
     data.pop("signature", None)
 
-    return verify_hmac(SHARED_KEY, data, signature)
+    return verify_hmac(CHECKPOINT_AUTH_KEY, data, signature)

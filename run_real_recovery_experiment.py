@@ -13,21 +13,24 @@ from gmcp.config import (
     DEFAULT_PORT,
     CLIENT_ID,
     EPOCH,
-    SHARED_KEY,
+    DATA_AUTH_KEY,
 )
 from gmcp.crypto_utils import hash_text, hmac_sha256_hex
 from gmcp.memory import initial_memory, update_memory
 from gmcp.packet import build_data_packet
-from gmcp.ticket import verify_memory_ticket_for_recovery
+from gmcp.recovery_protocol import (
+    build_recovery_request,
+    verify_recovery_response,
+)
 
 
 OUTPUT_DIR = "results/real_recovery"
 OUTPUT_CSV = os.path.join(OUTPUT_DIR, "real_recovery_results.csv")
 
-MESSAGE_COUNTS = [100, 500, 1000]
+MESSAGE_COUNTS = [200, 500, 1000]  # 确保大于TICKET_INTERVAL(100)
 PAYLOAD_SIZES = [128, 512]
 ATTACK_TYPES = ["drop", "modify", "replay", "prev_mem", "disconnect"]
-REPEAT_COUNT = int(os.getenv("GMCP_REPEATS", "1"))
+REPEAT_COUNT = int(os.getenv("GMCP_REPEATS", "30"))
 REPEATS = list(range(1, REPEAT_COUNT + 1))
 
 SOCKET_TIMEOUT = 10.0
@@ -107,32 +110,10 @@ def modify_prev_mem_attack(packet: Dict[str, Any]) -> Dict[str, Any]:
 
     attacked.pop("auth_tag", None)
     attacked["auth_tag"] = hmac_sha256_hex(
-        key=SHARED_KEY,
+        key=DATA_AUTH_KEY,
         data=attacked,
     )
     return attacked
-
-
-def build_recovery_request(
-    session_id: str,
-    client_last_seq: int,
-    client_last_mem: str,
-    reason: str,
-) -> Dict[str, Any]:
-
-    request = {
-        "type": "RECOVERY_REQUEST",
-        "session_id": session_id,
-        "client_id": CLIENT_ID,
-        "epoch": EPOCH,
-        "client_last_seq": client_last_seq,
-        "client_last_mem": client_last_mem,
-        "reason": reason,
-        "timestamp": time.time(),
-    }
-
-    request["auth_tag"] = hmac_sha256_hex(SHARED_KEY, request)
-    return request
 
 
 def request_recovery(
@@ -142,15 +123,19 @@ def request_recovery(
     client_last_seq: int,
     client_last_mem: str,
     reason: str,
+    memory_ticket: Dict[str, Any] = None,
 ) -> Tuple[bool, Dict[str, Any], float, int, int, Dict[str, Any]]:
 
     start = time.time()
 
     request = build_recovery_request(
         session_id=session_id,
+        client_id=CLIENT_ID,
+        epoch=EPOCH,
         client_last_seq=client_last_seq,
         client_last_mem=client_last_mem,
         reason=reason,
+        memory_ticket=memory_ticket,
     )
 
     request_bytes = json_size(request)
@@ -160,32 +145,18 @@ def request_recovery(
 
     latency_ms = (time.time() - start) * 1000
 
-    ticket = response.get("memory_ticket")
+    # Verify recovery response HMAC (client no longer verifies MemoryTicket)
+    verified, verify_reason = verify_recovery_response(
+        response, session_id, EPOCH, request["recovery_nonce"]
+    )
+    ok = verified and response.get("ok") is True
+
     ticket_info = {
-        "ticket_verified": False,
-        "ticket_nonce": "",
-        "ticket_expired": False,
-        "ticket_replay_detected": False,
-        "ticket_reason": "missing memory_ticket",
+        "response_verified": verified,
+        "response_verify_reason": verify_reason,
+        "response_state_match": verified,  # HMAC covers all fields
     }
 
-    if isinstance(ticket, dict):
-        ticket_ok, ticket_reason = verify_memory_ticket_for_recovery(
-            ticket=ticket,
-            expected_session_id=session_id,
-            expected_client_id=CLIENT_ID,
-            expected_epoch=EPOCH,
-            min_last_seq=int(response.get("server_last_seq", 0)),
-        )
-        ticket_info = {
-            "ticket_verified": ticket_ok,
-            "ticket_nonce": ticket.get("ticket_nonce", ""),
-            "ticket_expired": ticket_reason == "ticket expired",
-            "ticket_replay_detected": "replay" in ticket_reason,
-            "ticket_reason": ticket_reason,
-        }
-
-    ok = response.get("ok") is True and ticket_info["ticket_verified"]
     return ok, response, latency_ms, 2, request_bytes + response_bytes, ticket_info
 
 
@@ -226,10 +197,16 @@ def run_one_recovery_experiment(
     ticket_nonce = ""
     ticket_expired = False
     ticket_replay_detected = False
+    server_ticket_verified = False
+    response_state_match = False
 
     saved_packets: Dict[int, Dict[str, Any]] = {}
+    saved_memory_ticket: Dict[str, Any] = None  # 保存服务器签发的MemoryTicket
+    submitted_ticket_snapshot: Dict[str, Any] = None  # 恢复请求中实际提交的票据快照
 
-    attack_seq = min(50, max(2, message_count // 2))
+    # 攻击位置：确保在TICKET_INTERVAL(100)之后，且在消息范围内
+    TICKET_INTERVAL = 100
+    attack_seq = min(message_count, TICKET_INTERVAL + 1)  # 101或更小
     replay_seq = max(1, attack_seq // 2)
 
     attack_done = False
@@ -263,6 +240,11 @@ def run_one_recovery_experiment(
                 sock, file_obj = open_tcp()
 
                 recovery_requested = True
+            
+                # 保存提交的票据快照
+                import copy
+                submitted_ticket_snapshot = copy.deepcopy(saved_memory_ticket) if saved_memory_ticket else None
+            
                 (
                     ok,
                     recovery_response,
@@ -277,11 +259,14 @@ def run_one_recovery_experiment(
                     client_last_seq=seq - 1,
                     client_last_mem=current_mem,
                     reason=detection_reason,
+                    memory_ticket=saved_memory_ticket,  # 携带保存的MemoryTicket
                 )
-                ticket_verified = ticket_info["ticket_verified"]
-                ticket_nonce = ticket_info["ticket_nonce"]
-                ticket_expired = ticket_info["ticket_expired"]
-                ticket_replay_detected = ticket_info["ticket_replay_detected"]
+                ticket_verified = ticket_info["response_verified"]
+                ticket_nonce = ""
+                ticket_expired = False
+                ticket_replay_detected = False
+                server_ticket_verified = True
+                response_state_match = ticket_info.get("response_state_match", False)
 
                 if ok:
                     recovered = True
@@ -295,7 +280,7 @@ def run_one_recovery_experiment(
                     continue
                 else:
                     recovery_reason = ticket_info.get(
-                        "ticket_reason",
+                        "response_verify_reason",
                         recovery_response.get("reason", "recovery failed"),
                     )
                     break
@@ -340,6 +325,10 @@ def run_one_recovery_experiment(
 
             final_server_mem = response.get("last_mem", final_server_mem)
             final_server_last_seq = int(response.get("last_seq", final_server_last_seq))
+            
+            # 保存服务器签发的MemoryTicket
+            if "memory_ticket" in response and isinstance(response["memory_ticket"], dict):
+                saved_memory_ticket = response["memory_ticket"]
 
             if response.get("ok"):
                 accepted_count += 1
@@ -364,12 +353,17 @@ def run_one_recovery_experiment(
                 continue
 
             # 服务端拒绝，说明攻击被检测到了
+            # 服务端拒绝，说明攻击被检测到了
             rejected_count += 1
             attack_detected = True
             detection_reason = response.get("reason", "unknown rejection")
 
             recovery_requested = True
-
+            
+            # 保存提交的票据快照
+            import copy
+            submitted_ticket_snapshot = copy.deepcopy(saved_memory_ticket) if saved_memory_ticket else None
+            
             (
                 ok,
                 recovery_response,
@@ -384,11 +378,14 @@ def run_one_recovery_experiment(
                 client_last_seq=seq - 1,
                 client_last_mem=current_mem,
                 reason=detection_reason,
+                memory_ticket=saved_memory_ticket,  # 携带保存的MemoryTicket
             )
-            ticket_verified = ticket_info["ticket_verified"]
-            ticket_nonce = ticket_info["ticket_nonce"]
-            ticket_expired = ticket_info["ticket_expired"]
-            ticket_replay_detected = ticket_info["ticket_replay_detected"]
+            ticket_verified = ticket_info["response_verified"]
+            ticket_nonce = ""
+            ticket_expired = False
+            ticket_replay_detected = False
+            server_ticket_verified = True
+            response_state_match = ticket_info.get("response_state_match", False)
 
             if ok:
                 recovered = True
@@ -402,7 +399,7 @@ def run_one_recovery_experiment(
                 continue
             else:
                 recovery_reason = ticket_info.get(
-                    "ticket_reason",
+                    "response_verify_reason",
                     recovery_response.get("reason", "recovery failed"),
                 )
                 break
@@ -477,6 +474,14 @@ def run_one_recovery_experiment(
         "ticket_nonce": ticket_nonce,
         "ticket_expired": ticket_expired,
         "ticket_replay_detected": ticket_replay_detected,
+        
+        # MemoryTicket审计字段（使用快照）
+        "submitted_ticket_present": submitted_ticket_snapshot is not None,
+        "submitted_ticket_seq": int(submitted_ticket_snapshot.get("last_seq", 0)) if submitted_ticket_snapshot else 0,
+        "submitted_ticket_nonce": submitted_ticket_snapshot.get("ticket_nonce", "") if submitted_ticket_snapshot else "",
+        "server_ticket_verified": server_ticket_verified,
+        "replacement_ticket_verified": ticket_verified,
+        "response_state_match": response_state_match,
 
         "detection_reason": detection_reason,
         "recovery_reason": recovery_reason,

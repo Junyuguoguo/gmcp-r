@@ -6,7 +6,7 @@ import random
 import time
 from typing import Dict, Any, Tuple, List
 
-from gmcp.config import SESSION_ID, CLIENT_ID, EPOCH, SHARED_KEY
+from gmcp.config import SESSION_ID, CLIENT_ID, EPOCH, DATA_AUTH_KEY
 from gmcp.crypto_utils import hash_text, hmac_sha256_hex, verify_hmac
 from gmcp.memory import initial_memory, update_memory
 from gmcp.metrics import MetricsRecorder
@@ -82,7 +82,7 @@ def build_packet(
     if protocol in ("hash_chain", "gmcp_r"):
         packet["prev_mem"] = prev_mem
 
-    packet["auth_tag"] = hmac_sha256_hex(SHARED_KEY, packet)
+    packet["auth_tag"] = hmac_sha256_hex(DATA_AUTH_KEY, packet)
     return packet
 
 
@@ -100,7 +100,7 @@ def verify_packet(
         return False, "missing auth_tag", server_last_seq, server_last_mem
 
     data_for_auth = packet_without_auth(packet)
-    if not verify_hmac(SHARED_KEY, data_for_auth, recv_auth_tag):
+    if not verify_hmac(DATA_AUTH_KEY, data_for_auth, recv_auth_tag):
         return False, "auth_tag verification failed", server_last_seq, server_last_mem
 
     if packet.get("session_id") != SESSION_ID:
@@ -163,7 +163,7 @@ def modify_prev_mem_attack(packet: Dict[str, Any]) -> Dict[str, Any]:
     attacked = dict(packet)
     attacked["prev_mem"] = "fake-memory-state"
     attacked.pop("auth_tag", None)
-    attacked["auth_tag"] = hmac_sha256_hex(SHARED_KEY, attacked)
+    attacked["auth_tag"] = hmac_sha256_hex(DATA_AUTH_KEY, attacked)
     return attacked
 
 
@@ -270,11 +270,11 @@ def simulate_recovery(
             "expire_time": time.time() + 3600,
             "ticket_nonce": "ticket-only-%f" % time.time(),
         }
-        ticket["auth_tag"] = hmac_sha256_hex(SHARED_KEY, ticket)
+        ticket["auth_tag"] = hmac_sha256_hex(DATA_AUTH_KEY, ticket)
 
         data = dict(ticket)
         tag = data.pop("auth_tag")
-        ok = verify_hmac(SHARED_KEY, data, tag)
+        ok = verify_hmac(DATA_AUTH_KEY, data, tag)
 
         stable_cpu_work(2)
 
@@ -469,7 +469,7 @@ def simulate_forged_recovery_attack(
     tag = msg.get("auth_tag")
     data = dict(msg)
     data.pop("auth_tag", None)
-    ok = verify_hmac(SHARED_KEY, data, tag)
+    ok = verify_hmac(DATA_AUTH_KEY, data, tag)
 
     stable_cpu_work(3)
 

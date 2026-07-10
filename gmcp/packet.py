@@ -3,7 +3,7 @@
 import time
 from typing import Dict, Any
 
-from gmcp.config import SHARED_KEY
+from gmcp.config import DATA_AUTH_KEY
 from gmcp.crypto_utils import hash_text, hmac_sha256_hex
 
 
@@ -14,6 +14,7 @@ def build_data_packet(
     seq: int,
     prev_mem: str,
     payload: str,
+    protocol: str = "gmcp",
 ) -> Dict[str, Any]:
     """
     构造 DATA 报文。
@@ -22,6 +23,7 @@ def build_data_packet(
 
     packet = {
         "type": "DATA",
+        "protocol": protocol,
         "session_id": session_id,
         "sender_id": sender_id,
         "epoch": epoch,
@@ -32,7 +34,7 @@ def build_data_packet(
         "timestamp": time.time(),
     }
 
-    auth_tag = hmac_sha256_hex(SHARED_KEY, packet)
+    auth_tag = hmac_sha256_hex(DATA_AUTH_KEY, packet)
     packet["auth_tag"] = auth_tag
     return packet
 

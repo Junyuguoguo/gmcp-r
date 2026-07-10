@@ -12,7 +12,7 @@ from gmcp.config import (
     DEFAULT_PORT,
     CLIENT_ID,
     EPOCH,
-    SHARED_KEY,
+    DATA_AUTH_KEY,
 )
 from gmcp.memory import initial_memory
 from gmcp.protocol import GMCPState, GMCPVerifier
@@ -56,7 +56,7 @@ def verify_recovery_request(packet: Dict[str, Any]) -> bool:
     data = dict(packet)
     data.pop("auth_tag", None)
 
-    return verify_hmac(SHARED_KEY, data, tag)
+    return verify_hmac(DATA_AUTH_KEY, data, tag)
 
 
 def handle_recovery_request(packet, states, verifiers, stats):

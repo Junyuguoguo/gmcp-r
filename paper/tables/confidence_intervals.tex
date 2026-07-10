@@ -1,0 +1,15 @@
+\begin{table}[t]
+\centering
+\caption{Performance Metrics with 95\% Confidence Intervals}
+\begin{tabular}{lccc}
+\toprule
+Protocol & Throughput (msg/s) & RTT (ms) & Success (\%) \\
+\midrule
+gmcp_r & 3299 $\pm$ 263 & 0.14 $\pm$ 0.03 & 37.0 $\pm$ 2.4 \\
+hash_chain & 4008 $\pm$ 330 & 0.10 $\pm$ 0.00 & 37.0 $\pm$ 2.4 \\
+seq_mac & 6342 $\pm$ 408 & 0.09 $\pm$ 0.00 & 52.7 $\pm$ 2.7 \\
+ticket_only & 0 $\pm$ 0 & 0.00 $\pm$ 0.00 & 0.0 $\pm$ 0.0 \\
+\bottomrule
+\end{tabular}
+\label{tab:confidence_intervals}
+\end{table}

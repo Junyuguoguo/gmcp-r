@@ -1,0 +1,430 @@
+# -*- coding: utf-8 -*-
+# real_tcp_server_with_ticket.py
+# 
+# 增强版服务器：定期签发MemoryTicket，支持真实恢复流程测试
+# 集成CheckpointManager，实现真正的checkpoint恢复
+
+import json
+import socket
+import threading
+import time
+from typing import Dict, Any
+
+from gmcp.config import (
+    SERVER_BIND_HOST,
+    DEFAULT_PORT,
+    CLIENT_ID,
+    EPOCH,
+    DATA_AUTH_KEY,
+    CHECKPOINT_INTERVAL,
+)
+from gmcp.memory import initial_memory
+from gmcp.protocol import GMCPState, GMCPVerifier
+from gmcp.ticket import build_memory_ticket
+from gmcp.checkpoint_manager import CheckpointManager
+from gmcp.recovery_protocol import (
+    build_recovery_response,
+    verify_recovery_request,
+)
+from gmcp.session_registry import SessionContext, SessionRegistry
+from gmcp.config import LOCK_STRATEGY
+# 每隔多少条消息签发一次MemoryTicket
+TICKET_INTERVAL = 100
+
+
+def _session_factory(session_id: str, checkpoint_interval: int) -> SessionContext:
+    """Create a full SessionContext for a new session."""
+    mem_seed = "demo-seed"
+    m0 = initial_memory(session_id, CLIENT_ID, EPOCH, mem_seed)
+    state = GMCPState(
+        session_id=session_id,
+        sender_id=CLIENT_ID,
+        epoch=EPOCH,
+        last_seq=0,
+        last_mem=m0,
+    )
+    verifier = GMCPVerifier(state)
+    checkpoint_mgr = CheckpointManager(
+        session_id=session_id,
+        epoch=EPOCH,
+        checkpoint_interval=checkpoint_interval,
+    )
+    return SessionContext(
+        session_id=session_id,
+        state=state,
+        verifier=verifier,
+        checkpoint_manager=checkpoint_mgr,
+    )
+
+
+def send_json_line(conn, response: Dict[str, Any]):
+    raw = json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n"
+    conn.sendall(raw)
+
+
+def enable_tcp_nodelay(conn) -> None:
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
+
+def _reject(session_id: str, recovery_nonce: str, reason: str, recv_time: float) -> Dict[str, Any]:
+    """Build an authenticated failure recovery response."""
+    return build_recovery_response(
+        ok=False,
+        reason=reason,
+        session_id=session_id,
+        epoch=EPOCH,
+        recovery_nonce=recovery_nonce,
+    )
+
+
+def handle_recovery_request(packet, registry: SessionRegistry):
+    recv_time = time.time()
+    session_id = packet.get("session_id", "unknown-session")
+    recovery_nonce = packet.get("recovery_nonce", "")
+
+    ok_req, reason_req = verify_recovery_request(packet)
+    if not ok_req:
+        return build_recovery_response(
+            ok=False, reason="invalid recovery request auth_tag",
+            session_id=session_id, epoch=EPOCH,
+            recovery_nonce=recovery_nonce,
+        )
+
+    client_ckpt_interval = int(packet.get("checkpoint_interval", CHECKPOINT_INTERVAL))
+    # Validate range — fall back to default if out of bounds
+    if client_ckpt_interval < 10 or client_ckpt_interval > 1000:
+        client_ckpt_interval = CHECKPOINT_INTERVAL
+
+    ctx = registry.get_or_create(session_id, client_ckpt_interval)
+    with ctx.lock:
+        state = ctx.state
+        checkpoint_mgr = ctx.checkpoint_manager
+        
+        # 验证客户端带回来的MemoryTicket（必需）
+        client_ticket = packet.get("memory_ticket")
+        ticket_valid = False
+        ticket_reason = "no ticket provided"
+        
+        if not isinstance(client_ticket, dict):
+            # 缺少票据，拒绝请求
+            print(f"[SERVER] 恢复请求缺少MemoryTicket", flush=True)
+            return _reject(session_id, recovery_nonce, "missing memory_ticket", recv_time)
+        
+        from gmcp.ticket import validate_memory_ticket, consume_ticket_nonce
+        # 获取最近的Checkpoint，使用其seq作为recovery_floor
+        latest_checkpoint = checkpoint_mgr.get_latest_checkpoint()
+        if latest_checkpoint:
+            recovery_floor = latest_checkpoint.seq
+        else:
+            # 如果没有Checkpoint，使用0（允许任何票据）
+            recovery_floor = 0
+        
+        # 第一步：验证票据（不消费nonce）
+        ticket_valid, ticket_reason = validate_memory_ticket(
+            ticket=client_ticket,
+            expected_session_id=session_id,
+            expected_client_id=packet.get("client_id", CLIENT_ID),
+            expected_epoch=EPOCH,
+            min_last_seq=recovery_floor,  # 使用recovery_floor
+        )
+        
+        if not ticket_valid:
+            print(f"[SERVER] MemoryTicket验证失败: {ticket_reason}", flush=True)
+            return _reject(session_id, recovery_nonce, f"memory_ticket invalid: {ticket_reason}", recv_time)
+        
+        print(f"[SERVER] MemoryTicket验证成功", flush=True)
+        
+        # 验证票据中的Checkpoint与服务器记录一致
+        ticket_checkpoint_seq = int(client_ticket.get("checkpoint_seq", 0))
+        ticket_checkpoint_mem = client_ticket.get("checkpoint_mem", "")
+        
+        # 根据ticket.checkpoint_seq查找服务器保存的Checkpoint
+        stored_checkpoint = checkpoint_mgr.get_checkpoint_for_seq(ticket_checkpoint_seq)
+        if not stored_checkpoint:
+            # 找不到Checkpoint，拒绝恢复
+            print(f"[SERVER] 未找到Checkpoint seq={ticket_checkpoint_seq}，拒绝恢复", flush=True)
+            return _reject(session_id, recovery_nonce, "checkpoint not found", recv_time)
+        
+        # 验证Checkpoint认证标签
+        checkpoint_ok, checkpoint_reason = checkpoint_mgr.verify_checkpoint(stored_checkpoint)
+        if not checkpoint_ok:
+            print(f"[SERVER] Checkpoint认证标签验证失败: {checkpoint_reason}", flush=True)
+            return _reject(session_id, recovery_nonce, f"checkpoint authentication failed: {checkpoint_reason}", recv_time)
+        
+        # 比较Checkpoint的session_id、epoch、seq和memory
+        if stored_checkpoint.session_id != session_id:
+            print(f"[SERVER] Checkpoint session_id不匹配", flush=True)
+            return _reject(session_id, recovery_nonce, "checkpoint session_id mismatch", recv_time)
+        
+        if stored_checkpoint.epoch != EPOCH:
+            print(f"[SERVER] Checkpoint epoch不匹配", flush=True)
+            return _reject(session_id, recovery_nonce, "checkpoint epoch mismatch", recv_time)
+        
+        if stored_checkpoint.seq != ticket_checkpoint_seq:
+            print(f"[SERVER] Checkpoint seq不匹配: stored={stored_checkpoint.seq}, ticket={ticket_checkpoint_seq}", flush=True)
+            return _reject(session_id, recovery_nonce, "checkpoint seq mismatch", recv_time)
+        
+        if stored_checkpoint.memory != ticket_checkpoint_mem:
+            print(f"[SERVER] Checkpoint memory不匹配: stored={stored_checkpoint.memory[:16]}..., ticket={ticket_checkpoint_mem[:16]}...", flush=True)
+            return _reject(session_id, recovery_nonce, "checkpoint memory mismatch", recv_time)
+        
+        # 验证ticket.checkpoint_seq <= ticket.last_seq <= server.last_seq
+        ticket_last_seq = int(client_ticket.get("last_seq", 0))
+        if ticket_checkpoint_seq > ticket_last_seq or ticket_last_seq > state.last_seq:
+            print(f"[SERVER] Checkpoint序列不一致: ckpt_seq={ticket_checkpoint_seq}, ticket_last={ticket_last_seq}, server_last={state.last_seq}", flush=True)
+            return _reject(session_id, recovery_nonce, "checkpoint sequence inconsistency", recv_time)
+        
+        print(f"[SERVER] Checkpoint验证成功: seq={ticket_checkpoint_seq}", flush=True)
+        
+        # 所有检查通过，现在消费nonce
+        if not consume_ticket_nonce(client_ticket):
+            print(f"[SERVER] nonce消费失败（可能已被使用）", flush=True)
+            return _reject(session_id, recovery_nonce, "ticket replay detected during nonce consumption", recv_time)
+        print(f"[SERVER] nonce已消费", flush=True)
+        
+        # 获取最近的Checkpoint
+        latest_checkpoint = checkpoint_mgr.get_latest_checkpoint()
+        if latest_checkpoint:
+            checkpoint_seq = latest_checkpoint.seq
+            checkpoint_mem = latest_checkpoint.memory
+        else:
+            # 如果没有Checkpoint，使用当前状态
+            checkpoint_seq = state.last_seq
+            checkpoint_mem = state.last_mem
+        
+        # 生成新的MemoryTicket
+        memory_ticket = build_memory_ticket(
+            session_id=session_id,
+            client_id=packet.get("client_id", CLIENT_ID),
+            epoch=EPOCH,
+            last_seq=state.last_seq,
+            last_mem=state.last_mem,
+            checkpoint_seq=checkpoint_seq,
+            checkpoint_mem=checkpoint_mem,
+        )
+
+        response = build_recovery_response(
+            ok=True,
+            reason="ok",
+            session_id=session_id,
+            epoch=EPOCH,
+            recovery_nonce=recovery_nonce,
+            extra={
+                "recovery_mode": "memory_ticket_checkpoint",
+                "server_last_seq": state.last_seq,
+                "server_last_mem": state.last_mem,
+                "checkpoint_seq": checkpoint_seq,
+                "checkpoint_mem": checkpoint_mem,
+                "memory_ticket": memory_ticket,
+                "ticket_verified": ticket_valid,
+                "ticket_reason": ticket_reason,
+            },
+        )
+
+    return response
+
+
+def handle_client(conn, addr, registry: SessionRegistry):
+    enable_tcp_nodelay(conn)
+    print(f"[REAL_TCP_SERVER] connected from {addr}", flush=True)
+
+    file_obj = None
+
+    try:
+        conn.settimeout(30)
+        file_obj = conn.makefile("r", encoding="utf-8", newline="\n")
+
+        while True:
+            try:
+                line = file_obj.readline()
+            except socket.timeout:
+                print(f"[REAL_TCP_SERVER] connection timeout from {addr}", flush=True)
+                break
+
+            if not line:
+                break
+
+            recv_time = time.time()
+
+            # 每条消息开始时初始化memory_ticket
+            memory_ticket = None
+
+            try:
+                packet: Dict[str, Any] = json.loads(line)
+            except Exception:
+                send_json_line(conn, {
+                    "ok": False,
+                    "reason": "invalid json",
+                    "server_time": recv_time,
+                })
+                continue
+
+            packet_type = packet.get("type")
+
+            if packet_type == "PING":
+                send_json_line(conn, {
+                    "ok": True,
+                    "reason": "pong",
+                    "server_time": recv_time,
+                })
+                continue
+
+            if packet_type == "RECOVERY_REQUEST":
+                response = handle_recovery_request(packet, registry)
+                send_json_line(conn, response)
+                continue
+
+            session_id = packet.get("session_id", "unknown-session")
+            client_ckpt_interval = int(packet.get("checkpoint_interval", CHECKPOINT_INTERVAL))
+            if client_ckpt_interval < 10 or client_ckpt_interval > 1000:
+                client_ckpt_interval = CHECKPOINT_INTERVAL
+
+            ctx = registry.get_or_create(session_id, client_ckpt_interval)
+            with ctx.lock:
+                state = ctx.state
+                verifier = ctx.verifier
+                checkpoint_mgr = ctx.checkpoint_manager
+                stats = ctx.stats
+
+                ok, reason = verifier.verify_data_packet(packet)
+
+                stats["total"] += 1
+
+                if ok:
+                    stats["accepted"] += 1
+
+                    # 检查是否需要创建checkpoint
+                    if checkpoint_mgr.should_checkpoint(state.last_seq):
+                        checkpoint = checkpoint_mgr.create_checkpoint(
+                            seq=state.last_seq,
+                            memory=state.last_mem,
+                        )
+                        print(
+                            f"[REAL_TCP_SERVER] checkpoint created at seq={state.last_seq}",
+                            flush=True,
+                        )
+                        
+                        # 创建Checkpoint时同步签发MemoryTicket
+                        memory_ticket = build_memory_ticket(
+                            session_id=session_id,
+                            client_id=CLIENT_ID,
+                            epoch=EPOCH,
+                            last_seq=state.last_seq,
+                            last_mem=state.last_mem,
+                            checkpoint_seq=checkpoint.seq,
+                            checkpoint_mem=checkpoint.memory,
+                        )
+                        print(
+                            f"[REAL_TCP_SERVER] issued MemoryTicket at checkpoint seq={state.last_seq}",
+                            flush=True,
+                        )
+
+                    if state.last_seq % 500 == 0:
+                        print(
+                            f"[REAL_TCP_SERVER] session={session_id}, "
+                            f"accepted={stats['accepted']}, "
+                            f"last_seq={state.last_seq}",
+                            flush=True,
+                        )
+                else:
+                    stats["rejected"] += 1
+                    print(
+                        f"[REAL_TCP_SERVER] reject session={session_id}, "
+                        f"seq={packet.get('seq')}, reason={reason}",
+                        flush=True,
+                    )
+
+                # 定期签发MemoryTicket（仅当Checkpoint未签发时）
+                if memory_ticket is None and ok and state.last_seq % TICKET_INTERVAL == 0 and state.last_seq > 0:
+                    # 获取最近的checkpoint
+                    latest_checkpoint = checkpoint_mgr.get_latest_checkpoint()
+                    if latest_checkpoint:
+                        checkpoint_seq = latest_checkpoint.seq
+                        checkpoint_mem = latest_checkpoint.memory
+                    else:
+                        # 没有Checkpoint时，创建一个再签发票据
+                        checkpoint = checkpoint_mgr.create_checkpoint(
+                            seq=state.last_seq,
+                            memory=state.last_mem,
+                        )
+                        checkpoint_seq = checkpoint.seq
+                        checkpoint_mem = checkpoint.memory
+                    
+                    memory_ticket = build_memory_ticket(
+                        session_id=session_id,
+                        client_id=CLIENT_ID,
+                        epoch=EPOCH,
+                        last_seq=state.last_seq,
+                        last_mem=state.last_mem,
+                        checkpoint_seq=checkpoint_seq,
+                        checkpoint_mem=checkpoint_mem,
+                    )
+                    print(
+                        f"[REAL_TCP_SERVER] issued MemoryTicket at seq={state.last_seq}, "
+                        f"checkpoint_seq={checkpoint_seq}",
+                        flush=True,
+                    )
+
+                response = {
+                    "ok": ok,
+                    "reason": reason,
+                    "session_id": session_id,
+                    "last_seq": state.last_seq,
+                    "last_mem": state.last_mem,
+                    "server_time": recv_time,
+                    "accepted": stats["accepted"],
+                    "rejected": stats["rejected"],
+                }
+
+                # 如果有ticket，添加到响应中
+                if memory_ticket:
+                    response["memory_ticket"] = memory_ticket
+
+            send_json_line(conn, response)
+
+    except Exception as e:
+        print(f"[REAL_TCP_SERVER] error from {addr}: {e}", flush=True)
+
+    finally:
+        try:
+            if file_obj:
+                file_obj.close()
+        except Exception:
+            pass
+
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+        print(f"[REAL_TCP_SERVER] disconnected from {addr}", flush=True)
+
+
+def main():
+    registry = SessionRegistry(factory=_session_factory, lock_strategy=LOCK_STRATEGY)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((SERVER_BIND_HOST, DEFAULT_PORT))
+    sock.listen(100)
+
+    print(f"[REAL_TCP_SERVER] Listening on {SERVER_BIND_HOST}:{DEFAULT_PORT}", flush=True)
+    print(f"[REAL_TCP_SERVER] MemoryTicket will be issued every {TICKET_INTERVAL} messages", flush=True)
+
+    while True:
+        conn, addr = sock.accept()
+        enable_tcp_nodelay(conn)
+
+        t = threading.Thread(
+            target=handle_client,
+            args=(conn, addr, registry),
+            daemon=True,
+        )
+        t.start()
+
+
+if __name__ == "__main__":
+    main()

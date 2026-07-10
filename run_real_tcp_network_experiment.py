@@ -14,7 +14,7 @@ from gmcp.config import (
     DEFAULT_PORT,
     CLIENT_ID,
     EPOCH,
-    SHARED_KEY,
+    DATA_AUTH_KEY,
 )
 from gmcp.crypto_utils import hash_text, hmac_sha256_hex
 from gmcp.memory import initial_memory, update_memory
@@ -64,7 +64,7 @@ def modify_prev_mem_attack(packet: Dict[str, Any]) -> Dict[str, Any]:
 
     attacked.pop("auth_tag", None)
     attacked["auth_tag"] = hmac_sha256_hex(
-        key=SHARED_KEY,
+        key=DATA_AUTH_KEY,
         data=attacked,
     )
     return attacked

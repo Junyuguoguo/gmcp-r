@@ -3,7 +3,7 @@
 import time
 from typing import Dict, Any
 
-from gmcp.config import SHARED_KEY
+from gmcp.config import DATA_AUTH_KEY
 from gmcp.crypto_utils import hmac_sha256_hex, verify_hmac
 
 
@@ -27,7 +27,7 @@ def build_snack(
         "timestamp": time.time(),
     }
 
-    msg["auth_tag"] = hmac_sha256_hex(SHARED_KEY, msg)
+    msg["auth_tag"] = hmac_sha256_hex(DATA_AUTH_KEY, msg)
     return msg
 
 
@@ -47,7 +47,7 @@ def build_ir_refresh(
         "timestamp": time.time(),
     }
 
-    msg["auth_tag"] = hmac_sha256_hex(SHARED_KEY, msg)
+    msg["auth_tag"] = hmac_sha256_hex(DATA_AUTH_KEY, msg)
     return msg
 
 
@@ -59,4 +59,4 @@ def verify_recovery_message(msg: Dict[str, Any]) -> bool:
     data = dict(msg)
     data.pop("auth_tag", None)
 
-    return verify_hmac(SHARED_KEY, data, tag)
+    return verify_hmac(DATA_AUTH_KEY, data, tag)

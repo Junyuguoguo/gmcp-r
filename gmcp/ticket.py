@@ -1,13 +1,46 @@
 # gmcp/ticket.py
 
 import time
-from typing import Dict, Any, Optional, Set, Tuple
+import threading
+from typing import Any, Dict, Optional, Set, Tuple
 
-from gmcp.config import SHARED_KEY
+from gmcp.config import TICKET_AUTH_KEY
 from gmcp.crypto_utils import hmac_sha256_hex, verify_hmac, random_nonce
 
 
-USED_TICKET_NONCES: Set[str] = set()
+class TicketNonceStore:
+    """Atomic nonce store for ticket replay prevention.
+
+    All operations are guarded by a threading.Lock() so that concurrent
+    recovery requests cannot both consume the same nonce.
+    """
+
+    def __init__(self):
+        self._used: Set[str] = set()
+        self._lock = threading.Lock()
+
+    def is_unused(self, nonce: Any) -> bool:
+        with self._lock:
+            return bool(nonce) and nonce not in self._used
+
+    def consume(self, nonce: Any) -> bool:
+        with self._lock:
+            if not nonce or nonce in self._used:
+                return False
+            self._used.add(nonce)
+            return True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._used.clear()
+
+
+# Default global store – existing module-level helpers delegate to this.
+_default_store = TicketNonceStore()
+
+# Legacy aliases kept for backward compatibility; prefer TicketNonceStore.
+USED_TICKET_NONCES: Set[str] = _default_store._used
+NONCE_LOCK = _default_store._lock
 
 REQUIRED_MEMORY_TICKET_FIELDS = {
     "type",
@@ -50,7 +83,7 @@ def build_memory_ticket(
         "key_version": 1,
     }
 
-    server_auth_tag = hmac_sha256_hex(SHARED_KEY, ticket)
+    server_auth_tag = hmac_sha256_hex(TICKET_AUTH_KEY, ticket)
     ticket["server_auth_tag"] = server_auth_tag
     return ticket
 
@@ -70,7 +103,7 @@ def _verify_memory_ticket_signature_and_fields(ticket: Dict[str, Any]) -> Tuple[
     data = dict(ticket)
     data.pop("server_auth_tag", None)
 
-    if not verify_hmac(SHARED_KEY, data, tag):
+    if not verify_hmac(TICKET_AUTH_KEY, data, tag):
         return False, "invalid ticket auth tag"
 
     if time.time() > ticket.get("expire_time", 0):
@@ -125,12 +158,58 @@ def verify_memory_ticket(
         return False, "rollback detected: ticket last_seq is older than required"
 
     nonce = ticket.get("ticket_nonce")
-    if nonce in USED_TICKET_NONCES:
+    if not _default_store.consume(nonce):
         return False, "ticket replay detected"
 
-    USED_TICKET_NONCES.add(nonce)
-
     return True, "ok"
+
+
+def validate_memory_ticket(
+    ticket: Dict[str, Any],
+    expected_session_id: Optional[str] = None,
+    expected_client_id: Optional[str] = None,
+    expected_epoch: Optional[int] = None,
+    min_last_seq: Optional[int] = None,
+) -> Tuple[bool, str]:
+    """
+    Validate a MemoryTicket WITHOUT consuming its nonce.
+
+    Use this for multi-step verification where nonce should only be consumed
+    after ALL checks (including checkpoint verification) pass.
+    """
+
+    ok, reason = _verify_memory_ticket_signature_and_fields(ticket)
+    if not ok:
+        return ok, reason
+
+    if expected_session_id is not None and ticket.get("session_id") != expected_session_id:
+        return False, "session_id mismatch"
+
+    if expected_client_id is not None and ticket.get("client_id") != expected_client_id:
+        return False, "client_id mismatch"
+
+    if expected_epoch is not None and int(ticket.get("epoch")) != int(expected_epoch):
+        return False, "epoch mismatch"
+
+    if min_last_seq is not None and int(ticket.get("last_seq")) < int(min_last_seq):
+        return False, "rollback detected: ticket last_seq is older than required"
+
+    nonce = ticket.get("ticket_nonce")
+    if not _default_store.is_unused(nonce):
+        return False, "ticket replay detected"
+
+    # Don't consume nonce yet - caller must call consume_ticket_nonce() after all checks pass
+    return True, "ok"
+
+
+def consume_ticket_nonce(ticket: Dict[str, Any]) -> bool:
+    """
+    Atomically consume a ticket's nonce after all validation checks pass.
+
+    Returns True if nonce was consumed, False if already consumed (replay).
+    """
+    nonce = ticket.get("ticket_nonce")
+    return _default_store.consume(nonce)
 
 
 def verify_memory_ticket_for_recovery(

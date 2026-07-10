@@ -1,4 +1,7 @@
 import unittest
+import csv
+from collections import defaultdict
+from pathlib import Path
 
 
 class PlotCompatibilityTests(unittest.TestCase):
@@ -233,6 +236,136 @@ class RerunFailedRecoveryTests(unittest.TestCase):
                 }
             )
         )
+
+
+class PaperDataConsistencyTests(unittest.TestCase):
+    def test_real_recovery_summary_matches_raw_csv(self):
+        raw_path = Path("results/real_recovery/real_recovery_results.csv")
+        summary_path = Path("results/real_recovery/summary_real_recovery.csv")
+
+        with raw_path.open(newline="", encoding="utf-8") as f:
+            raw_rows = list(csv.DictReader(f))
+        with summary_path.open(newline="", encoding="utf-8") as f:
+            summary_rows = {row["attack_type"]: row for row in csv.DictReader(f)}
+
+        grouped = defaultdict(list)
+        for row in raw_rows:
+            grouped[row["attack_type"]].append(row)
+
+        self.assertEqual(set(grouped), set(summary_rows))
+        for attack_type, rows in grouped.items():
+            summary = summary_rows[attack_type]
+            latencies = [float(row["recovery_latency_ms"]) for row in rows]
+            success_rate = sum(
+                str(row["full_recovery_success"]).lower() == "true" for row in rows
+            ) / len(rows) * 100
+            memory_rate = sum(
+                str(row["memory_match_after_recovery"]).lower() == "true" for row in rows
+            ) / len(rows) * 100
+
+            self.assertEqual(int(summary["sample_count"]), len(rows))
+            self.assertAlmostEqual(float(summary["recovery_success_rate"]), success_rate, places=3)
+            self.assertAlmostEqual(float(summary["memory_match_rate"]), memory_rate, places=3)
+            self.assertAlmostEqual(
+                float(summary["latency_mean_ms"]),
+                sum(latencies) / len(latencies),
+                places=3,
+            )
+
+    def test_baseline_summary_and_delivery_sources_match_raw_csv(self):
+        raw_path = Path("paper_data/01_real_baseline.csv")
+        summary_path = Path("results/real_baseline_comparison/summary_real_baseline_comparison_v2.csv")
+
+        with raw_path.open(newline="", encoding="utf-8") as f:
+            raw_rows = list(csv.DictReader(f))
+        with summary_path.open(newline="", encoding="utf-8") as f:
+            summary_rows = {row["protocol"]: row for row in csv.DictReader(f)}
+
+        grouped = defaultdict(list)
+        for row in raw_rows:
+            grouped[row["protocol"]].append(row)
+
+        expected_strings = []
+        for protocol, rows in grouped.items():
+            normal = [row for row in rows if row["attack_type"] == "none"]
+            attacks = [row for row in rows if row["attack_type"] != "none"]
+            detected = [
+                str(row["attack_detected_by_server"]).lower() == "true"
+                for row in attacks
+            ]
+            throughput = sum(float(row["throughput_msg_per_sec"]) for row in normal) / len(normal)
+            rtt = sum(float(row["rtt_mean_ms"]) for row in normal) / len(normal)
+            detection_rate = sum(detected) / len(detected) * 100
+            false_accept = sum(not value for value in detected) / len(detected) * 100
+
+            summary = summary_rows[protocol]
+            self.assertAlmostEqual(float(summary["normal_throughput"]), throughput, delta=1)
+            self.assertAlmostEqual(float(summary["normal_rtt"]), rtt, places=3)
+            self.assertAlmostEqual(float(summary["attack_detection_rate"]), detection_rate, places=3)
+            self.assertAlmostEqual(float(summary["false_accept_rate"]), false_accept, places=3)
+            expected_strings.append(f"{throughput:,.0f}")
+            expected_strings.append(f"{rtt:.3f}")
+
+        delivery_text = "\n".join(
+            Path(path).read_text(encoding="utf-8")
+            for path in [
+                "README.md",
+                "EXPERIMENT_SUMMARY.md",
+                "paper/main_zh.md",
+                "paper/build_mdpi_chinese_docx.py",
+                "paper/tables/baseline_v2.md",
+            ]
+        )
+        for expected in expected_strings:
+            self.assertIn(expected, delivery_text)
+
+    def test_weak_network_manuscript_uses_actual_repeat_count(self):
+        manuscript = Path("paper/main_zh.md").read_text(encoding="utf-8")
+
+        self.assertNotIn("每种配置重复50次", manuscript)
+        self.assertIn("每个条件重复2次", manuscript)
+
+    def test_delivery_sources_do_not_contain_stale_numbers_or_placeholder_refs(self):
+        checked_files = [
+            Path("README.md"),
+            Path("EXPERIMENT_SUMMARY.md"),
+            Path("paper/main.tex"),
+            Path("paper/build_mdpi_chinese_docx.py"),
+        ]
+        combined = "\n".join(path.read_text(encoding="utf-8") for path in checked_files)
+
+        stale_tokens = [
+            "1,071 msg/s",
+            "3,976 msg/s",
+            "3,299 msg/s",
+            "首个提供记忆连续性+高效恢复",
+            "ANOVA p<0.001",
+            "[REF-",
+        ]
+        for token in stale_tokens:
+            self.assertNotIn(token, combined)
+
+    def test_baseline_validation_uses_server_detection_field(self):
+        from validate_experiment_results import calculate_baseline_detection_rates
+
+        rows = [
+            {
+                "protocol": "gmcp_r",
+                "attack_type": "drop",
+                "success_rate": "0",
+                "attack_detected_by_server": "False",
+            },
+            {
+                "protocol": "gmcp_r",
+                "attack_type": "modify",
+                "success_rate": "100",
+                "attack_detected_by_server": "True",
+            },
+        ]
+
+        rates = calculate_baseline_detection_rates(rows)
+        self.assertEqual(rates["gmcp_r"]["detected"], 1)
+        self.assertEqual(rates["gmcp_r"]["total"], 2)
 
 
 if __name__ == "__main__":

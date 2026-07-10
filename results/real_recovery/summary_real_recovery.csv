@@ -1,6 +1,6 @@
-attack_type,attack_detection_rate,recovery_success_rate,memory_match_after_recovery,final_seq_consistency,recovery_latency_ms,recovery_extra_messages,recovery_extra_bytes,post_recovery_accepted
-disconnect,1.0,1.0,1.0,1.0,345.55893333333336,2.0,1380.8333333333333,484.3333333333333
-drop,1.0,1.0,1.0,1.0,173.75868888888888,2.0,1372.611111111111,484.3333333333333
-modify,1.0,1.0,1.0,1.0,179.43691666666666,2.0,1369.7777777777778,484.3333333333333
-prev_mem,1.0,1.0,1.0,1.0,175.58451666666667,2.0,1391.3333333333333,484.3333333333333
-replay,1.0,1.0,1.0,1.0,180.31566111111113,2.0,1370.7777777777778,484.3333333333333
+attack_type,sample_count,attack_detection_rate,recovery_success_rate,memory_match_rate,final_seq_consistency_rate,ticket_verified_rate,latency_mean_ms,latency_std_ms,latency_min_ms,latency_max_ms,latency_median_ms,recovery_extra_messages_mean,recovery_extra_bytes_mean,post_recovery_accepted_mean,environment
+disconnect,180,100.0,100.0,100.0,100.0,100.0,0.218,0.062,0.178,0.94,0.202,2.0,1987.944,466.667,local_tcp_loopback
+drop,180,100.0,100.0,100.0,100.0,100.0,0.222,0.045,0.144,0.383,0.209,2.0,1976.028,466.667,local_tcp_loopback
+modify,180,100.0,100.0,100.0,100.0,100.0,0.219,0.523,0.141,7.121,0.162,2.0,1972.867,466.667,local_tcp_loopback
+prev_mem,180,100.0,100.0,100.0,100.0,100.0,0.175,0.04,0.142,0.578,0.165,2.0,1996.856,466.667,local_tcp_loopback
+replay,180,100.0,100.0,100.0,100.0,100.0,0.177,0.036,0.143,0.462,0.164,2.0,1973.911,466.667,local_tcp_loopback

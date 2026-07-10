@@ -25,6 +25,54 @@ def save_bar(series, xlabel, ylabel, title, output_path, rotation=45):
     save_bar_chart(series, xlabel, ylabel, title, output_path, rotation=rotation)
 
 
+def _bool_series(series):
+    return (series.astype(str).str.lower() == "true").astype(int)
+
+
+def build_recovery_summary(df):
+    summary = df.groupby("attack_type").agg(
+        sample_count=("attack_type", "size"),
+        attack_detection_rate=("attack_detected_bool", "mean"),
+        recovery_success_rate=("full_recovery_success_bool", "mean"),
+        memory_match_rate=("memory_match_after_recovery_bool", "mean"),
+        final_seq_consistency_rate=("final_seq_consistent_bool", "mean"),
+        ticket_verified_rate=("ticket_verified_bool", "mean"),
+        latency_mean_ms=("recovery_latency_ms", "mean"),
+        latency_std_ms=("recovery_latency_ms", "std"),
+        latency_min_ms=("recovery_latency_ms", "min"),
+        latency_max_ms=("recovery_latency_ms", "max"),
+        latency_median_ms=("recovery_latency_ms", "median"),
+        recovery_extra_messages_mean=("recovery_extra_messages", "mean"),
+        recovery_extra_bytes_mean=("recovery_extra_bytes", "mean"),
+        post_recovery_accepted_mean=("post_recovery_accepted", "mean"),
+    ).reset_index()
+
+    percent_cols = [
+        "attack_detection_rate",
+        "recovery_success_rate",
+        "memory_match_rate",
+        "final_seq_consistency_rate",
+        "ticket_verified_rate",
+    ]
+    for col in percent_cols:
+        summary[col] = (summary[col] * 100).round(3)
+
+    for col in [
+        "latency_mean_ms",
+        "latency_std_ms",
+        "latency_min_ms",
+        "latency_max_ms",
+        "latency_median_ms",
+        "recovery_extra_messages_mean",
+        "recovery_extra_bytes_mean",
+        "post_recovery_accepted_mean",
+    ]:
+        summary[col] = summary[col].round(3)
+
+    summary["environment"] = "local_tcp_loopback"
+    return summary
+
+
 def main():
     ensure_output_dir()
     clean_old_figures()
@@ -38,8 +86,11 @@ def main():
         "full_recovery_success",
         "memory_match_after_recovery",
         "final_seq_consistent",
+        "ticket_verified",
     ]:
-        df[col + "_bool"] = (df[col].astype(str).str.lower() == "true").astype(int)
+        if col not in df.columns:
+            df[col] = False
+        df[col + "_bool"] = _bool_series(df[col])
     if "recovery_extra_messages" not in df.columns:
         df["recovery_extra_messages"] = 0
     if "recovery_extra_bytes" not in df.columns:
@@ -99,18 +150,8 @@ def main():
         os.path.join(OUTPUT_DIR, "recovery_fig6_recovery_overhead_by_attack.png"),
     )
 
-    summary = df.groupby("attack_type").agg(
-        attack_detection_rate=("attack_detected_bool", "mean"),
-        recovery_success_rate=("full_recovery_success_bool", "mean"),
-        memory_match_after_recovery=("memory_match_after_recovery_bool", "mean"),
-        final_seq_consistency=("final_seq_consistent_bool", "mean"),
-        recovery_latency_ms=("recovery_latency_ms", "mean"),
-        recovery_extra_messages=("recovery_extra_messages", "mean"),
-        recovery_extra_bytes=("recovery_extra_bytes", "mean"),
-        post_recovery_accepted=("post_recovery_accepted", "mean"),
-    )
-
-    summary.to_csv("results/real_recovery/summary_real_recovery.csv", encoding="utf-8")
+    summary = build_recovery_summary(df)
+    summary.to_csv("results/real_recovery/summary_real_recovery.csv", index=False, encoding="utf-8")
 
     print("[REAL_RECOVERY_PLOT] figures saved to", OUTPUT_DIR)
     print("[REAL_RECOVERY_PLOT] summary saved to results/real_recovery/summary_real_recovery.csv")
