@@ -69,7 +69,7 @@ BASELINE_PORT = 9001
 # Protocol registry
 # =========================
 
-SUPPORTED_PROTOCOLS = ("gmcp_r", "hash_chain", "seq_mac", "ticket_only", "authenticated_hash_chain")
+SUPPORTED_PROTOCOLS = ("gmcp", "hash_chain", "seq_mac", "ticket_only", "authenticated_hash_chain")
 
 
 def _make_gmcp_state(session_id: str):
@@ -106,7 +106,7 @@ def _make_auth_hash_chain_state(session_id: str):
 
 
 STATE_FACTORIES = {
-    "gmcp_r": _make_gmcp_state,
+    "gmcp": _make_gmcp_state,
     "hash_chain": _make_hash_chain_state,
     "seq_mac": _make_seq_mac_state,
     "ticket_only": _make_ticket_only_state,
@@ -169,7 +169,7 @@ def handle_recovery_request(packet, registry: SessionRegistry):
             "server_time": recv_time,
         }
 
-    protocol = packet.get("protocol", "gmcp_r")
+    protocol = packet.get("protocol", "gmcp")
     registry_key = f"{protocol}:{session_id}"
 
     if protocol not in STATE_FACTORIES:
@@ -185,7 +185,7 @@ def handle_recovery_request(packet, registry: SessionRegistry):
         state = ctx.state
 
         # Build recovery response depending on protocol
-        if protocol == "gmcp_r":
+        if protocol == "gmcp":
             memory_ticket = build_memory_ticket(
                 session_id=session_id,
                 client_id=packet.get("client_id", CLIENT_ID),
@@ -334,7 +334,7 @@ def handle_client(conn, addr, registry: SessionRegistry):
                 continue
 
             # DATA packet — route by protocol
-            protocol = packet.get("protocol", "gmcp_r")
+            protocol = packet.get("protocol", "gmcp")
             if protocol not in SUPPORTED_PROTOCOLS:
                 send_json_line(conn, {
                     "ok": False,
@@ -388,7 +388,7 @@ def handle_client(conn, addr, registry: SessionRegistry):
                 }
 
                 # Attach protocol-specific state info
-                if protocol == "gmcp_r":
+                if protocol == "gmcp":
                     response["last_mem"] = state.last_mem
                 elif protocol in ("hash_chain", "authenticated_hash_chain"):
                     response["last_hash"] = state.last_hash
