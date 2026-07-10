@@ -6,7 +6,7 @@
 
 ## 摘要
 
-在断续通信场景中，现有安全协议（如TLS会话恢复、基于序列号的可靠传输）能够重建连接，但无法验证断连期间的历史通信是否完整、连续且未被篡改。本文提出GMCP-R（Memory-Continuity-Aware Secure Recovery Protocol），一种面向断续通信的历史连续性安全恢复协议。GMCP-R通过记忆哈希链（mem_i = H(mem_{i-1} ‖ payload_i)）绑定全部消息历史，通过MemoryTicket机制实现高效状态恢复，并通过Checkpoint机制将恢复开销从O(n)降至O(k)。我们基于Python TCP原型实现了GMCP-R及三种基线协议并进行系统性实验。结果表明：GMCP-R在测试攻击场景下达到100%检测率且误接受率为0%，而Seq+MAC和Ticket Only分别存在25%和50%的误接受率；本地计算吞吐量约6.6万消息/秒；1至20并发客户端均保持100%成功率；代码级弱网仿真初步结果显示GMCP-R在当前设置下具有较好的恢复稳定性，但仍需真实弱网验证。
+在断续通信场景中，现有安全协议（如TLS会话恢复、基于序列号的可靠传输）能够重建连接，但无法验证断连期间的历史通信是否完整、连续且未被篡改。本文提出GMCP-R（Memory-Continuity-Aware Secure Recovery Protocol），一种面向断续通信的历史连续性安全恢复协议。GMCP-R通过记忆哈希链（mem_i = H(mem_{i-1} ‖ payload_i)）绑定全部消息历史，通过MemoryTicket机制实现高效状态恢复，并通过Checkpoint机制将恢复开销从O(n)降至O(k)。我们基于Python TCP原型实现了GMCP-R及四种基线协议（Hash Chain、Authenticated Hash Chain、Seq+MAC、Ticket Only）并进行系统性实验。结果表明：GMCP-R在测试攻击场景下达到100%检测率且误接受率为0%；Ticket Only的攻击检测率为83.3%、误接受率为16.7%；本地计算吞吐量约6.6万消息/秒；1至20并发客户端均保持100%成功率；代码级弱网仿真初步结果显示GMCP-R在当前设置下具有较好的恢复稳定性，但仍需真实弱网验证。
 
 **关键词**：安全通信协议、记忆连续性、状态恢复、MemoryTicket、Checkpoint
 
@@ -53,7 +53,7 @@ TLS会话恢复通过Pre-Shared Key（PSK）实现0-RTT连接建立，但不验�
 
 3. **Checkpoint机制**：周期性保存状态快照，将恢复开销从O(n)降低到O(k)，其中k为Checkpoint间隔，使大规模通信场景下的恢复成为可能。
 
-4. **系统性实验评估**：基于Python TCP原型，与三种基线协议进行了涵盖安全性、性能、并发和代码级弱网仿真的对比实验。
+4. **系统性实验评估**：基于Python TCP原型，与四种基线协议（Hash Chain、Authenticated Hash Chain、Seq+MAC、Ticket Only）进行了涵盖安全性、性能、并发和代码级弱网仿真的对比实验。
 
 ---
 
@@ -277,7 +277,7 @@ MemoryTicket的安全性质：
 
 ### 6.2 基线协议
 
-我们实现了三种基线协议进行对比：
+我们实现了四种基线协议进行对比：
 
 | 协议 | 描述 | 记忆连续性 | 恢复机制 |
 |------|------|-----------|---------|

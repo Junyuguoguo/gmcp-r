@@ -12,13 +12,17 @@ CSV results used by the manuscript.
 
 | Dataset | Rows | Repeats | Scope |
 |---|---:|---:|---|
-| `01_real_baseline.csv` | 3,600 | 30/config | GMCP-R vs Hash Chain, Seq+MAC, Ticket Only |
+| `01_real_baseline.csv` | 7,200 | 30/config | GMCP-R vs 4 baselines, 5 protocols × 8 attack conditions |
 | `02_ticket_attacks.csv` | 300 | 30/config | Invalid MemoryTicket rejection |
-| `03_performance.csv` | 120 | 3/config | Local computation benchmark |
-| `04_concurrency.csv` | 15 | 3/config | 1-20 concurrent clients |
+| `03_performance.csv` | 1,200 | 30/config | Local computation benchmark |
+| `04_concurrency.csv` | 150 | 30/config | 1-20 concurrent clients |
 | `05_weak_network.csv` | 150 | 2/config | Preliminary code-level weak-network simulation |
 | `06_memory_ticket_recovery.csv` | 900 | 30/config | Attack/disconnect recovery |
 | `07_checkpoint_recovery.csv` | 120 | 10/config | Checkpoint reconstruction audit |
+| `08_recovery_window.csv` | 760 | 30/config | Recovery window + ACK loss + nonce race |
+| `09_checkpoint_cost.csv` | 2,160 | 30/config | O(k) vs O(n) checkpoint recovery cost |
+
+Total paper-facing data rows: 12,940.
 
 ## Key Results
 

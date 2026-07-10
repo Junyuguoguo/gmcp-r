@@ -7,15 +7,17 @@ derived from the current CSV files and should replace older draft prose.
 
 | File | Experiment | Rows | Repeat Count | Environment |
 |---|---|---:|---:|---|
-| `paper_data/01_real_baseline.csv` | Baseline comparison | 3,600 | 30/config | Python TCP prototype |
+| `paper_data/01_real_baseline.csv` | Baseline comparison | 7,200 | 30/config | Python TCP prototype |
 | `paper_data/02_ticket_attacks.csv` | Invalid MemoryTicket attacks | 300 | 30/config | Local TCP loopback |
-| `paper_data/03_performance.csv` | Local computation benchmark | 120 | 3/config | Local computation |
-| `paper_data/04_concurrency.csv` | Concurrent clients | 15 | 3/config | Local TCP loopback |
+| `paper_data/03_performance.csv` | Local computation benchmark | 1,200 | 30/config | Local computation |
+| `paper_data/04_concurrency.csv` | Concurrent clients | 150 | 30/config | Local TCP loopback |
 | `paper_data/05_weak_network.csv` | Weak-network simulation | 150 | 2/config | Code-level simulation |
 | `paper_data/06_memory_ticket_recovery.csv` | Attack/disconnect recovery | 900 | 30/config | Local TCP loopback |
 | `paper_data/07_checkpoint_recovery.csv` | Checkpoint recovery | 120 | 10/config | Local TCP loopback |
+| `paper_data/08_recovery_window.csv` | Recovery window + ACK loss + nonce race | 760 | 30/config | Local TCP loopback |
+| `paper_data/09_checkpoint_cost.csv` | O(k) vs O(n) checkpoint recovery cost | 2,160 | 30/config | Local computation |
 
-Total paper-facing rows: 5,205.
+Total paper-facing rows: 12,940.
 
 ## Baseline Comparison
 

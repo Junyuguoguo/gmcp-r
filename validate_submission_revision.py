@@ -59,7 +59,12 @@ def recompute_baseline_summary(rows: List[Dict[str, str]]) -> Dict[str, Dict[str
     summaries = {}
     for protocol, prows in by_protocol.items():
         normal = [r for r in prows if r.get("attack_type") == "none"]
-        attacks = [r for r in prows if r.get("attack_type") != "none"]
+        attacks = [
+            r for r in prows
+            if r.get("attack_type") != "none"
+            and parse_bool(r.get("attack_applicable", "True"))
+            and parse_bool(r.get("attack_injected", "False"))
+        ]
 
         normal_throughput = (
             sum(safe_float(r.get("throughput_msg_per_sec", 0)) for r in normal) / len(normal)
