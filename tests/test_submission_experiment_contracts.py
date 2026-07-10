@@ -277,8 +277,8 @@ class RecoveryWindowCSVContractTests(unittest.TestCase):
 
         required_columns = {
             "scenario", "checkpoint_interval", "payload_size", "repeat_id",
-            "ticket_seq", "client_seq", "server_seq", "floor_seq", "response_seq",
-            "gap", "response_advance", "request_auth_ok", "response_auth_ok",
+            "ticket_seq", "client_seq", "server_seq", "recovery_floor", "ticket_last_seq",
+            "server_last_seq_before", "server_last_seq_after", "request_auth_ok", "response_auth_ok",
             "nonce_match", "nonce_consumed", "race_winner_count", "state_unchanged",
             "success", "reason",
         }
@@ -524,8 +524,8 @@ class ManifestTests(unittest.TestCase):
             with open(csv_path, "w", newline="") as f:
                 writer = csv_mod.DictWriter(f, fieldnames=[
                     "scenario", "checkpoint_interval", "payload_size", "repeat_id",
-                    "ticket_seq", "client_seq", "server_seq", "floor_seq", "response_seq",
-                    "gap", "response_advance", "request_auth_ok", "response_auth_ok",
+                    "ticket_seq", "client_seq", "server_seq", "recovery_floor", "ticket_last_seq",
+                    "server_last_seq_before", "server_last_seq_after", "request_auth_ok", "response_auth_ok",
                     "nonce_match", "nonce_consumed", "race_winner_count", "state_unchanged",
                     "success", "reason", "recovery_latency_ms",
                 ])
@@ -534,8 +534,8 @@ class ManifestTests(unittest.TestCase):
                     "scenario": "control", "checkpoint_interval": "100",
                     "payload_size": "128", "repeat_id": "1",
                     "ticket_seq": "100", "client_seq": "100", "server_seq": "100",
-                    "floor_seq": "100", "response_seq": "100",
-                    "gap": "0", "response_advance": "0",
+                    "recovery_floor": "100", "ticket_last_seq": "100",
+                    "server_last_seq_before": "100", "server_last_seq_after": "100",
                     "request_auth_ok": "True", "response_auth_ok": "True",
                     "nonce_match": "True", "nonce_consumed": "True",
                     "race_winner_count": "0", "state_unchanged": "False",

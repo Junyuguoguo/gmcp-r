@@ -28,11 +28,11 @@ Source: `results/real_baseline_comparison/summary_real_baseline_comparison_v2.cs
 
 | Protocol | Normal Throughput | Normal RTT | Attack Detection | False Accept |
 |---|---:|---:|---:|---:|
-| GMCP-R | 9,967 msg/s | 0.098 ms | 100% | 0% |
-| Hash Chain | 11,977 msg/s | 0.092 ms | 100% | 0% |
-| Seq+MAC | 12,697 msg/s | 0.102 ms | 100% | 25% |
-| Authenticated Hash Chain | 9,328 msg/s | 0.104 ms | 100% | 0% |
-| Ticket Only | 12,104 msg/s | 0.102 ms | 83.3% | 16.7% |
+| GMCP-R | 10,341 msg/s | 0.091 ms | 100.0% | 0.0% |
+| Hash Chain | 12,642 msg/s | 0.082 ms | 100.0% | 0.0% |
+| Seq+MAC | 12,760 msg/s | 0.082 ms | 100.0% | 0.0% |
+| Authenticated Hash Chain | 9,655 msg/s | 0.098 ms | 100.0% | 0.0% |
+| Ticket Only | 13,177 msg/s | 0.083 ms | 83.3% | 16.7% |
 
 GMCP-R and Hash Chain have the same tested attack-detection rate. GMCP-R's
 incremental contribution is verifiable recovery through MemoryTicket and

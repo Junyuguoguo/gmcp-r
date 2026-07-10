@@ -23,11 +23,11 @@ Source: `results/real_baseline_comparison/summary_real_baseline_comparison_v2.cs
 
 | Protocol | Normal Throughput | Normal RTT | Attack Detection | False Accept | False Reject |
 |---|---:|---:|---:|---:|---:|
-| GMCP-R | 9,967 msg/s | 0.093 ms | 100% | 0% | 0% |
-| Hash Chain | 11,977 msg/s | 0.084 ms | 100% | 0% | 0% |
-| Seq+MAC | 12,697 msg/s | 0.080 ms | 75% | 25% | 0% |
-| Authenticated Hash Chain | 9,328 msg/s | 0.104 ms | 100% | 0% | 0% |
-| Ticket Only | 12,104 msg/s | 0.102 ms | 83.3% | 16.7% | 0% |
+| GMCP-R | 10,341 msg/s | 0.091 ms | 100.0% | 0.0% | 0% |
+| Hash Chain | 12,642 msg/s | 0.082 ms | 100.0% | 0.0% | 0% |
+| Seq+MAC | 12,760 msg/s | 0.082 ms | 100.0% | 0.0% | 0% |
+| Authenticated Hash Chain | 9,655 msg/s | 0.098 ms | 100.0% | 0.0% | 0% |
+| Ticket Only | 13,177 msg/s | 0.083 ms | 83.3% | 16.7% | 0% |
 
 Interpretation: GMCP-R should not be described as detecting more tested attacks
 than Hash Chain. Both reach 100% in this matrix. The distinction is recovery:
@@ -62,10 +62,10 @@ Source: `paper_data/03_performance.csv`
 
 | Protocol | Mean Throughput | Mean E2E Latency |
 |---|---:|---:|
-| GMCP-R | 65,931 msg/s | 14.96 us |
-| Hash Chain | 260,437 msg/s | 3.45 us |
-| Seq+MAC | 213,051 msg/s | 4.26 us |
-| Ticket Only | 364,572 msg/s | 2.29 us |
+| GMCP-R | 10,341 msg/s | 0.091 ms | 100.0% | 0.0% | 0% |
+| Hash Chain | 12,642 msg/s | 0.082 ms | 100.0% | 0.0% | 0% |
+| Seq+MAC | 12,760 msg/s | 0.082 ms | 100.0% | 0.0% | 0% |
+| Ticket Only | 13,177 msg/s | 0.083 ms | 83.3% | 16.7% | 0% |
 
 Interpretation: GMCP-R is slower than the lightweight baselines, but still
 offers about 6.6e4 msg/s in the local computation benchmark. The paper should
@@ -90,9 +90,9 @@ Source: `results/weak_network_simulation/summary_weak_network_simulation.csv`
 
 | Protocol | Mean Success | Success Std | Mean Throughput | Mean RTT | n |
 |---|---:|---:|---:|---:|---:|
-| GMCP-R | 100.00% | 0.00% | 72.81 msg/s | 79.90 ms | 50 |
-| Hash Chain | 0.18% | 0.24% | 0.00 msg/s | 23.77 ms | 50 |
-| Seq+MAC | 0.00% | 0.00% | 0.00 msg/s | 0.00 ms | 50 |
+| GMCP-R | 10,341 msg/s | 0.091 ms | 100.0% | 0.0% | 0% |
+| Hash Chain | 12,642 msg/s | 0.082 ms | 100.0% | 0.0% | 0% |
+| Seq+MAC | 12,760 msg/s | 0.082 ms | 100.0% | 0.0% | 0% |
 
 This is code-level simulation: 3 protocols x 5 loss rates x 5 delay settings x
 2 repeats = 150 rows. Do not present this as a real weak-network result.

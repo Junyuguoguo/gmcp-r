@@ -37,7 +37,7 @@ from gmcp.config import (
     TICKET_AUTH_KEY,
     CHECKPOINT_AUTH_KEY,
 )
-from gmcp.crypto_utils import hash_text, hmac_sha256_hex
+from gmcp.crypto_utils import hash_text, hmac_sha256_hex, with_hmac
 from gmcp.memory import initial_memory, update_memory
 from gmcp.packet import build_data_packet, packet_without_auth
 from gmcp.recovery_protocol import (
@@ -93,6 +93,22 @@ def _close_tcp(sock, file_obj):
             sock.close()
     except Exception:
         pass
+
+
+def _send_hello(sock, file_obj, session_id, sender_id, epoch):
+    """Send HELLO handshake and wait for HELLO_ACK."""
+    hello = with_hmac(DATA_AUTH_KEY, {
+        "type": "HELLO",
+        "protocol": "gmcp",
+        "session_id": session_id,
+        "sender_id": sender_id,
+        "epoch": epoch,
+        "client_nonce": str(int(time.time() * 1000000)),
+        "timestamp": time.time(),
+    })
+    _send_json(sock, hello)
+    line = file_obj.readline()
+    return json.loads(line) if line else {"ok": False, "reason": "no response"}
 
 
 def _send_json(sock, packet):
@@ -571,6 +587,7 @@ def run_nonce_race(host, port, session_id, checkpoint_interval, payload_size):
 
     # Phase 1: advance to seq=100 using a dedicated connection
     sock_setup, fobj_setup = _open_tcp(host, port)
+    _send_hello(sock_setup, fobj_setup, session_id, CLIENT_ID, EPOCH)
     saved_ticket = None
     for seq in range(1, 101):
         payload = f"race-{seq:04d}-{prefix}"
@@ -615,6 +632,7 @@ def run_nonce_race(host, port, session_id, checkpoint_interval, payload_size):
         barrier.wait()
         try:
             s, f = _open_tcp(host, port)
+            _send_hello(s, f, sid, CLIENT_ID, EPOCH)
             ok, resp, lat, auth, reason, req_nonce = _send_recovery(
                 s, f, sid,
                 client_last_seq=100,
@@ -715,6 +733,7 @@ def run_window_scenario(
         return run_nonce_race(host, port, sid, checkpoint_interval, payload_size)
 
     sock, file_obj = _open_tcp(host, port)
+    _send_hello(sock, file_obj, sid, CLIENT_ID, EPOCH)
     try:
         runners = {
             "control": run_control,
