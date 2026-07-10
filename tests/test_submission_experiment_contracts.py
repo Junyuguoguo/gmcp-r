@@ -296,12 +296,12 @@ class RecoveryWindowCSVContractTests(unittest.TestCase):
         with csv_path.open(newline="", encoding="utf-8") as f:
             rows = list(csv_mod.DictReader(f))
 
-        self.assertEqual(len(rows), 540, f"Expected 540 rows, got {len(rows)}")
+        self.assertEqual(len(rows), 760, f"Expected 760 rows, got {len(rows)}")
 
         non_race = [r for r in rows if r["scenario"] != "nonce_race"]
         race = [r for r in rows if r["scenario"] == "nonce_race"]
-        self.assertEqual(len(non_race), 480)
-        self.assertEqual(len(race), 60)
+        self.assertEqual(len(non_race), 720)
+        self.assertEqual(len(race), 40)
 
     def test_scenario_invariants_from_csv(self):
         csv_path = Path("results/submission_revision/recovery_window_experiment.csv")

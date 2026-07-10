@@ -75,6 +75,12 @@ class RecoveryMeasurement:
     reconstructed_mem: str
     reconstructed_hash: str
     target_state_match: bool
+    checkpoint_auth_ok: bool = True
+    record_auth_ok: bool = True
+    chain_continuity_ok: bool = True
+    payload_hash_ok: bool = True
+    recovery_valid: bool = True
+    failure_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +222,28 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
 
     # 1. Read checkpoint (material bytes = serialized checkpoint)
     checkpoint_bytes = len(canonical_json(prepared.checkpoint_record).encode("utf-8"))
-    ok, reason = verify_hmac(CHECKPOINT_AUTH_KEY, prepared.checkpoint_record, prepared.checkpoint_record["signature"]), "ok"
-    # Use verify_checkpoint_fields equivalent
     sig_data = dict(prepared.checkpoint_record)
     sig = sig_data.pop("signature", "")
     ck_ok = verify_hmac(CHECKPOINT_AUTH_KEY, sig_data, sig)
+
+    # If checkpoint auth fails, return failure measurement immediately
+    if not ck_ok:
+        t1 = time.perf_counter_ns()
+        return RecoveryMeasurement(
+            protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
+            repeat_id=prepared.repeat_id, replay_count=0,
+            recovery_material_bytes=checkpoint_bytes,
+            logical_bytes_read=checkpoint_bytes,
+            auth_records_verified=1,
+            recovery_time_ns=t1 - t0,
+            target_seq=target_seq,
+            reconstructed_mem="", reconstructed_hash="",
+            target_state_match=False,
+            checkpoint_auth_ok=False, record_auth_ok=True,
+            chain_continuity_ok=True, payload_hash_ok=True,
+            recovery_valid=False,
+            failure_reason="checkpoint_auth_failed",
+        )
 
     # 2. Replay from history.jsonl: records at checkpoint_seq+1 .. target_seq
     reconstructed_mem = prepared.checkpoint_record["memory"]
@@ -246,6 +269,69 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
             # Re-verify
             tag_ok = verify_hmac(DATA_AUTH_KEY, unsigned, received_tag)
             record["auth_tag"] = received_tag
+
+            # Check auth_tag validity
+            if not tag_ok:
+                t1 = time.perf_counter_ns()
+                line_bytes = len(line.encode("utf-8"))
+                return RecoveryMeasurement(
+                    protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
+                    repeat_id=prepared.repeat_id, replay_count=replay_count,
+                    recovery_material_bytes=material_bytes + line_bytes,
+                    logical_bytes_read=logical_bytes + line_bytes,
+                    auth_records_verified=auth_records + 1,
+                    recovery_time_ns=t1 - t0,
+                    target_seq=target_seq,
+                    reconstructed_mem=reconstructed_mem, reconstructed_hash="",
+                    target_state_match=False,
+                    checkpoint_auth_ok=True, record_auth_ok=False,
+                    chain_continuity_ok=True, payload_hash_ok=True,
+                    recovery_valid=False,
+                    failure_reason=f"record_auth_failed_seq_{seq}",
+                )
+
+            # Verify prev_mem chain continuity
+            chain_ok = (record["prev_mem"] == prev_mem)
+            if not chain_ok:
+                t1 = time.perf_counter_ns()
+                line_bytes = len(line.encode("utf-8"))
+                return RecoveryMeasurement(
+                    protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
+                    repeat_id=prepared.repeat_id, replay_count=replay_count,
+                    recovery_material_bytes=material_bytes + line_bytes,
+                    logical_bytes_read=logical_bytes + line_bytes,
+                    auth_records_verified=auth_records + 1,
+                    recovery_time_ns=t1 - t0,
+                    target_seq=target_seq,
+                    reconstructed_mem=reconstructed_mem, reconstructed_hash="",
+                    target_state_match=False,
+                    checkpoint_auth_ok=True, record_auth_ok=True,
+                    chain_continuity_ok=False, payload_hash_ok=True,
+                    recovery_valid=False,
+                    failure_reason=f"chain_continuity_failed_seq_{seq}",
+                )
+
+            # Verify payload_hash
+            computed_hash = hash_text(record["payload"])
+            ph_ok = (computed_hash == record["payload_hash"])
+            if not ph_ok:
+                t1 = time.perf_counter_ns()
+                line_bytes = len(line.encode("utf-8"))
+                return RecoveryMeasurement(
+                    protocol="gmcp_r", n=prepared.n, k=prepared.k, offset=offset,
+                    repeat_id=prepared.repeat_id, replay_count=replay_count,
+                    recovery_material_bytes=material_bytes + line_bytes,
+                    logical_bytes_read=logical_bytes + line_bytes,
+                    auth_records_verified=auth_records + 1,
+                    recovery_time_ns=t1 - t0,
+                    target_seq=target_seq,
+                    reconstructed_mem=reconstructed_mem, reconstructed_hash="",
+                    target_state_match=False,
+                    checkpoint_auth_ok=True, record_auth_ok=True,
+                    chain_continuity_ok=True, payload_hash_ok=False,
+                    recovery_valid=False,
+                    failure_reason=f"payload_hash_failed_seq_{seq}",
+                )
 
             # Reconstruct memory via update_memory() (not reading stored mem)
             reconstructed_mem = update_memory(
@@ -279,6 +365,9 @@ def measure_gmcp_recovery(prepared: PreparedHistory, offset: int) -> RecoveryMea
         reconstructed_mem=reconstructed_mem,
         reconstructed_hash="",  # not applicable for GMCP
         target_state_match=(reconstructed_mem == target_mem),
+        checkpoint_auth_ok=True, record_auth_ok=True,
+        chain_continuity_ok=True, payload_hash_ok=True,
+        recovery_valid=True, failure_reason="",
     )
 
 
@@ -326,6 +415,26 @@ def measure_authenticated_chain_recovery(prepared: PreparedHistory, offset: int)
                 last_hash=current_hash,
             )
 
+            if not ok:
+                t1 = time.perf_counter_ns()
+                line_bytes = len(line.encode("utf-8"))
+                return RecoveryMeasurement(
+                    protocol="authenticated_hash_chain",
+                    n=prepared.n, k=prepared.k, offset=offset,
+                    repeat_id=prepared.repeat_id, replay_count=replay_count,
+                    recovery_material_bytes=material_bytes + line_bytes,
+                    logical_bytes_read=logical_bytes + line_bytes,
+                    auth_records_verified=auth_records + 1,
+                    recovery_time_ns=t1 - t0,
+                    target_seq=target_seq,
+                    reconstructed_mem="", reconstructed_hash=reconstructed_hash,
+                    target_state_match=False,
+                    checkpoint_auth_ok=True, record_auth_ok=False,
+                    chain_continuity_ok=False, payload_hash_ok=True,
+                    recovery_valid=False,
+                    failure_reason=f"chain_verify_failed_seq_{seq}_{reason}",
+                )
+
             current_hash = packet["chain_hash"]
             reconstructed_hash = current_hash
             replay_count += 1
@@ -351,6 +460,9 @@ def measure_authenticated_chain_recovery(prepared: PreparedHistory, offset: int)
         reconstructed_mem="",  # not applicable for chain
         reconstructed_hash=reconstructed_hash,
         target_state_match=(reconstructed_hash == prepared.target_hash_by_seq.get(target_seq, "")),
+        checkpoint_auth_ok=True, record_auth_ok=True,
+        chain_continuity_ok=True, payload_hash_ok=True,
+        recovery_valid=True, failure_reason="",
     )
 
 
@@ -365,6 +477,8 @@ CSV_COLUMNS = [
     "recovery_time_us", "recovery_time_ms",
     "target_seq", "reconstructed_mem", "reconstructed_hash",
     "target_state_match",
+    "checkpoint_auth_ok", "record_auth_ok", "chain_continuity_ok",
+    "payload_hash_ok", "recovery_valid", "failure_reason",
 ]
 
 
@@ -386,6 +500,12 @@ def measurement_to_row(m: RecoveryMeasurement) -> Dict[str, Any]:
         "reconstructed_mem": m.reconstructed_mem,
         "reconstructed_hash": m.reconstructed_hash,
         "target_state_match": m.target_state_match,
+        "checkpoint_auth_ok": m.checkpoint_auth_ok,
+        "record_auth_ok": m.record_auth_ok,
+        "chain_continuity_ok": m.chain_continuity_ok,
+        "payload_hash_ok": m.payload_hash_ok,
+        "recovery_valid": m.recovery_valid,
+        "failure_reason": m.failure_reason,
     }
 
 

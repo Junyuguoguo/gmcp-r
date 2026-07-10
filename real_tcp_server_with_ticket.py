@@ -8,7 +8,7 @@ import json
 import socket
 import threading
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from gmcp.config import (
     SERVER_BIND_HOST,
@@ -69,15 +69,32 @@ def enable_tcp_nodelay(conn) -> None:
         pass
 
 
-def _reject(session_id: str, recovery_nonce: str, reason: str, recv_time: float) -> Dict[str, Any]:
+def _reject(session_id: str, recovery_nonce: str, reason: str, recv_time: float,
+            extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build an authenticated failure recovery response."""
-    return build_recovery_response(
+    response = build_recovery_response(
         ok=False,
         reason=reason,
         session_id=session_id,
         epoch=EPOCH,
         recovery_nonce=recovery_nonce,
     )
+    if extra:
+        response.update(extra)
+        # Re-sign with the extra fields included
+        response["recovery_auth_tag"] = _sign_response(response)
+    return response
+
+def _sign_response(response: Dict[str, Any]) -> str:
+    """Re-sign a recovery response after adding extra fields."""
+    from gmcp.crypto_utils import canonical_json
+    import hmac as _hmac
+    import hashlib as _hashlib
+    data = dict(response)
+    data.pop("recovery_auth_tag", None)
+    return _hmac.new(
+        DATA_AUTH_KEY, canonical_json(data).encode("utf-8"), _hashlib.sha256
+    ).hexdigest()
 
 
 def handle_recovery_request(packet, registry: SessionRegistry):
@@ -87,11 +104,10 @@ def handle_recovery_request(packet, registry: SessionRegistry):
 
     ok_req, reason_req = verify_recovery_request(packet)
     if not ok_req:
-        return build_recovery_response(
-            ok=False, reason="invalid recovery request auth_tag",
-            session_id=session_id, epoch=EPOCH,
-            recovery_nonce=recovery_nonce,
-        )
+        return _reject(session_id, recovery_nonce, "invalid recovery request auth_tag",
+                        recv_time, extra={
+                            "server_last_seq": 0, "recovery_floor": 0, "ticket_last_seq": 0,
+                        })
 
     client_ckpt_interval = int(packet.get("checkpoint_interval", CHECKPOINT_INTERVAL))
     # Validate range — fall back to default if out of bounds
@@ -111,7 +127,9 @@ def handle_recovery_request(packet, registry: SessionRegistry):
         if not isinstance(client_ticket, dict):
             # 缺少票据，拒绝请求
             print(f"[SERVER] 恢复请求缺少MemoryTicket", flush=True)
-            return _reject(session_id, recovery_nonce, "missing memory_ticket", recv_time)
+            return _reject(session_id, recovery_nonce, "missing memory_ticket", recv_time,
+                            extra={"server_last_seq": state.last_seq, "recovery_floor": 0,
+                                   "ticket_last_seq": 0})
         
         from gmcp.ticket import validate_memory_ticket, consume_ticket_nonce
         # 获取最近的Checkpoint，使用其seq作为recovery_floor
@@ -121,6 +139,8 @@ def handle_recovery_request(packet, registry: SessionRegistry):
         else:
             # 如果没有Checkpoint，使用0（允许任何票据）
             recovery_floor = 0
+
+        ticket_last_seq = int(client_ticket.get("last_seq", 0))
         
         # 第一步：验证票据（不消费nonce）
         ticket_valid, ticket_reason = validate_memory_ticket(
@@ -133,7 +153,9 @@ def handle_recovery_request(packet, registry: SessionRegistry):
         
         if not ticket_valid:
             print(f"[SERVER] MemoryTicket验证失败: {ticket_reason}", flush=True)
-            return _reject(session_id, recovery_nonce, f"memory_ticket invalid: {ticket_reason}", recv_time)
+            return _reject(session_id, recovery_nonce, f"memory_ticket invalid: {ticket_reason}", recv_time,
+                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
+                                   "ticket_last_seq": ticket_last_seq})
         
         print(f"[SERVER] MemoryTicket验证成功", flush=True)
         
@@ -146,43 +168,58 @@ def handle_recovery_request(packet, registry: SessionRegistry):
         if not stored_checkpoint:
             # 找不到Checkpoint，拒绝恢复
             print(f"[SERVER] 未找到Checkpoint seq={ticket_checkpoint_seq}，拒绝恢复", flush=True)
-            return _reject(session_id, recovery_nonce, "checkpoint not found", recv_time)
+            return _reject(session_id, recovery_nonce, "checkpoint not found", recv_time,
+                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
+                                   "ticket_last_seq": ticket_last_seq})
         
         # 验证Checkpoint认证标签
         checkpoint_ok, checkpoint_reason = checkpoint_mgr.verify_checkpoint(stored_checkpoint)
         if not checkpoint_ok:
             print(f"[SERVER] Checkpoint认证标签验证失败: {checkpoint_reason}", flush=True)
-            return _reject(session_id, recovery_nonce, f"checkpoint authentication failed: {checkpoint_reason}", recv_time)
+            return _reject(session_id, recovery_nonce, f"checkpoint authentication failed: {checkpoint_reason}", recv_time,
+                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
+                                   "ticket_last_seq": ticket_last_seq})
         
         # 比较Checkpoint的session_id、epoch、seq和memory
         if stored_checkpoint.session_id != session_id:
             print(f"[SERVER] Checkpoint session_id不匹配", flush=True)
-            return _reject(session_id, recovery_nonce, "checkpoint session_id mismatch", recv_time)
+            return _reject(session_id, recovery_nonce, "checkpoint session_id mismatch", recv_time,
+                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
+                                   "ticket_last_seq": ticket_last_seq})
         
         if stored_checkpoint.epoch != EPOCH:
             print(f"[SERVER] Checkpoint epoch不匹配", flush=True)
-            return _reject(session_id, recovery_nonce, "checkpoint epoch mismatch", recv_time)
+            return _reject(session_id, recovery_nonce, "checkpoint epoch mismatch", recv_time,
+                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
+                                   "ticket_last_seq": ticket_last_seq})
         
         if stored_checkpoint.seq != ticket_checkpoint_seq:
             print(f"[SERVER] Checkpoint seq不匹配: stored={stored_checkpoint.seq}, ticket={ticket_checkpoint_seq}", flush=True)
-            return _reject(session_id, recovery_nonce, "checkpoint seq mismatch", recv_time)
+            return _reject(session_id, recovery_nonce, "checkpoint seq mismatch", recv_time,
+                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
+                                   "ticket_last_seq": ticket_last_seq})
         
         if stored_checkpoint.memory != ticket_checkpoint_mem:
             print(f"[SERVER] Checkpoint memory不匹配: stored={stored_checkpoint.memory[:16]}..., ticket={ticket_checkpoint_mem[:16]}...", flush=True)
-            return _reject(session_id, recovery_nonce, "checkpoint memory mismatch", recv_time)
+            return _reject(session_id, recovery_nonce, "checkpoint memory mismatch", recv_time,
+                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
+                                   "ticket_last_seq": ticket_last_seq})
         
         # 验证ticket.checkpoint_seq <= ticket.last_seq <= server.last_seq
-        ticket_last_seq = int(client_ticket.get("last_seq", 0))
         if ticket_checkpoint_seq > ticket_last_seq or ticket_last_seq > state.last_seq:
             print(f"[SERVER] Checkpoint序列不一致: ckpt_seq={ticket_checkpoint_seq}, ticket_last={ticket_last_seq}, server_last={state.last_seq}", flush=True)
-            return _reject(session_id, recovery_nonce, "checkpoint sequence inconsistency", recv_time)
+            return _reject(session_id, recovery_nonce, "checkpoint sequence inconsistency", recv_time,
+                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
+                                   "ticket_last_seq": ticket_last_seq})
         
         print(f"[SERVER] Checkpoint验证成功: seq={ticket_checkpoint_seq}", flush=True)
         
         # 所有检查通过，现在消费nonce
         if not consume_ticket_nonce(client_ticket):
             print(f"[SERVER] nonce消费失败（可能已被使用）", flush=True)
-            return _reject(session_id, recovery_nonce, "ticket replay detected during nonce consumption", recv_time)
+            return _reject(session_id, recovery_nonce, "ticket replay detected during nonce consumption", recv_time,
+                            extra={"server_last_seq": state.last_seq, "recovery_floor": recovery_floor,
+                                   "ticket_last_seq": ticket_last_seq})
         print(f"[SERVER] nonce已消费", flush=True)
         
         # 获取最近的Checkpoint
@@ -217,10 +254,12 @@ def handle_recovery_request(packet, registry: SessionRegistry):
                 "server_last_seq": state.last_seq,
                 "server_last_mem": state.last_mem,
                 "checkpoint_seq": checkpoint_seq,
+                "recovery_floor": checkpoint_seq,
                 "checkpoint_mem": checkpoint_mem,
                 "memory_ticket": memory_ticket,
                 "ticket_verified": ticket_valid,
                 "ticket_reason": ticket_reason,
+                "ticket_last_seq": ticket_last_seq,
             },
         )
 
