@@ -941,9 +941,10 @@ def main():
     command_line = get_command_line()
     client_hostname = socket.gethostname()
     client_cpu = get_cpu_model()
-    # Force git_dirty=false in formal mode
-    if args.formal:
-        git_dirty = False
+    # Formal mode requires clean worktree
+    if args.formal and git_dirty:
+        print("[ERROR] Formal mode requires a clean client worktree. Commit or stash changes first.")
+        sys.exit(1)
     server_env_from_ack: Dict[str, str] = {}  # populated from first HELLO_ACK in remote mode
 
     print(f"[INFO] Total experiments: {total}")
@@ -1040,7 +1041,7 @@ def main():
                         no_internal_exception = result["error_count"] == 0
                         no_response_mismatch = result["rejected_count"] == 0
                         have_last_server_response = result["accepted_count"] > 0
-                        server_last_seq = result.get("client_final_seq", 0) if have_last_server_response else None
+                        server_last_seq = result.get("server_final_seq", 0) if have_last_server_response else None
                         client_state_available = result.get("client_final_seq", 0) > 0
                         no_malformed_response = no_response_mismatch
                         final_state_auditable = (
@@ -1059,7 +1060,8 @@ def main():
                         result["state_audit_available"] = final_state_auditable
                         result["result_success"] = not is_timeout and result["error_count"] == 0 and result["rejected_count"] == 0
                         if is_timeout:
-                            exec_valid = True
+                            result["result_success"] = False
+                            result["state_audit_available"] = False
                             result["result_success"] = False
                             result["state_audit_available"] = False
                         result["execution_valid"] = exec_valid

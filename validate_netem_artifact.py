@@ -52,12 +52,12 @@ REQUIRED_COLUMNS = [
 
 # Condition name → (requested_delay_ms, requested_loss_pct)
 CONDITION_PARAMS = {
-    "control":   (0, 0),
-    "mild":      (30, 1),
-    "mobile":    (60, 2),
-    "poor":      (100, 5),
-    "severe":    (200, 10),
-    "loss_heavy": (50, 20),
+    "control":   (0, 0, 0, 0),
+    "mild":      (30, 1, 10, 0),
+    "mobile":    (60, 2, 30, 5),
+    "poor":      (100, 5, 50, 5),
+    "severe":    (200, 10, 80, 10),
+    "loss_heavy": (50, 20, 20, 5),
 }
 
 
@@ -160,7 +160,7 @@ def main():
 
     if sane_issues:
         for issue in sane_issues[:10]:
-            print(f"WARN: {issue}")
+            print(f"TC FAIL: {issue}")
         if len(sane_issues) > 10:
             print(f"  ... and {len(sane_issues) - 10} more warnings")
     else:
@@ -187,7 +187,7 @@ def main():
             exec_issues.append(f"Row {row_num}: server_git_commit length={len(git_c)} (expected 40)")
 
         # server_git_dirty must be false (if column exists)
-        if "server_git_dirty" in r and git_dirty not in ("false", "False", ""):
+        if "server_git_dirty" in r and str(git_dirty).lower() != "false":
             exec_issues.append(f"Row {row_num}: server_git_dirty={git_dirty} (expected false)")
 
         # client_git_commit must be non-empty
@@ -199,15 +199,15 @@ def main():
             exec_issues.append(f"Row {row_num}: client_git_commit length={len(client_gc)} (expected 40)")
 
         # client_git_dirty must be false
-        if "client_git_dirty" in r and client_dirty not in ("false", "False", ""):
+        if "client_git_dirty" in r and str(client_dirty).lower() != "false":
             exec_issues.append(f"Row {row_num}: client_git_dirty={client_dirty} (expected false)")
 
         # state_match should exist
         if state_m == "":
             exec_issues.append(f"Row {row_num}: state_match is empty")
 
-        # Non-control conditions must have execution_valid=True
-        if cond != "control" and exec_v not in ("True", "true", True):
+        # All conditions must have execution_valid=True
+        if str(exec_v).lower() != "true":
             exec_issues.append(f"Row {row_num}: condition={cond} but execution_valid={exec_v}")
 
         # Control conditions must not have netem in actual_qdisc_config
@@ -229,32 +229,30 @@ def main():
             tc_issues.append(f"Row {row_num}: unknown condition '{cond}'")
             continue
 
-        req_delay, req_loss = CONDITION_PARAMS[cond]
+        req_delay, req_loss, req_jitter, req_reorder = CONDITION_PARAMS[cond]
 
         try:
             actual_delay = float(r.get("actual_delay_ms", 0))
             actual_loss = float(r.get("actual_loss_pct", 0))
+            actual_jitter = float(r.get("actual_jitter_ms", 0))
+            actual_reorder = float(r.get("actual_reorder_pct", 0))
         except (ValueError, TypeError):
             tc_issues.append(f"Row {row_num}: cannot parse actual tc parameters")
             continue
 
-        # Verify delay >= requested * 0.8
-        if req_delay > 0 and actual_delay < req_delay * 0.8:
-            tc_issues.append(
-                f"Row {row_num}: actual_delay={actual_delay:.1f}ms "
-                f"< requested={req_delay}ms * 0.8 = {req_delay * 0.8:.1f}ms"
-            )
-
-        # Verify loss >= requested * 0.8
-        if req_loss > 0 and actual_loss < req_loss * 0.8:
-            tc_issues.append(
-                f"Row {row_num}: actual_loss={actual_loss:.1f}% "
-                f"< requested={req_loss}% * 0.8 = {req_loss * 0.8:.1f}%"
-            )
+        tol = 0.25
+        if req_delay > 0 and abs(actual_delay - req_delay) > req_delay * tol:
+            tc_issues.append(f"Row {row_num}: actual_delay={actual_delay:.1f}ms vs requested={req_delay}ms")
+        if req_loss > 0 and abs(actual_loss - req_loss) > req_loss * tol:
+            tc_issues.append(f"Row {row_num}: actual_loss={actual_loss:.1f}% vs requested={req_loss}%")
+        if req_jitter > 0 and abs(actual_jitter - req_jitter) > req_jitter * tol:
+            tc_issues.append(f"Row {row_num}: actual_jitter={actual_jitter:.1f}ms vs requested={req_jitter}ms")
+        if req_reorder > 0 and abs(actual_reorder - req_reorder) > req_reorder * tol:
+            tc_issues.append(f"Row {row_num}: actual_reorder={actual_reorder:.1f}% vs requested={req_reorder}%")
 
     if tc_issues:
         for issue in tc_issues[:10]:
-            print(f"WARN: {issue}")
+            print(f"TC FAIL: {issue}")
         if len(tc_issues) > 10:
             print(f"  ... and {len(tc_issues) - 10} more warnings")
     else:

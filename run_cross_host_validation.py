@@ -930,6 +930,13 @@ def main():
                     print(f"[VALIDATE] FAIL row {i+1}: formal data cannot use loopback")
                     os.remove(tmp_csv)
                     sys.exit(1)
+                # Commit consistency
+                client_commit = r.get('git_commit', '')
+                server_commit = r.get('server_git_commit', '')
+                if not args.allow_mixed_commits and client_commit != server_commit:
+                    print(f"[VALIDATE] FAIL row {i+1}: client commit {client_commit[:8]} != server commit {server_commit[:8]}")
+                    os.remove(tmp_csv)
+                    sys.exit(1)
             client_dirty = any(
                 r.get("git_dirty") not in ("false", "False", False)
                 for r in rows
