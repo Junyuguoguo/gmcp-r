@@ -363,14 +363,23 @@ def handle_client(conn, addr, registry: SessionRegistry):
                 bound_epoch = hello_epoch
                 hello_done = True
 
-                send_json_line(conn, {
+                # Build HELLO_ACK response
+                hello_ack = {
                     "ok": True,
                     "type": "HELLO_ACK",
                     "reason": "ok",
                     "protocol": bound_protocol,
                     "session_id": bound_session_id,
                     "server_time": recv_time,
-                })
+                }
+
+                # For ticket_only protocol, include a ticket signature
+                if bound_protocol == "ticket_only":
+                    from gmcp.baselines.ticket_only import issue_ticket
+                    ticket = issue_ticket(bound_session_id, bound_epoch)
+                    hello_ack["ticket"] = ticket
+
+                send_json_line(conn, hello_ack)
                 continue
 
             # RECOVERY_REQUEST
