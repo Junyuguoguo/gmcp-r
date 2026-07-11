@@ -99,7 +99,7 @@ TCP等可靠传输协议通过序列号和重传机制保证消息的可靠投�
 
 我们考虑两种攻击者模型，覆盖8种攻击条件：
 
-**模型A：外部网络攻击者**。攻击者位于通信信道上，不知道共享密钥，能够拦截、篡改和重放消息，但无法构造有效MAC。该模型覆盖6种攻击条件：`modify_unsigned`（篡改未签名字段）、`metadata_tamper`（元数据篡改）、`exact_replay`（精确重放）、`cross_epoch_valid_mac`（跨epoch重放）、`cross_session_valid_mac`（跨会话重放）、`sequence_gap_valid_mac`（序列号间隙）。
+**模型A：外部网络攻击者**。攻击者位于通信信道上，不知道共享密钥，能够拦截、篡改和重放消息，但无法构造有效MAC。该模型覆盖3种攻击条件：`modify_unsigned`（篡改未签名字段）、`metadata_tamper`（元数据篡改）、`exact_replay`（精确重放）。
 
 **模型B：恶意持钥客户端**。攻击者是合法会话参与者，持有DATA密钥，能够构造有效MAC，但无法伪造历史记忆状态。该模型覆盖2种攻击条件：`forged_prev_mem_valid_mac`（伪造prev_mem+有效MAC）、`cross_epoch_valid_mac`（跨epoch重放+有效MAC）。
 
@@ -303,7 +303,7 @@ MemoryTicket的安全性质：
 | 消息数量 | 100, 500, 1000 |
 | 负载大小 | 128, 512 bytes |
 | 攻击条件 | 8种：none（无攻击基线）、cross_epoch_valid_mac（跨epoch重放+有效MAC）、cross_session_valid_mac（跨会话重放+有效MAC）、exact_replay（精确重放）、forged_prev_mem_valid_mac（伪造prev_mem+有效MAC）、metadata_tamper（元数据篡改）、modify_unsigned（篡改未签名字段）、sequence_gap_valid_mac（序列号间隙+有效MAC） |
-| 攻击者模型 | **网络攻击者**：可拦截、篡改、重放消息（覆盖6种网络层攻击）；**记忆连续性攻击者**：可伪造历史记忆状态（覆盖forged_prev_mem） |
+| 攻击者模型 | **外部网络攻击者**（不知道密钥）：覆盖modify_unsigned、metadata_tamper、exact_replay共3种；**恶意持钥客户端**（持有DATA key）：覆盖forged_prev_mem_valid_mac、sequence_gap_valid_mac、cross_session_valid_mac、cross_epoch_valid_mac共4种 |
 | 重复次数 | 基线30次/配置、票据30次/配置、恢复30次/配置、性能30次/配置、并发30次/并发等级、弱网2次/配置、Checkpoint恢复10次/配置、Checkpoint成本30次/(n,k,offset,protocol) |
 | 并发客户端数 | 1, 2, 5, 10, 20 |
 
@@ -315,7 +315,7 @@ MemoryTicket的安全性质：
 
 ### 7.1 基线协议对比实验
 
-为评估GMCP-R在安全性与性能之间的权衡，我们在相同的Python TCP loopback环境与统一消息配置下，对五种协议进行了对比实验。实验注入7类攻击（跨epoch重放、跨会话重放、精确重放、伪造prev_mem、元数据篡改、篡改未签名字段、序列号间隙），覆盖网络攻击者与记忆连续性攻击者两类模型，评估各协议的攻击检测能力。每种协议×攻击×消息数量×负载大小组合重复30次。实验结果如表1所示。
+为评估GMCP-R在安全性与性能之间的权衡，我们在相同的Python TCP loopback环境与统一消息配置下，对五种协议（GMCP-R、Hash Chain、Authenticated Hash Chain、Seq+MAC、Ticket Only）进行了对比实验。实验注入7类攻击（跨epoch重放、跨会话重放、精确重放、伪造prev_mem、元数据篡改、篡改未签名字段、序列号间隙），覆盖网络攻击者与记忆连续性攻击者两类模型，评估各协议的攻击检测能力。每种协议×攻击×消息数量×负载大小组合重复30次。实验结果如表1所示。
 
 **表1：基线协议对比结果**
 
@@ -365,7 +365,7 @@ MemoryTicket的安全性质：
 
 ### 7.3 性能基准实验
 
-为精确量化各协议的计算开销并排除网络因素的干扰，我们在TCP loopback环境下对五种协议进行了纯计算性能基准测试。实验覆盖64B至1024B五种负载大小、500和1000两种消息数量配置，每种配置重复30次。实验结果如表3所示，吞吐量随负载大小的变化趋势如图7所示，端到端延迟分布如图8所示。
+为精确量化各协议的计算开销并排除网络因素的干扰，我们在不建立网络连接的本地计算模式下，对四种协议（GMCP-R、Hash Chain、Seq+MAC、Ticket Only）进行了微基准测试。实验覆盖64B至1024B五种负载大小、500和1000两种消息数量配置，每种配置重复30次。实验结果如表3所示，吞吐量随负载大小的变化趋势如图7所示，端到端延迟分布如图8所示。
 
 **表3：性能基准测试结果（本地回环，负载大小64B-1024B均值）**
 

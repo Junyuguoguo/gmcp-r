@@ -673,7 +673,7 @@ def build_document():
     add_heading(doc, "Abstract（摘要）", 1)
     add_p(
         doc,
-        "连接恢复并不等同于历史状态恢复。针对断续通信中恢复后历史连续性难以验证的问题，本文提出 GMCP-R（Memory-Continuity-Aware Communication Protocol with Recovery）。该协议结合 memory chain、MemoryTicket 与 Checkpoint：memory chain 将消息内容、序列号、会话上下文和前序记忆状态绑定；MemoryTicket 以服务器认证票据保存 last_seq、last_mem 与 checkpoint 信息；Checkpoint 用于限制恢复时的历史重放范围。基于 Python TCP 原型的实验表明，在测试攻击场景下，GMCP-R 达到 100% 检测率、0% 误接受率和 0% 误拒绝率，五类无效 MemoryTicket 均被拒绝；本地纯计算吞吐量均值为 65,931 msg/s，1 至 20 个并发客户端均保持 100% 成功率，吞吐量峰值为 17,927 msg/s。弱网结果仅来自 preliminary code-level simulation，用于补充观察恢复行为，不作为核心结论。结果说明，GMCP-R 可在可接受开销下为断续通信提供历史连续性验证与安全恢复支持。",
+        "连接恢复并不等同于历史状态恢复。针对断续通信中恢复后历史连续性难以验证的问题，本文提出 GMCP-R（Memory-Continuity-Aware Communication Protocol with Recovery）。该协议结合 memory chain、MemoryTicket 与 Checkpoint：memory chain 将消息内容、序列号、会话上下文和前序记忆状态绑定；MemoryTicket 以服务器认证票据保存 last_seq、last_mem 与 checkpoint 信息；Checkpoint 用于限制恢复时的历史重放范围。基于 Python TCP 原型的实验表明，在测试攻击场景下，GMCP-R 达到 100% 检测率、0% 误接受率和 0% 误拒绝率，五类无效 MemoryTicket 均被拒绝；本地纯计算吞吐量均值为 63,998 msg/s，1 至 20 个并发客户端均保持 100% 成功率，吞吐量峰值为 17,244 msg/s。弱网结果仅来自 preliminary code-level simulation，用于补充观察恢复行为，不作为核心结论。结果说明，GMCP-R 可在可接受开销下为断续通信提供历史连续性验证与安全恢复支持。",
     )
     add_rich_p(
         doc,
@@ -947,7 +947,7 @@ def build_document():
             ["基线协议", "四种基线协议：Hash Chain、Authenticated Hash Chain、Seq+MAC、Ticket Only"],
             ["消息数量", "100、500、1000；并发实验为每客户端 200 条"],
             ["载荷大小", "64、128、256、512、1024 bytes（按实验类型不同取子集）"],
-            ["攻击类型", "drop、modify、replay、prev_mem；票据实验另含 expired、replayed、tampered、rollback、wrong_session"],
+            ["攻击类型", "modify_unsigned、metadata_tamper、exact_replay（网络攻击者）；forged_prev_mem_valid_mac、sequence_gap_valid_mac、cross_session_valid_mac、cross_epoch_valid_mac（恶意持钥客户端）；票据实验另含 expired、replayed、tampered、rollback、wrong_session"],
             ["主要指标", "吞吐量、RTT、攻击检测率、误接受率、误拒绝率、恢复成功率、并发成功率"],
         ],
         [2100, 7260],
@@ -1033,14 +1033,14 @@ def build_document():
     add_heading(doc, "7.3 Performance Benchmark", 2)
     add_p(
         doc,
-        "本地纯计算性能基准测试排除了网络往返影响，主要衡量协议构造、认证和验证逻辑的开销。GMCP-R 的平均吞吐量约为 65,931 msg/s，平均端到端处理延迟约为 14.96 μs。与更轻量的 Ticket Only、Hash Chain 和 Seq+MAC 相比，GMCP-R 的开销主要来自 payload_hash、memory chain 更新、字段覆盖更完整的 HMAC 以及 Checkpoint 管理。",
+        "本地纯计算性能基准测试排除了网络往返影响，主要衡量协议构造、认证和验证逻辑的开销。GMCP-R 的平均吞吐量约为 63,998 msg/s，平均端到端处理延迟约为 14.9 μs。与更轻量的 Ticket Only、Hash Chain 和 Seq+MAC 相比，GMCP-R 的开销主要来自 payload_hash、memory chain 更新、字段覆盖更完整的 HMAC 以及 Checkpoint 管理。",
     )
     add_table(
         doc,
         "表 8. 性能基准测试结果（本地回环，64B-1024B 均值）",
         ["协议", "平均吞吐量 (msg/s)", "平均端到端延迟 (μs)"],
         [
-            ["GMCP-R", "65,931", "14.96"],
+            ["GMCP-R", "63,998", "14.9"],
             ["Hash Chain", "260,437", "3.45"],
             ["Seq+MAC", "213,051", "4.26"],
             ["Ticket Only", "364,572", "2.29"],
@@ -1069,11 +1069,11 @@ def build_document():
         "表 9. 并发客户端测试结果",
         ["并发客户端数", "成功率", "总吞吐量 (msg/s)", "平均 RTT (ms)", "RTT 95% CI (ms)"],
         [
-            ["1", "100%", "7,037", "0.125", "±0.007"],
+            ["1", "100%", "6,754", "0.134", "±0.007"],
             ["2", "100%", "14,204", "0.124", "±0.004"],
-            ["5", "100%", "17,927", "0.255", "±0.007"],
-            ["10", "100%", "16,452", "0.571", "±0.015"],
-            ["20", "100%", "15,645", "1.216", "±0.018"],
+            ["5", "100%", "17,244", "0.309", "±0.007"],
+            ["10", "100%", "16,112", "0.588", "±0.015"],
+            ["20", "100%", "14,699", "1.315", "±0.018"],
         ],
         [1700, 1350, 2450, 1850, 2010],
         source="数据来源：results/concurrent/concurrent_results.csv。",
@@ -1092,7 +1092,7 @@ def build_document():
     )
     add_p(
         doc,
-        "并发结果显示，总吞吐量从 1 个客户端的 7,037 msg/s 增至 5 个客户端时的峰值 17,927 msg/s，随后在 10 和 20 个客户端下略有下降。该趋势与 Python 原型中的线程调度、GIL 影响、socket I/O 竞争以及服务端队列等待有关。平均 RTT 从 0.125 ms 上升到 1.216 ms，也反映了并发请求增加后的排队延迟和共享资源竞争。由于各并发级别成功率均为 100%，当前瓶颈主要表现为时延和吞吐变化，而非协议状态错误。",
+        "并发结果显示，总吞吐量从 1 个客户端的 6,754 msg/s 增至 5 个客户端时的峰值 17,244 msg/s，随后在 10 和 20 个客户端下略有下降。该趋势可能与服务端实现特性、解释器调度及本地资源竞争等因素有关。平均 RTT 从 0.134 ms 上升到 1.315 ms，也反映了并发请求增加后的排队延迟和共享资源竞争。由于各并发级别成功率均为 100%，当前瓶颈主要表现为时延和吞吐变化，而非协议状态错误。",
     )
     add_heading(doc, "7.5 Preliminary Weak-Network Simulation", 2)
     add_p(
@@ -1130,7 +1130,7 @@ def build_document():
         "当前实现主要使用对称密钥和 HMAC，开放环境中还需要与 TLS/QUIC 密钥协商或非对称签名机制集成。",
         "实验主要为单服务器架构，分布式多副本场景下的记忆状态一致性和票据跨节点验证仍需研究。",
         "弱网实验目前为代码级仿真，后续应使用 tc/netem 或 ns-3 对丢包、乱序、抖动和带宽限制进行更接近真实网络的评估。",
-        "当前攻击场景覆盖 drop、modify、replay、prev_mem 和五类无效票据，仍需扩展到协商降级、选择性篡改、并发恢复竞争等复杂攻击。",
+        "当前攻击场景覆盖3类网络攻击（modify_unsigned、metadata_tamper、exact_replay）和4类持钥攻击（forged_prev_mem_valid_mac、sequence_gap_valid_mac、cross_session_valid_mac、cross_epoch_valid_mac）以及五类无效票据，仍需扩展到协商降级、选择性篡改、并发恢复竞争等复杂攻击。",
     ])
     add_heading(doc, "8.6 Future Work（未来工作）", 2)
     add_p(
@@ -1145,7 +1145,7 @@ def build_document():
     )
     add_p(
         doc,
-        "基于 Python TCP 原型的实验表明，在测试攻击场景下，GMCP-R 达到 100% 攻击检测率、0% 误接受率与 0% 误拒绝率；五类无效 MemoryTicket 均被拒绝；本地纯计算吞吐量约为 65,931 msg/s；1 至 20 个并发客户端均保持 100% 成功率。初步代码级弱网仿真仅作为补充证据，真实弱网结论仍需进一步验证。后续工作将集中在形式化验证、真实弱网评估、嵌入式资源测量、后量子密钥建立集成和分布式多副本恢复机制上。",
+        "基于 Python TCP 原型的实验表明，在测试攻击场景下，GMCP-R 达到 100% 攻击检测率、0% 误接受率与 0% 误拒绝率；五类无效 MemoryTicket 均被拒绝；本地纯计算吞吐量约为 63,998 msg/s；1 至 20 个并发客户端均保持 100% 成功率。初步代码级弱网仿真仅作为补充证据，真实弱网结论仍需进一步验证。后续工作将集中在形式化验证、真实弱网评估、嵌入式资源测量、后量子密钥建立集成和分布式多副本恢复机制上。",
     )
 
     add_heading(doc, "Appendix A. Weak-Network Supplement（补充弱网仿真）", 1)
@@ -1158,9 +1158,9 @@ def build_document():
         "附录表 A1. 代码级发送丢弃与延迟实验（25 种参数组合 x 2 次重复）",
         ["协议", "成功率均值", "成功率标准差", "平均吞吐量 (msg/s)", "平均 RTT (ms)"],
         [
-            ["GMCP-R", "100.0%", "0.0%", "1159.5", "20.3"],
-            ["Hash Chain", "100.0%", "0.0%", "1113.7", "20.3"],
-            ["Seq+MAC", "100.0%", "0.0%", "1097.8", "20.3"],
+            ["GMCP-R", "100.0%", "0.0%", "417.3", "24.8"],
+            ["Hash Chain", "100.0%", "0.0%", "519.7", "24.8"],
+            ["Seq+MAC", "100.0%", "0.0%", "487.1", "24.8"],
         ],
         [1600, 1800, 1900, 2250, 1810],
         source="数据来源：paper_data/05_weak_network.csv。三种协议在统一重试预算下均达到100%成功率。实验为代码级应用层模拟，非tc/netem。",
