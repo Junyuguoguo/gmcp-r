@@ -17,6 +17,10 @@
 关键设计：
   - 没有真实服务器连接时，拒绝生成伪造数据
   - 记录 client_host_id, server_host_id, network_path_type, baseline_ping_rtt_ms
+  - HELLO 握手建立会话（protocol/session_id/sender_id/epoch）
+  - 内置服务器对每种协议进行完整验证（MAC/哈希链/HMAC）
+  - run_valid 字段标识有效实验结果
+  - 异常时标记 run 失败，不写入 CSV
 """
 
 import argparse
@@ -29,7 +33,7 @@ import subprocess
 import sys
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -44,14 +48,24 @@ from gmcp.crypto_utils import hash_text, hmac_sha256_hex
 from gmcp.memory import initial_memory
 from gmcp.packet import build_data_packet
 from gmcp.protocol import GMCPState, GMCPVerifier
-from gmcp.checkpoint_manager import CheckpointManager
-from gmcp.session_registry import SessionContext, SessionRegistry
 
-# Baseline protocol builders
-from gmcp.baselines.seq_mac import build_data_packet as seq_mac_build
-from gmcp.baselines.hash_chain import build_data_packet as hc_build
-from gmcp.baselines.authenticated_hash_chain import build_data_packet as ahc_build
-from gmcp.baselines.ticket_only import build_data_packet as ticket_build
+# Baseline protocol builders and verifiers
+from gmcp.baselines.seq_mac import (
+    build_data_packet as seq_mac_build,
+    SeqMACState,
+    SeqMACVerifier,
+)
+from gmcp.baselines.hash_chain import (
+    build_data_packet as hc_build,
+    HashChainState,
+    HashChainVerifier,
+    hash_func as hc_hash_func,
+)
+from gmcp.baselines.authenticated_hash_chain import (
+    build_data_packet as ahc_build,
+    AuthHashChainState,
+    AuthHashChainVerifier,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -172,6 +186,31 @@ def close_tcp(sock, file_obj):
         pass
 
 
+def send_hello(
+    sock: socket.socket,
+    file_obj,
+    protocol: str,
+    session_id: str,
+    sender_id: str,
+    epoch: int,
+) -> Dict[str, Any]:
+    """Send HELLO handshake and validate response. Raises on failure."""
+    hello = {
+        "type": "HELLO",
+        "protocol": protocol,
+        "session_id": session_id,
+        "sender_id": sender_id,
+        "epoch": epoch,
+    }
+    send_json_line(sock, hello)
+    resp = recv_json_line(file_obj)
+    if not resp.get("ok"):
+        raise RuntimeError(
+            f"HELLO rejected by server: {resp.get('reason', 'unknown')}"
+        )
+    return resp
+
+
 def ping_server(host: str, port: int) -> bool:
     """Test if the GMCP-R TCP server is reachable."""
     try:
@@ -186,6 +225,27 @@ def ping_server(host: str, port: int) -> bool:
         return resp.get("ok") is True
     except Exception:
         return False
+
+
+def get_git_metadata() -> Dict[str, str]:
+    """Get git metadata for reproducibility."""
+    meta = {"git_commit": "", "git_branch": "", "git_dirty": ""}
+    try:
+        meta["git_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        meta["git_branch"] = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        meta["git_dirty"] = "true" if dirty else "false"
+    except Exception:
+        pass
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +302,8 @@ def build_packet_for_protocol(
 def get_initial_state(protocol: str, session_id: str) -> Tuple[str, Any]:
     """
     Return (initial_memory_value, state_or_none) for the protocol.
+
+    Must match the server-side initial state computation exactly.
     """
     if protocol in ("gmcp_r",):
         mem = initial_memory(session_id, CLIENT_ID, EPOCH, "demo-seed")
@@ -249,7 +311,8 @@ def get_initial_state(protocol: str, session_id: str) -> Tuple[str, Any]:
     elif protocol == "seq_mac":
         return "", None
     elif protocol in ("hash_chain", "authenticated_hash_chain"):
-        mem = hash_text(f"init:{session_id}")
+        # Must match create_initial_state: hash_func(f"init:{session_id}:{epoch}")
+        mem = hc_hash_func(f"init:{session_id}:{EPOCH}")
         return mem, None
     else:
         raise ValueError(f"Unknown protocol: {protocol}")
@@ -270,8 +333,13 @@ def run_one_experiment(
     server_host_id: str,
     network_path_type: str,
     baseline_rtt_ms: float,
-) -> Dict[str, Any]:
-    """Run a single cross-host experiment and return a result dict."""
+    git_meta: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Run a single cross-host experiment and return a result dict.
+
+    Returns None if the run failed (exception during connection/HELLO).
+    """
 
     session_id = (
         f"cross-{protocol}-m{message_count}-p{payload_size}-"
@@ -294,6 +362,9 @@ def run_one_experiment(
     try:
         sock, file_obj = open_tcp(server_host, server_port)
 
+        # --- HELLO handshake ---
+        send_hello(sock, file_obj, protocol, session_id, CLIENT_ID, EPOCH)
+
         for seq in range(1, message_count + 1):
             payload = make_payload(seq, payload_size)
             packet = build_packet_for_protocol(
@@ -311,8 +382,12 @@ def run_one_experiment(
 
                 if response.get("ok"):
                     accepted_count += 1
+                    # Update protocol-specific state from server response
                     if protocol == "gmcp_r":
                         current_mem = response.get("last_mem", current_mem)
+                    elif protocol in ("hash_chain", "authenticated_hash_chain"):
+                        current_mem = response.get("last_hash", current_mem)
+                    # seq_mac: only last_seq, no state to update on client
                 else:
                     rejected_count += 1
 
@@ -323,6 +398,7 @@ def run_one_experiment(
 
     except Exception as e:
         print(f"  [ERROR] {protocol} r{repeat_id}: {e}")
+        return None
     finally:
         close_tcp(sock, file_obj)
 
@@ -345,6 +421,11 @@ def run_one_experiment(
 
     avg_rtt = sum(rtts) / len(rtts) if rtts else 0
 
+    # --- run_valid computation ---
+    unrecovered = rejected_count + timeout_count + error_count
+    state_match = accepted_count == message_count
+    run_valid = (accepted_count == message_count) and (unrecovered == 0) and state_match
+
     return {
         "session_id": session_id,
         "experiment_type": "cross_host",
@@ -363,6 +444,9 @@ def run_one_experiment(
         "rejected_count": rejected_count,
         "timeout_count": timeout_count,
         "error_count": error_count,
+        "unrecovered": unrecovered,
+        "state_match": state_match,
+        "run_valid": run_valid,
         "success_rate": round(success_rate, 2),
         "throughput_msg_per_sec": round(throughput, 2),
         "elapsed_seconds": round(elapsed, 3),
@@ -370,7 +454,10 @@ def run_one_experiment(
         "p50_rtt_ms": round(percentile(rtts, 0.50), 2),
         "p95_rtt_ms": round(percentile(rtts, 0.95), 2),
         "p99_rtt_ms": round(percentile(rtts, 0.99), 2),
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "git_commit": git_meta.get("git_commit", ""),
+        "git_branch": git_meta.get("git_branch", ""),
+        "git_dirty": git_meta.get("git_dirty", ""),
     }
 
 
@@ -378,44 +465,27 @@ def run_one_experiment(
 # Embedded server (optional)
 # ---------------------------------------------------------------------------
 
-def _session_factory(session_id: str, checkpoint_interval: int) -> SessionContext:
-    """Factory for creating new SessionContext objects."""
-    mem_seed = "demo-seed"
-    m0 = initial_memory(session_id, CLIENT_ID, EPOCH, mem_seed)
-    state = GMCPState(
-        session_id=session_id,
-        sender_id=CLIENT_ID,
-        epoch=EPOCH,
-        last_seq=0,
-        last_mem=m0,
-    )
-    verifier = GMCPVerifier(state)
-    cp_mgr = CheckpointManager(
-        session_id=session_id,
-        epoch=EPOCH,
-        checkpoint_interval=checkpoint_interval,
-    )
-    return SessionContext(
-        session_id=session_id,
-        state=state,
-        verifier=verifier,
-        checkpoint_manager=cp_mgr,
-    )
-
-
 class EmbeddedTCPServer:
     """
-    Lightweight TCP server that handles GMCP-R PING and DATA packets.
+    Lightweight TCP server that handles GMCP-R PING, HELLO, and DATA packets.
+    Supports full verification for all four protocols:
+      - gmcp_r: HMAC + memory chain
+      - seq_mac: HMAC(seq || payload)
+      - hash_chain: SHA-256 chain hash verification
+      - authenticated_hash_chain: HMAC + SHA-256 chain hash
     Spawned only when --no-spawn-server is NOT set.
     """
 
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-        self._registry = SessionRegistry(factory=_session_factory)
         self._server_sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        # Per-session protocol and verifier storage
+        self._protocols: Dict[str, str] = {}       # session_id -> protocol name
+        self._verifiers: Dict[str, Any] = {}        # session_id -> verifier object
+        self._lock = threading.Lock()
 
     def start(self):
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -464,9 +534,10 @@ class EmbeddedTCPServer:
                 if ptype == "PING":
                     resp = {"ok": True, "type": "PONG", "server_time": time.time()}
                     self._send(conn, resp)
+                elif ptype == "HELLO":
+                    self._handle_hello(conn, packet)
                 elif ptype == "DATA":
-                    resp = self._handle_data(packet)
-                    self._send(conn, resp)
+                    self._handle_data(conn, packet)
                 else:
                     self._send(conn, {"ok": False, "reason": f"unknown type: {ptype}"})
         except (ConnectionError, socket.timeout, OSError):
@@ -474,27 +545,114 @@ class EmbeddedTCPServer:
         finally:
             close_tcp(conn, file_obj)
 
-    def _handle_data(self, packet: Dict[str, Any]) -> Dict[str, Any]:
+    def _handle_hello(self, conn: socket.socket, packet: Dict[str, Any]):
+        """Process HELLO handshake: validate fields and create protocol verifier."""
+        protocol = packet.get("protocol", "")
+        session_id = packet.get("session_id", "")
+        sender_id = packet.get("sender_id", "")
+        epoch = packet.get("epoch", 0)
+
+        if not session_id:
+            self._send(conn, {"ok": False, "reason": "missing session_id"})
+            return
+
+        if protocol not in PROTOCOLS:
+            self._send(conn, {"ok": False, "reason": f"unsupported protocol: {protocol}"})
+            return
+
+        with self._lock:
+            # Don't re-create if session already exists
+            if session_id in self._verifiers:
+                self._send(conn, {
+                    "ok": True,
+                    "type": "HELLO_ACK",
+                    "session_id": session_id,
+                    "protocol": protocol,
+                })
+                return
+
+            self._protocols[session_id] = protocol
+
+            if protocol == "gmcp_r":
+                mem_seed = "demo-seed"
+                m0 = initial_memory(session_id, sender_id, epoch, mem_seed)
+                state = GMCPState(
+                    session_id=session_id,
+                    sender_id=sender_id,
+                    epoch=epoch,
+                    last_seq=0,
+                    last_mem=m0,
+                )
+                self._verifiers[session_id] = GMCPVerifier(state)
+
+            elif protocol == "seq_mac":
+                state = SeqMACState(
+                    session_id=session_id,
+                    sender_id=sender_id,
+                    epoch=epoch,
+                    last_seq=0,
+                )
+                self._verifiers[session_id] = SeqMACVerifier(state)
+
+            elif protocol == "hash_chain":
+                initial_hash = hc_hash_func(f"init:{session_id}:{epoch}")
+                state = HashChainState(
+                    session_id=session_id,
+                    sender_id=sender_id,
+                    epoch=epoch,
+                    last_seq=0,
+                    last_hash=initial_hash,
+                    hash_chain=[],
+                )
+                self._verifiers[session_id] = HashChainVerifier(state)
+
+            elif protocol == "authenticated_hash_chain":
+                initial_hash = hc_hash_func(f"init:{session_id}:{epoch}")
+                state = AuthHashChainState(
+                    session_id=session_id,
+                    sender_id=sender_id,
+                    epoch=epoch,
+                    last_seq=0,
+                    last_hash=initial_hash,
+                    hash_chain=[],
+                )
+                self._verifiers[session_id] = AuthHashChainVerifier(state)
+
+        print(f"  [HELLO] session={session_id} protocol={protocol}")
+        self._send(conn, {
+            "ok": True,
+            "type": "HELLO_ACK",
+            "session_id": session_id,
+            "protocol": protocol,
+        })
+
+    def _handle_data(self, conn: socket.socket, packet: Dict[str, Any]):
+        """Process DATA packet using protocol-appropriate verification."""
         session_id = packet.get("session_id", "unknown")
-        protocol = packet.get("protocol", "gmcp_r")
 
-        ctx = self._registry.get_or_create(session_id)
+        with self._lock:
+            verifier = self._verifiers.get(session_id)
+            protocol = self._protocols.get(session_id, "")
 
+        if verifier is None:
+            self._send(conn, {"ok": False, "reason": "no HELLO received for this session"})
+            return
+
+        ok, reason = verifier.verify_data_packet(packet)
+
+        resp: Dict[str, Any] = {"ok": ok, "reason": reason}
+
+        # Include protocol-appropriate state in response
         if protocol == "gmcp_r":
-            ok, reason = ctx.verifier.verify_data_packet(packet)
-            return {
-                "ok": ok,
-                "reason": reason,
-                "last_seq": ctx.state.last_seq,
-                "last_mem": ctx.state.last_mem,
-            }
-        else:
-            # Baseline protocols: basic verification
-            seq = packet.get("seq", 0)
-            if seq <= ctx.state.last_seq:
-                return {"ok": False, "reason": "replay_or_stale_seq"}
-            ctx.state.last_seq = seq
-            return {"ok": True, "reason": "ok", "last_seq": ctx.state.last_seq}
+            resp["last_seq"] = verifier.state.last_seq
+            resp["last_mem"] = verifier.state.last_mem
+        elif protocol in ("hash_chain", "authenticated_hash_chain"):
+            resp["last_seq"] = verifier.state.last_seq
+            resp["last_hash"] = verifier.state.last_hash
+        elif protocol == "seq_mac":
+            resp["last_seq"] = verifier.state.last_seq
+
+        self._send(conn, resp)
 
     @staticmethod
     def _send(conn: socket.socket, resp: Dict[str, Any]):
@@ -563,6 +721,12 @@ def main():
     server_host_id = server_host if args.no_spawn_server else get_host_id()
     network_path_type = classify_network_path(server_host)
 
+    # Collect git metadata
+    git_meta = get_git_metadata()
+    print(f"[INFO] Git commit: {git_meta['git_commit'][:12] if git_meta['git_commit'] else 'N/A'}")
+    print(f"[INFO] Git branch: {git_meta['git_branch'] or 'N/A'}")
+    print(f"[INFO] Git dirty:  {git_meta['git_dirty'] or 'N/A'}")
+
     ensure_output_dir()
 
     fieldnames = [
@@ -572,9 +736,11 @@ def main():
         "message_count", "payload_size", "repeat_id",
         "sent_count", "accepted_count", "rejected_count",
         "timeout_count", "error_count",
+        "unrecovered", "state_match", "run_valid",
         "success_rate", "throughput_msg_per_sec", "elapsed_seconds",
         "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
         "timestamp",
+        "git_commit", "git_branch", "git_dirty",
     ]
 
     total = len(PROTOCOLS) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * repeats
@@ -592,6 +758,8 @@ def main():
         sys.exit(1)
 
     completed = 0
+    failed = 0
+    skipped = 0
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -600,6 +768,7 @@ def main():
             for msg_count in MESSAGE_COUNTS:
                 for payload_size in PAYLOAD_SIZES:
                     for repeat_id in range(1, repeats + 1):
+                        idx = completed + failed + skipped + 1
                         result = run_one_experiment(
                             protocol=protocol,
                             message_count=msg_count,
@@ -611,21 +780,34 @@ def main():
                             server_host_id=server_host_id,
                             network_path_type=network_path_type,
                             baseline_rtt_ms=baseline_rtt,
+                            git_meta=git_meta,
                         )
+                        if result is None:
+                            # Run failed (exception) — skip CSV write
+                            failed += 1
+                            print(
+                                f"  [{idx}/{total}] {protocol} m={msg_count} "
+                                f"p={payload_size} r={repeat_id}: FAILED (skipped)"
+                            )
+                            continue
+
                         writer.writerow(result)
                         f.flush()
                         completed += 1
                         acc = result["accepted_count"]
                         rej = result["rejected_count"]
+                        valid_mark = "OK" if result["run_valid"] else "INVALID"
                         print(
-                            f"  [{completed}/{total}] {protocol} m={msg_count} "
+                            f"  [{idx}/{total}] {protocol} m={msg_count} "
                             f"p={payload_size} r={repeat_id}: "
                             f"accepted={acc} rejected={rej} "
-                            f"rtt={result['avg_rtt_ms']:.1f}ms"
+                            f"rtt={result['avg_rtt_ms']:.1f}ms [{valid_mark}]"
                         )
 
     print(f"\n[DONE] Results written to {OUTPUT_CSV}")
-    print(f"[DONE] {completed} experiments completed.")
+    print(f"[DONE] {completed} experiments completed, {failed} failed, {skipped} skipped.")
+    if failed > 0:
+        print(f"[WARN] {failed} experiments had errors and were excluded from results.")
 
 
 if __name__ == "__main__":

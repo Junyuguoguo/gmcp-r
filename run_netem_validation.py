@@ -51,8 +51,12 @@ from gmcp.session_registry import SessionContext, SessionRegistry
 
 # Baseline protocol builders
 from gmcp.baselines.seq_mac import build_data_packet as seq_mac_build
+from gmcp.baselines.seq_mac import SeqMACVerifier, create_initial_state as sm_init_state
 from gmcp.baselines.hash_chain import build_data_packet as hc_build
 from gmcp.baselines.authenticated_hash_chain import build_data_packet as ahc_build
+from gmcp.baselines.authenticated_hash_chain import AuthHashChainVerifier, create_initial_state as ahc_init_state
+
+from gmcp.experiment_stats import get_git_commit, get_python_version, get_os_info
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -239,7 +243,7 @@ def tc_condition(interface: str, loss: int, delay_ms: int, jitter_ms: int, reord
     print(f"[TC] Applying: {condition_desc}")
     ok = setup_tc_netem(interface, loss, delay_ms, jitter_ms, reorder)
     if not ok:
-        print("[TC] WARNING: Failed to apply condition, proceeding anyway")
+        raise RuntimeError(f"[TC] Failed to apply condition: {condition_desc}")
     try:
         yield
     finally:
@@ -326,6 +330,8 @@ def run_one_experiment(
     errors = 0
     sent = 0
     rtts: List[float] = []
+    run_valid = True
+    failure_reason = ""
 
     start_time = time.time()
     sock = None
@@ -355,13 +361,21 @@ def run_one_experiment(
                         current_mem = response.get("last_mem", current_mem)
                 else:
                     rejected += 1
+                    run_valid = False
+                    failure_reason = response.get("reason", "server_rejected")
 
             except socket.timeout:
                 timeouts += 1
-            except Exception:
+                run_valid = False
+                failure_reason = "socket_timeout"
+            except Exception as e:
                 errors += 1
+                run_valid = False
+                failure_reason = str(e)
 
     except Exception as e:
+        run_valid = False
+        failure_reason = str(e)
         print(f"  [ERROR] {protocol} {condition_name} r{repeat_id}: {e}")
     finally:
         close_tcp(sock, file_obj)
@@ -410,6 +424,8 @@ def run_one_experiment(
         "p50_rtt_ms": round(percentile(rtts, 0.50), 2),
         "p95_rtt_ms": round(percentile(rtts, 0.95), 2),
         "p99_rtt_ms": round(percentile(rtts, 0.99), 2),
+        "run_valid": run_valid,
+        "failure_reason": failure_reason,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
 
@@ -419,18 +435,29 @@ def run_one_experiment(
 # ---------------------------------------------------------------------------
 
 def _session_factory(session_id: str, checkpoint_interval: int) -> SessionContext:
-    mem_seed = "demo-seed"
-    m0 = initial_memory(session_id, CLIENT_ID, EPOCH, mem_seed)
-    state = GMCPState(
-        session_id=session_id,
-        sender_id=CLIENT_ID,
-        epoch=EPOCH,
-        last_seq=0,
-        last_mem=m0,
-    )
-    verifier = GMCPVerifier(state)
+    """Create a SessionContext for a composite key like 'protocol:session_id'."""
+    protocol, _, sid = session_id.partition(":")
+    if protocol == "gmcp_r":
+        mem_seed = "demo-seed"
+        m0 = initial_memory(sid, CLIENT_ID, EPOCH, mem_seed)
+        state = GMCPState(
+            session_id=sid,
+            sender_id=CLIENT_ID,
+            epoch=EPOCH,
+            last_seq=0,
+            last_mem=m0,
+        )
+        verifier = GMCPVerifier(state)
+    elif protocol == "seq_mac":
+        state = sm_init_state(sid, CLIENT_ID, EPOCH)
+        verifier = SeqMACVerifier(state)
+    elif protocol == "authenticated_hash_chain":
+        state = ahc_init_state(sid, CLIENT_ID, EPOCH)
+        verifier = AuthHashChainVerifier(state)
+    else:
+        raise ValueError(f"unsupported protocol: {protocol}")
     cp_mgr = CheckpointManager(
-        session_id=session_id,
+        session_id=sid,
         epoch=EPOCH,
         checkpoint_interval=checkpoint_interval,
     )
@@ -512,17 +539,14 @@ class EmbeddedTCPServer:
     def _handle_data(self, packet: Dict[str, Any]) -> Dict[str, Any]:
         session_id = packet.get("session_id", "unknown")
         protocol = packet.get("protocol", "gmcp_r")
-        ctx = self._registry.get_or_create(session_id)
+        registry_key = f"{protocol}:{session_id}"
+        ctx = self._registry.get_or_create(registry_key)
 
+        ok, reason = ctx.verifier.verify_data_packet(packet)
+        resp = {"ok": ok, "reason": reason, "last_seq": ctx.state.last_seq}
         if protocol == "gmcp_r":
-            ok, reason = ctx.verifier.verify_data_packet(packet)
-            return {"ok": ok, "reason": reason, "last_seq": ctx.state.last_seq, "last_mem": ctx.state.last_mem}
-        else:
-            seq = packet.get("seq", 0)
-            if seq <= ctx.state.last_seq:
-                return {"ok": False, "reason": "replay_or_stale_seq"}
-            ctx.state.last_seq = seq
-            return {"ok": True, "reason": "ok", "last_seq": ctx.state.last_seq}
+            resp["last_mem"] = ctx.state.last_mem
+        return resp
 
     @staticmethod
     def _send(conn: socket.socket, resp: Dict[str, Any]):
@@ -606,10 +630,18 @@ def main():
         "timeout_count", "error_count",
         "success_rate", "throughput_msg_per_sec", "elapsed_seconds",
         "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
+        "run_valid", "failure_reason",
         "timestamp",
+        "git_commit", "python_version", "os_info",
     ]
 
     total = len(PROTOCOLS) * len(conditions) * repeats
+
+    # Collect metadata once
+    git_commit = get_git_commit()
+    python_version = get_python_version()
+    os_info = get_os_info()
+
     print(f"[INFO] Total experiments: {total}")
     print(f"[INFO] Protocols: {PROTOCOLS}")
     print(f"[INFO] Conditions: {[c[0] for c in conditions]}")
@@ -641,6 +673,9 @@ def main():
                             message_count=MESSAGE_COUNT,
                             payload_size=PAYLOAD_SIZE,
                         )
+                        result["git_commit"] = git_commit
+                        result["python_version"] = python_version
+                        result["os_info"] = os_info
                         writer.writerow(result)
                         f.flush()
                         completed += 1
