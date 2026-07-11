@@ -241,6 +241,7 @@ def run_one_experiment(
     rejected_count = 0
     timeout_count = 0
     error_count = 0
+    failure_reason = ""
     sent_count = 0
     rtts: List[float] = []
 
@@ -302,8 +303,12 @@ def run_one_experiment(
 
             except socket.timeout:
                 timeout_count += 1
+                failure_reason = "socket_timeout"
+                break  # Stop this run, don't continue with next seq
             except Exception as e:
                 error_count += 1
+                failure_reason = str(e)
+                break  # Stop this run, don't continue with next seq
 
     except Exception as e:
         print(f"  [ERROR] {protocol} r{repeat_id}: {e}")
@@ -372,6 +377,7 @@ def run_one_experiment(
         "rejected_count": rejected_count,
         "timeout_count": timeout_count,
         "error_count": error_count,
+        "failure_reason": failure_reason,
         "unrecovered": unrecovered,
         # State audit fields (from ProtocolAdapter)
         "client_final_seq": state_fields["client_final_seq"],
@@ -670,6 +676,8 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat only, output to smoke CSV")
     parser.add_argument("--formal", action="store_true", help="Formal mode: full run with strict guards")
     parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
+    parser.add_argument("--allow-mixed-commits", action="store_true",
+        help="Allow client and server to run different git commits (formal mode)")
     parser.add_argument(
         "--server-only",
         action="store_true",
@@ -679,6 +687,8 @@ def main():
 
     # --- Formal mode: force repeats=20 ---
     if args.formal:
+        if args.allow_mixed_commits:
+            print("[FORMAL] --allow-mixed-commits: skipping commit consistency check")
         if args.repeats is not None and args.repeats != 20:
             parser.error('--formal requires exactly 20 repeats (or omit for default 20)')
 
@@ -790,7 +800,7 @@ def main():
         "server_host", "server_port", "tcp_connect_latency_ms",
         "message_count", "payload_size", "repeat_id",
         "sent_count", "accepted_count", "rejected_count",
-        "timeout_count", "error_count",
+        "timeout_count", "error_count", "failure_reason",
         "unrecovered",
         "client_final_seq", "server_final_seq", "sequence_match",
         "client_final_mem", "server_final_mem", "memory_match",
