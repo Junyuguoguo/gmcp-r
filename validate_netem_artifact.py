@@ -3,14 +3,16 @@
 """
 验证 tc/netem 实验产物 (netem_validation_results.csv)
 
-检查项：
+严格检查项：
   1. CSV 文件存在且非空
-  2. 矩阵完整性（3 protocols × 6 conditions × 10 repeats）
+  2. 矩阵完整性（3 protocols × 6 conditions × 10 repeats = 180 行）
   3. 关键列存在且值合理
-  4. execution_valid、server_git_commit、state_match 检查
-  5. 不要求所有行 result_success=100%
+  4. execution_valid=True（非 control 行）
+  5. server_git_dirty=false
+  6. tc 参数匹配（actual_delay/loss 在 requested * 0.8 以上）
+  7. 不强制 100% success_rate（真实网络现象）
 
-如果数据不存在，报告 "no data" 并以非零码退出。
+如果任何 issue 或 exec_issue，以非零码退出。
 """
 
 import csv
@@ -35,9 +37,20 @@ REQUIRED_COLUMNS = [
     "success_rate", "throughput_msg_per_sec", "elapsed_seconds",
     "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
     "execution_valid", "interface", "requested_netem_config", "actual_qdisc_config",
+    "actual_delay_ms", "actual_loss_pct", "actual_jitter_ms",
     "server_git_commit", "state_match",
     "timestamp",
 ]
+
+# Condition name → (requested_delay_ms, requested_loss_pct)
+CONDITION_PARAMS = {
+    "control":   (0, 0),
+    "mild":      (30, 1),
+    "mobile":    (60, 2),
+    "poor":      (100, 5),
+    "severe":    (200, 10),
+    "loss_heavy": (50, 20),
+}
 
 
 def read_csv_rows(filepath: str):
@@ -46,7 +59,7 @@ def read_csv_rows(filepath: str):
 
 
 def main():
-    print(f"=== Netem Artifact Validation ===")
+    print(f"=== Netem Artifact Validation (strict) ===")
     print(f"File: {CSV_PATH}")
     print()
 
@@ -72,7 +85,7 @@ def main():
         sys.exit(1)
     print(f"Columns: OK ({len(actual_cols)} columns, all required columns present)")
 
-    # 3. Matrix completeness
+    # 3. Matrix completeness (must be exactly 180 rows)
     seen = set()
     for r in rows:
         key = (
@@ -115,9 +128,8 @@ def main():
     else:
         print(f"Matrix: OK ({len(seen)}/{expected_total} unique combos)")
 
-    if issues:
-        for issue in issues:
-            print(f"WARN: {issue}")
+    if len(rows) != expected_total:
+        issues.append(f"Row count mismatch: {len(rows)} != expected {expected_total}")
 
     # 4. Value sanity checks
     sane_issues = []
@@ -146,37 +158,77 @@ def main():
     else:
         print("Sanity checks: OK")
 
-    # 4b. execution_valid checks (non-control conditions)
+    # 5. Strict execution_valid checks (non-control conditions)
     exec_issues = []
     for i, r in enumerate(rows):
         row_num = i + 1
         cond = r.get("condition_name", "")
         exec_v = r.get("execution_valid", "")
         git_c = r.get("server_git_commit", "")
+        git_dirty = r.get("server_git_dirty", "")
         state_m = r.get("state_match", "")
 
         # server_git_commit must be non-empty
         if not git_c:
             exec_issues.append(f"Row {row_num}: server_git_commit is empty")
 
+        # server_git_dirty must be false (if column exists)
+        if "server_git_dirty" in r and git_dirty not in ("false", "False", ""):
+            exec_issues.append(f"Row {row_num}: server_git_dirty={git_dirty} (expected false)")
+
         # state_match should exist
         if state_m == "":
             exec_issues.append(f"Row {row_num}: state_match is empty")
 
-        # Non-control conditions should have execution_valid
-        # (but we don't require 100% success_rate — real network phenomena)
+        # Non-control conditions must have execution_valid=True
         if cond != "control" and exec_v not in ("True", "true", True):
             exec_issues.append(f"Row {row_num}: condition={cond} but execution_valid={exec_v}")
 
-    if exec_issues:
-        for issue in exec_issues[:10]:
-            print(f"WARN: {issue}")
-        if len(exec_issues) > 10:
-            print(f"  ... and {len(exec_issues) - 10} more warnings")
-    else:
-        print("Execution validity checks: OK")
+    # 6. tc parameter matching (actual vs requested)
+    tc_issues = []
+    for i, r in enumerate(rows):
+        row_num = i + 1
+        cond = r.get("condition_name", "")
 
-    # 5. Per-condition success rate trends
+        if cond == "control":
+            continue  # control has no tc parameters
+
+        if cond not in CONDITION_PARAMS:
+            tc_issues.append(f"Row {row_num}: unknown condition '{cond}'")
+            continue
+
+        req_delay, req_loss = CONDITION_PARAMS[cond]
+
+        try:
+            actual_delay = float(r.get("actual_delay_ms", 0))
+            actual_loss = float(r.get("actual_loss_pct", 0))
+        except (ValueError, TypeError):
+            tc_issues.append(f"Row {row_num}: cannot parse actual tc parameters")
+            continue
+
+        # Verify delay >= requested * 0.8
+        if req_delay > 0 and actual_delay < req_delay * 0.8:
+            tc_issues.append(
+                f"Row {row_num}: actual_delay={actual_delay:.1f}ms "
+                f"< requested={req_delay}ms * 0.8 = {req_delay * 0.8:.1f}ms"
+            )
+
+        # Verify loss >= requested * 0.8
+        if req_loss > 0 and actual_loss < req_loss * 0.8:
+            tc_issues.append(
+                f"Row {row_num}: actual_loss={actual_loss:.1f}% "
+                f"< requested={req_loss}% * 0.8 = {req_loss * 0.8:.1f}%"
+            )
+
+    if tc_issues:
+        for issue in tc_issues[:10]:
+            print(f"WARN: {issue}")
+        if len(tc_issues) > 10:
+            print(f"  ... and {len(tc_issues) - 10} more warnings")
+    else:
+        print("tc parameter checks: OK")
+
+    # 7. Per-condition success rate trends
     print()
     print("--- Success Rate by Condition ---")
     by_cond = defaultdict(list)
@@ -189,7 +241,7 @@ def main():
             avg = sum(vals) / len(vals)
             print(f"  {cond:12s}: n={len(vals):3d}  avg_success={avg:6.2f}%")
 
-    # 6. Per-protocol summary
+    # 8. Per-protocol summary
     print()
     print("--- Summary by Protocol ---")
     by_proto = defaultdict(list)
@@ -208,16 +260,21 @@ def main():
             f"avg_rtt={avg_rtt:7.2f}ms"
         )
 
+    # 9. Final verdict — strict: any issue or exec_issue → FAIL
     print()
-    all_issues = issues + sane_issues + exec_issues
-    if not all_issues:
-        print("PASS: All checks passed.")
-        sys.exit(0)
-    elif issues:
-        print("PARTIAL: Some matrix completeness issues detected (see warnings above).")
+    all_critical = issues + exec_issues
+    all_warnings = sane_issues + tc_issues
+
+    if all_critical:
+        for issue in all_critical:
+            print(f"FAIL: {issue}")
+        print(f"\nFAIL: {len(all_critical)} critical issue(s) found. Exiting with error.")
         sys.exit(1)
+    elif all_warnings:
+        print(f"PASS: All critical checks passed ({len(all_warnings)} warning(s)).")
+        sys.exit(0)
     else:
-        print("PASS: All checks passed (with minor warnings).")
+        print("PASS: All checks passed.")
         sys.exit(0)
 
 

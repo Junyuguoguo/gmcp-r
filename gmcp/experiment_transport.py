@@ -115,6 +115,25 @@ def get_git_metadata() -> Dict[str, str]:
     return meta
 
 
+def get_cpu_model() -> str:
+    """Return a short CPU model string."""
+    try:
+        proc = platform.processor()
+        if proc:
+            return proc
+    except Exception:
+        pass
+    # Linux fallback: read /proc/cpuinfo
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
 def get_server_env_info() -> Dict[str, str]:
     """Return server environment info for HELLO_ACK."""
     return {
@@ -122,6 +141,8 @@ def get_server_env_info() -> Dict[str, str]:
         "server_python_version": platform.python_version(),
         "server_os_info": f"{platform.system()} {platform.release()}",
         "server_hostname": socket.gethostname(),
+        "server_git_dirty": str(get_git_dirty()).lower(),
+        "server_cpu_model": get_cpu_model(),
     }
 
 
@@ -202,6 +223,11 @@ class ProtocolAdapter:
 
     Tracks client-side state independently from the server, enabling
     ``check_state_match`` to compare the two.
+
+    After a successful verification, callers should call
+    ``update_after_accept(packet, response)`` which:
+      - computes client_state from the *local packet* (not the server response)
+      - stores the server-reported values separately for later comparison
     """
 
     def __init__(
@@ -219,6 +245,9 @@ class ProtocolAdapter:
         self.last_seq: int = 0
         self.client_state: Dict[str, Any] = {}
         self._ticket = ticket
+
+        # Server-reported final state (saved for CSV comparison)
+        self.server_state: Dict[str, Any] = {}
 
         # Pre-compute initial state values
         self._initial_mem = ""
@@ -293,8 +322,8 @@ class ProtocolAdapter:
                 sender_id=self.sender_id,
                 epoch=self.epoch,
                 seq=seq,
-                payload=payload,
                 ticket=self._ticket,
+                payload=payload,
             )
 
         else:
@@ -304,10 +333,62 @@ class ProtocolAdapter:
         packet["protocol"] = wire
         return packet
 
-    # ---- State tracking (mirrors server responses) ----
+    # ---- State tracking (independent from server responses) ----
+
+    def update_after_accept(
+        self, packet: Dict[str, Any], response: Dict[str, Any]
+    ) -> None:
+        """
+        Update both client_state (from local packet) and server_state
+        (from server response) after a successful verification.
+
+        Client state is computed *independently* from the sent packet,
+        not copied from the server response.
+        """
+        seq = packet.get("seq", 0)
+        self.last_seq = seq
+
+        # --- Client-side independent state computation ---
+        if self.protocol == "gmcp_r":
+            from gmcp.memory import update_memory
+            prev_mem = packet.get("prev_mem", self._initial_mem)
+            session_id = packet.get("session_id", self.session_id)
+            epoch = packet.get("epoch", self.epoch)
+            payload_hash = packet.get("payload_hash", "")
+            sender_id = packet.get("sender_id", self.sender_id)
+            self.client_state["last_mem"] = update_memory(
+                prev_mem, session_id, epoch, seq, payload_hash, sender_id
+            )
+
+        elif self.protocol in ("hash_chain", "authenticated_hash_chain"):
+            # Take chain_hash directly from the packet (client computed it)
+            self.client_state["last_hash"] = packet.get("chain_hash", "")
+
+        # seq_mac / ticket_only: only seq matters, already updated above
+
+        # --- Save server-reported state for comparison ---
+        self.server_state["last_seq"] = response.get("last_seq", seq)
+
+        if self.protocol == "gmcp_r":
+            mem = response.get("last_mem")
+            if mem:
+                self.server_state["last_mem"] = mem
+        elif self.protocol in ("hash_chain", "authenticated_hash_chain"):
+            h = response.get("last_hash")
+            if h:
+                self.server_state["last_hash"] = h
 
     def update_from_response(self, response: Dict[str, Any]) -> None:
-        """Update client-side state from a successful server response."""
+        """
+        Update client-side state directly from server response.
+
+        .. deprecated::
+            Use ``update_after_accept(packet, response)`` instead for
+            independent state tracking.  This method copies state from
+            the server response rather than computing it independently.
+            Kept for backward compatibility with
+            ``run_netem_validation.py``.
+        """
         if not response.get("ok"):
             return
 
@@ -332,24 +413,25 @@ class ProtocolAdapter:
             "client_final_hash": self.client_state.get("last_hash", ""),
         }
 
-    def check_state_match(self, server_response: Dict[str, Any]) -> bool:
+    def check_state_match(self, server_response: Optional[Dict[str, Any]] = None) -> bool:
         """
-        Compare client-tracked state against the server's final response.
+        Compare client-tracked state against the server's final state.
 
-        This is an *independent* check: the client has been maintaining its
-        own view of the state across all responses and now compares it
-        against what the server reports as its final state.
+        If *server_response* is None, uses the internally saved
+        ``self.server_state`` from ``update_after_accept()``.
         """
         client = self.get_client_final_state()
 
-        server_seq = server_response.get("last_seq", 0)
+        srv = server_response if server_response is not None else self.server_state
+
+        server_seq = srv.get("last_seq", 0)
         seq_match = client["client_final_seq"] == server_seq
 
         if self.protocol == "gmcp_r":
-            server_mem = server_response.get("last_mem", "")
+            server_mem = srv.get("last_mem", "")
             protocol_match = client["client_final_mem"] == server_mem
         elif self.protocol in ("hash_chain", "authenticated_hash_chain"):
-            server_hash = server_response.get("last_hash", "")
+            server_hash = srv.get("last_hash", "")
             protocol_match = client["client_final_hash"] == server_hash
         else:
             # seq_mac, ticket_only — only sequence matters
@@ -360,28 +442,30 @@ class ProtocolAdapter:
     def get_final_state_for_csv(self) -> Dict[str, Any]:
         """Return a dict of state audit fields suitable for CSV output."""
         client = self.get_client_final_state()
+        srv = self.server_state
+
         if self.protocol == "gmcp_r":
             return {
                 "client_final_seq": client["client_final_seq"],
-                "server_final_seq": client["client_final_seq"],
+                "server_final_seq": srv.get("last_seq", client["client_final_seq"]),
                 "client_final_mem": client["client_final_mem"],
-                "server_final_mem": client["client_final_mem"],
+                "server_final_mem": srv.get("last_mem", ""),
                 "client_final_hash": "",
                 "server_final_hash": "",
             }
         elif self.protocol in ("hash_chain", "authenticated_hash_chain"):
             return {
                 "client_final_seq": client["client_final_seq"],
-                "server_final_seq": client["client_final_seq"],
+                "server_final_seq": srv.get("last_seq", client["client_final_seq"]),
                 "client_final_mem": "",
                 "server_final_mem": "",
                 "client_final_hash": client["client_final_hash"],
-                "server_final_hash": client["client_final_hash"],
+                "server_final_hash": srv.get("last_hash", ""),
             }
         else:
             return {
                 "client_final_seq": client["client_final_seq"],
-                "server_final_seq": client["client_final_seq"],
+                "server_final_seq": srv.get("last_seq", client["client_final_seq"]),
                 "client_final_mem": "",
                 "server_final_mem": "",
                 "client_final_hash": "",

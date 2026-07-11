@@ -11,7 +11,7 @@
   5 protocols × 2 msg_counts × 2 payloads × 20 repeats = 400 rows
 
 使用方法：
-  服务端：python run_cross_host_validation.py --bind-host 0.0.0.0 --port 9001
+  服务端：python run_cross_host_validation.py --server-only --bind-host 0.0.0.0 --port 9001
   客户端：python run_cross_host_validation.py --host <server-ip> --port 9001 --no-spawn-server
 
 关键设计：
@@ -81,6 +81,7 @@ from gmcp.experiment_transport import (
     recv_json_line,
     get_git_metadata,
     get_server_env_info,
+    get_cpu_model,
 )
 
 # ---------------------------------------------------------------------------
@@ -263,6 +264,8 @@ def run_one_experiment(
             "server_python_version": ack.get("server_python_version", ""),
             "server_os_info": ack.get("server_os_info", ""),
             "server_hostname": ack.get("server_hostname", ""),
+            "server_git_dirty": ack.get("server_git_dirty", ""),
+            "server_cpu_model": ack.get("server_cpu_model", ""),
         }
 
         # Extract ticket for ticket_only protocol
@@ -292,8 +295,8 @@ def run_one_experiment(
 
                 if response.get("ok"):
                     accepted_count += 1
-                    # Update adapter state from server response
-                    adapter.update_from_response(response)
+                    # Update adapter: client state from packet, server state from response
+                    adapter.update_after_accept(packet, response)
                 else:
                     rejected_count += 1
 
@@ -332,13 +335,8 @@ def run_one_experiment(
     sequence_match = (adapter.last_seq == message_count)
 
     # Independent state comparison via ProtocolAdapter
-    # Build a synthetic "server final state" from the last known values
-    server_final = {
-        "last_seq": adapter.last_seq,
-        "last_mem": adapter.client_state.get("last_mem", ""),
-        "last_hash": adapter.client_state.get("last_hash", ""),
-    }
-    state_match = adapter.check_state_match(server_final) and sequence_match
+    # Uses internally saved server_state from update_after_accept()
+    state_match = adapter.check_state_match() and sequence_match
 
     # Memory/hash match for CSV columns
     if protocol == "gmcp_r":
@@ -398,11 +396,17 @@ def run_one_experiment(
         "git_commit": git_meta.get("git_commit", ""),
         "git_branch": git_meta.get("git_branch", ""),
         "git_dirty": git_meta.get("git_dirty", ""),
+        # Client environment info
+        "client_python_version": platform.python_version(),
+        "client_os_info": f"{platform.system()} {platform.release()}",
+        "client_cpu_model": git_meta.get("client_cpu_model", ""),
         # Server environment info (from HELLO_ACK)
         "server_git_commit": server_env.get("server_git_commit", ""),
         "server_python_version": server_env.get("server_python_version", ""),
         "server_os_info": server_env.get("server_os_info", ""),
         "server_hostname": server_env.get("server_hostname", ""),
+        "server_git_dirty": server_env.get("server_git_dirty", ""),
+        "server_cpu_model": server_env.get("server_cpu_model", ""),
     }
     return result
 
@@ -663,7 +667,8 @@ def main():
         action="store_true",
         help="Do NOT spawn an embedded server; connect to an external server at --host:--port",
     )
-    parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat only")
+    parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat only, output to smoke CSV")
+    parser.add_argument("--formal", action="store_true", help="Formal mode: full run with strict guards")
     parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
     parser.add_argument(
         "--server-only",
@@ -671,6 +676,11 @@ def main():
         help="Run as server only (listen for connections, do not run client experiments)",
     )
     args = parser.parse_args()
+
+    # --- Mutual exclusion: --quick and --formal ---
+    if args.quick and args.formal:
+        print("[ERROR] --quick and --formal are mutually exclusive.")
+        sys.exit(1)
 
     repeats = 1 if args.quick else (args.repeats or REPEAT_COUNT)
 
@@ -712,7 +722,7 @@ def main():
         if not ping_server(server_host, server_port):
             print("[FATAL] Cannot reach GMCP-R server. Refusing to generate data.")
             print("        Start the server first:")
-            print(f"        python run_cross_host_validation.py --bind-host 0.0.0.0 --port {server_port}")
+            print(f"        python run_cross_host_validation.py --server-only --bind-host 0.0.0.0 --port {server_port}")
             sys.exit(1)
         print("[CLIENT] Server is reachable.")
     else:
@@ -723,6 +733,29 @@ def main():
         srv = EmbeddedTCPServer(args.bind_host, server_port)
         srv.start()
         time.sleep(0.3)
+
+    # --- Formal mode guards ---
+    if args.formal:
+        if not args.no_spawn_server:
+            print("[ERROR] --formal requires --no-spawn-server (must connect to a real server).")
+            sys.exit(1)
+        network_path_check = classify_network_path(server_host)
+        if network_path_check == "loopback":
+            print("[ERROR] --formal requires a non-loopback network path.")
+            sys.exit(1)
+        client_hid = get_host_id()
+        # server_hostname is not known until HELLO_ACK; we can at least check != server_host
+        if client_hid == server_host:
+            print("[ERROR] --formal requires client_host_id != server_host.")
+            sys.exit(1)
+
+    # Determine output CSV based on mode
+    if args.formal:
+        output_csv = os.path.join(OUTPUT_DIR, "cross_host_results.csv")
+    elif args.quick:
+        output_csv = os.path.join(OUTPUT_DIR, "cross_host_smoke.csv")
+    else:
+        output_csv = OUTPUT_CSV  # default: cross_host_results.csv
 
     # Measure baseline RTT
     print("[INFO] Measuring baseline RTT ...")
@@ -735,9 +768,14 @@ def main():
 
     # Collect git metadata
     git_meta = get_git_metadata()
+    # Add client CPU model to git_meta for use in run_one_experiment
+    git_meta["client_cpu_model"] = get_cpu_model()
     print(f"[INFO] Git commit: {git_meta['git_commit'][:12] if git_meta['git_commit'] else 'N/A'}")
     print(f"[INFO] Git branch: {git_meta['git_branch'] or 'N/A'}")
     print(f"[INFO] Git dirty:  {git_meta['git_dirty'] or 'N/A'}")
+
+    # Capture command line
+    command_line = " ".join(sys.argv)
 
     ensure_output_dir()
 
@@ -757,16 +795,21 @@ def main():
         "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
         "timestamp",
         "git_commit", "git_branch", "git_dirty",
-        "server_git_commit", "server_python_version", "server_os_info", "server_hostname",
+        "client_python_version", "client_os_info", "client_cpu_model",
+        "server_git_commit", "server_python_version", "server_os_info",
+        "server_hostname", "server_git_dirty", "server_cpu_model",
+        "command_line",
     ]
 
     total = len(PROTOCOLS) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * repeats
+    mode_label = "formal" if args.formal else ("smoke" if args.quick else "default")
+    print(f"[INFO] Mode: {mode_label}")
     print(f"[INFO] Total experiments: {total}")
     print(f"[INFO] Protocols: {PROTOCOLS}")
     print(f"[INFO] Message counts: {MESSAGE_COUNTS}")
     print(f"[INFO] Payload sizes: {PAYLOAD_SIZES}")
     print(f"[INFO] Repeats: {repeats}")
-    print(f"[INFO] Output: {OUTPUT_CSV}")
+    print(f"[INFO] Output: {output_csv}")
     print()
 
     # Check if server is truly reachable (hard guard)
@@ -775,7 +818,7 @@ def main():
         sys.exit(1)
 
     # Atomic publish: write to .tmp, validate, then replace
-    tmp_csv = OUTPUT_CSV + ".tmp"
+    tmp_csv = output_csv + ".tmp"
     completed = 0
     failed = 0
     skipped = 0
@@ -809,6 +852,9 @@ def main():
                                 f"p={payload_size} r={repeat_id}: FAILED (skipped)"
                             )
                             continue
+
+                        # Inject command_line into each result
+                        result["command_line"] = command_line
 
                         writer.writerow(result)
                         f.flush()
@@ -844,6 +890,24 @@ def main():
             print("[VALIDATE] FAIL: git_dirty is not false for all rows")
             os.remove(tmp_csv)
             sys.exit(1)
+        # Formal mode: also check server_git_dirty
+        if args.formal:
+            server_dirty = any(
+                r.get("server_git_dirty") not in ("false", "False", False, "")
+                for r in rows
+            )
+            if server_dirty:
+                print("[VALIDATE] FAIL: server_git_dirty is not false for all rows")
+                os.remove(tmp_csv)
+                sys.exit(1)
+            client_dirty = any(
+                r.get("git_dirty") not in ("false", "False", False)
+                for r in rows
+            )
+            if client_dirty:
+                print("[VALIDATE] FAIL: client git_dirty is not false for all rows")
+                os.remove(tmp_csv)
+                sys.exit(1)
         print(f"[VALIDATE] OK: {len(rows)} rows, all run_valid=True, git_dirty=false")
     except Exception as e:
         print(f"[VALIDATE] FAIL: {e}")
@@ -852,8 +916,8 @@ def main():
         sys.exit(1)
 
     # Atomic replace
-    os.replace(tmp_csv, OUTPUT_CSV)
-    print(f"\n[DONE] Results atomically written to {OUTPUT_CSV}")
+    os.replace(tmp_csv, output_csv)
+    print(f"\n[DONE] Results atomically written to {output_csv}")
     print(f"[DONE] {completed} experiments completed, {failed} failed, {skipped} skipped.")
     if failed > 0:
         print(f"[WARN] {failed} experiments had errors and were excluded from results.")
