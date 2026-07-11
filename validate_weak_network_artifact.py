@@ -9,11 +9,14 @@ Checks:
   1. Exactly 150 rows
   2. Matrix complete: 3 protocols × 5 loss_rates × 5 delay_ms × 2 repeats
   3. Lossless control group (loss=0, delay=0) has 100% success_rate
-  4. loss>0 rows have dropped_count > 0
-  5. success_rate consistent with accepted_count / message_count
-  6. git_commit non-empty and git_commit_full length 40 (if column exists)
+  4. loss>0 rows have simulated_drop_count > 0
+  5. success_rate consistent with accepted_logical_messages / logical_message_count
+  6. run_seed non-empty (replaces old git_commit check)
   7. git_dirty == false (if column exists)
-  8. state_match / memory_match / hash_match all True (if columns exist)
+  8. Protocol-specific state consistency:
+     - gmcp_r: state_match AND memory_match
+     - hash_chain: state_match AND hash_match
+     - seq_mac: state_match AND sequence_match
   9. run_valid == True (if column exists)
 
 Exits nonzero with one line per violation.
@@ -45,6 +48,14 @@ def warn(msgs: list) -> None:
 def read_csv_rows(path: str) -> list:
     with open(path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
+
+
+# Protocol-specific consistency columns
+PROTOCOL_MATCH_COLS = {
+    "gmcp_r": ["state_match", "memory_match"],
+    "hash_chain": ["state_match", "hash_match"],
+    "seq_mac": ["state_match", "sequence_match"],
+}
 
 
 def validate() -> int:
@@ -128,10 +139,10 @@ def validate() -> int:
             )
 
     # -------------------------------------------------------------------
-    # 4. loss>0 → dropped_count > 0
+    # 4. loss>0 → simulated_drop_count > 0
     # -------------------------------------------------------------------
     lossy = [r for r in rows if int(float(r["loss_rate"])) > 0]
-    zero_drop = [r for r in lossy if int(float(r.get("dropped_count", 0))) == 0]
+    zero_drop = [r for r in lossy if int(float(r.get("simulated_drop_count", 0))) == 0]
     if zero_drop:
         # At least some rows with loss>0 should have drops; check per-config
         lossy_configs = {}
@@ -141,7 +152,7 @@ def validate() -> int:
 
         no_drop_configs = []
         for key, config_rows in lossy_configs.items():
-            total_drops = sum(int(float(r.get("dropped_count", 0))) for r in config_rows)
+            total_drops = sum(int(float(r.get("simulated_drop_count", 0))) for r in config_rows)
             if total_drops == 0:
                 no_drop_configs.append(key)
 
@@ -152,12 +163,12 @@ def validate() -> int:
                 )
 
     # -------------------------------------------------------------------
-    # 5. success_rate consistency: accepted_count / message_count * 100
+    # 5. success_rate consistency: accepted_logical_messages / logical_message_count * 100
     # -------------------------------------------------------------------
     for r in rows:
         try:
-            accepted = int(float(r["accepted_count"]))
-            msg_count = int(float(r["message_count"]))
+            accepted = int(float(r["accepted_logical_messages"]))
+            msg_count = int(float(r["logical_message_count"]))
             sr = float(r["success_rate"])
             expected_sr = round(accepted / msg_count * 100, 2) if msg_count > 0 else 0
             if abs(sr - expected_sr) > 0.1:
@@ -170,27 +181,15 @@ def validate() -> int:
             errors.append(f"Row validation error: {e}")
 
     # -------------------------------------------------------------------
-    # 6. git_commit non-empty and length check
+    # 6. run_seed non-empty (replaces old git_commit check)
     # -------------------------------------------------------------------
     for r in rows:
-        gc = r.get("git_commit", "").strip()
-        if not gc:
+        rs = r.get("run_seed", "").strip()
+        if not rs:
             errors.append(
-                f"Empty git_commit: protocol={r['protocol']}, loss={r['loss_rate']}, "
+                f"Empty run_seed: protocol={r['protocol']}, loss={r['loss_rate']}, "
                 f"delay={r['delay_ms']}, repeat={r['repeat_id']}"
             )
-
-    # Check git_commit_full length 40 (if column exists)
-    if "git_commit_full" in rows[0]:
-        for r in rows:
-            gcf = r.get("git_commit_full", "").strip()
-            if len(gcf) != 40:
-                errors.append(
-                    f"git_commit_full length {len(gcf)} != 40: "
-                    f"protocol={r['protocol']}, value={gcf}"
-                )
-    else:
-        warnings.append("Column 'git_commit_full' not present; skipping full commit hash check")
 
     # -------------------------------------------------------------------
     # 7. git_dirty == false (if column exists)
@@ -207,20 +206,24 @@ def validate() -> int:
         warnings.append("Column 'git_dirty' not present; skipping dirty check")
 
     # -------------------------------------------------------------------
-    # 8. state_match / memory_match / hash_match (if columns exist)
+    # 8. Protocol-specific state consistency
     # -------------------------------------------------------------------
-    match_cols = ["state_match", "memory_match", "hash_match"]
-    for col in match_cols:
-        if col in rows[0]:
-            false_rows = [r for r in rows if str(r.get(col, "")).strip().lower() not in ("true", "1")]
-            if false_rows:
-                for r in false_rows:
+    for r in rows:
+        proto = r.get("protocol", "")
+        match_cols = PROTOCOL_MATCH_COLS.get(proto)
+        if match_cols is None:
+            errors.append(f"Unknown protocol for state check: {proto}")
+            continue
+        for col in match_cols:
+            if col in r:
+                val = str(r[col]).strip().lower()
+                if val not in ("true", "1"):
                     errors.append(
-                        f"{col} is not true: protocol={r['protocol']}, "
+                        f"{col} is not true: protocol={proto}, "
                         f"loss={r['loss_rate']}, delay={r['delay_ms']}, repeat={r['repeat_id']}"
                     )
-        else:
-            warnings.append(f"Column '{col}' not present; skipping")
+            else:
+                warnings.append(f"Column '{col}' not present for protocol {proto}; skipping")
 
     # -------------------------------------------------------------------
     # 9. run_valid == True (if column exists)

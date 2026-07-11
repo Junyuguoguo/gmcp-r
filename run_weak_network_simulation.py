@@ -28,6 +28,7 @@ import socket
 import subprocess
 import sys
 import time
+import platform
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -163,9 +164,9 @@ def make_delay_schedule(run_seed: str, message_count: int, delay_ms: float) -> L
     return schedule
 
 
-def loss_schedule_hash(loss_schedule: List[bool]) -> str:
-    """计算丢包调度的哈希，用于审计"""
-    data = "".join("1" if d else "0" for d in loss_schedule)
+def loss_schedule_hash(drop_sequence: List[bool]) -> str:
+    """计算实际attempt级丢弃序列的哈希，用于审计"""
+    data = "".join("1" if d else "0" for d in drop_sequence)
     return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
@@ -185,6 +186,46 @@ def enable_tcp_nodelay(sock: socket.socket) -> None:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except Exception:
         pass
+
+
+def collect_git_metadata() -> Dict[str, Any]:
+    """收集 git 和环境元数据"""
+    meta = {}
+    try:
+        meta["git_commit_full"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        meta["git_commit_full"] = ""
+    try:
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        meta["git_dirty"] = "true" if dirty else "false"
+    except Exception:
+        meta["git_dirty"] = "unknown"
+    meta["command_line"] = " ".join(sys.argv)
+    meta["python_version"] = sys.version.split()[0]
+    meta["os_info"] = f"{platform.system()} {platform.release()}"
+    meta["hostname"] = platform.node()
+    return meta
+
+
+def check_git_dirty(allow_dirty: bool) -> None:
+    """检查 git worktree 是否 dirty，除非 --allow-dirty"""
+    if allow_dirty:
+        return
+    try:
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        if dirty:
+            raise RuntimeError(
+                "Git worktree is dirty. Commit or stash changes first, "
+                "or pass --allow-dirty to override."
+            )
+    except subprocess.CalledProcessError:
+        pass  # not in a git repo, skip check
 
 
 def recv_json_line(file_obj):
@@ -437,7 +478,12 @@ def run_one_experiment(
     # 2. 确定性调度
     loss_schedule = make_loss_schedule(run_seed, message_count, loss_rate)
     delay_schedule = make_delay_schedule(run_seed, message_count, delay_ms)
-    lsh = loss_schedule_hash(loss_schedule)
+
+    # 跟踪实际attempt级丢弃序列（Task 5）
+    actual_drop_sequence: List[bool] = []
+
+    # 存储最后一次成功服务器响应（Task 4）
+    last_successful_response: Dict[str, Any] = {}
 
     # 3. Session ID（确定性，基于 run_seed）
     session_id = f"weaknet-{protocol}-l{loss_rate}-d{delay_ms}-r{repeat_id}-{run_seed}"
@@ -520,11 +566,14 @@ def run_one_experiment(
                 if should_drop:
                     # 真正应用层丢弃：不调用 sendall
                     simulated_drop_count += 1
+                    actual_drop_sequence.append(True)
                     # 注入配置延迟
                     if configured_delay > 0:
                         injected_delay_list.append(configured_delay)
                         time.sleep(configured_delay / 1000.0)
                     continue  # 重试同一条消息
+
+                actual_drop_sequence.append(False)
 
                 # 重建包（本地状态未变，同一个 seq）
                 packet = build_packet_for_protocol(
@@ -550,6 +599,7 @@ def run_one_experiment(
                     if response.get("ok"):
                         accepted_logical_messages += 1
                         update_state_after_accept(protocol, state, seq, packet, response)
+                        last_successful_response = dict(response)
                         accepted = True
                         break
                     else:
@@ -574,17 +624,16 @@ def run_one_experiment(
 
     elapsed = time.time() - start_time
 
-    # 最后一次响应（用于审计，如果有的话）
-    last_response = {
-        "last_seq": state["last_seq"],
-    }
-    if protocol == "gmcp_r":
-        last_response["last_mem"] = state.get("last_mem", "")
-    elif protocol == "hash_chain":
-        last_response["last_hash"] = state.get("last_hash", "")
+    # 计算实际attempt级丢弃序列的哈希（Task 5）
+    lsh = loss_schedule_hash(actual_drop_sequence)
 
+    # 使用真实服务器最后一次成功响应做审计（Task 4）
+    if last_successful_response:
+        audit_response = last_successful_response
+    else:
+        audit_response = {"last_seq": 0}
     # 协议状态审计
-    audit = get_protocol_audit(protocol, state, last_response)
+    audit = get_protocol_audit(protocol, state, audit_response)
 
     # 统计
     success_rate = (accepted_logical_messages / logical_message_count * 100
@@ -688,6 +737,8 @@ FIELDNAMES = [
     "client_final_hash", "server_final_hash", "hash_match",
     "sequence_match",
     "elapsed_seconds",
+    "git_commit_full", "git_dirty",
+    "command_line", "python_version", "os_info", "hostname",
 ]
 
 
@@ -787,7 +838,7 @@ def run_smoke_test(args) -> bool:
 # 正式实验
 # =========================
 
-def run_formal_experiments(args) -> Tuple[List[Dict[str, Any]], str]:
+def run_formal_experiments(args, git_meta: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
     """运行完整 150 行正式实验"""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -846,7 +897,8 @@ def run_formal_experiments(args) -> Tuple[List[Dict[str, Any]], str]:
                             print(f"VALIDATION: {msg}")
                             failed += 1
                             continue
-
+                        # 添加 git 元数据
+                        result.update(git_meta)
                         results.append(result)
 
                         status = (
@@ -884,20 +936,17 @@ def run_formal_experiments(args) -> Tuple[List[Dict[str, Any]], str]:
 # =========================
 
 def atomic_publish(results: List[Dict[str, Any]], formal_csv: str,
-                   paper_output: str):
+                   paper_output: str, expected_rows: int):
     """
     原子发布到 paper_data/:
     1. 验证行数
     2. 写入临时文件
     3. os.replace 到目标
     """
-    expected_rows = len(PROTOCOLS) * len(LOSS_RATES) * len(DELAY_MS) * len(range(1, 3))
-
     if len(results) != expected_rows:
-        print(
-            f"[PUBLISH] WARNING: Expected {expected_rows} rows, got {len(results)}. "
-            f"Publishing anyway.",
-            flush=True,
+        raise RuntimeError(
+            f"[PUBLISH] Expected {expected_rows} rows, got {len(results)}. "
+            f"Refusing to publish incomplete results."
         )
 
     # 确保目录存在
@@ -934,10 +983,19 @@ def atomic_publish(results: List[Dict[str, Any]], formal_csv: str,
 def main():
     args = parse_args()
 
+    # --allow-dirty 检查（Task 3）
+    check_git_dirty(args.allow_dirty)
+
+    # 收集 git 元数据（Task 3）
+    git_meta = collect_git_metadata()
+
     # 设置全局重试参数
     global MAX_RETRIES, RETRY_DELAY_MS
     MAX_RETRIES = args.max_retries
     RETRY_DELAY_MS = args.retry_delay_ms
+
+    # 计算 expected_rows
+    expected_rows = len(PROTOCOLS) * len(LOSS_RATES) * len(DELAY_MS) * args.repeats
 
     # 确定需要哪些服务器
     need_baseline_server = True  # 所有协议都走 baseline_server（port 9001）
@@ -963,11 +1021,11 @@ def main():
                 print("[PREFLIGHT] Smoke test FAILED. Aborting.", flush=True)
                 return 1
 
-            results, formal_csv = run_formal_experiments(args)
+            results, formal_csv = run_formal_experiments(args, git_meta)
 
             # 原子发布
             if results:
-                atomic_publish(results, formal_csv, args.paper_output)
+                atomic_publish(results, formal_csv, args.paper_output, expected_rows)
 
             return 0
 
@@ -975,10 +1033,10 @@ def main():
         if not run_smoke_test(args):
             return 1
 
-        results, formal_csv = run_formal_experiments(args)
+        results, formal_csv = run_formal_experiments(args, git_meta)
 
         if results:
-            atomic_publish(results, formal_csv, args.paper_output)
+            atomic_publish(results, formal_csv, args.paper_output, expected_rows)
 
         return 0
 

@@ -197,10 +197,10 @@ def build_summary() -> str:
         )
 
     gmcp_tp = df03[df03["protocol"] == "gmcp_r"]["throughput_msg_per_sec"].mean()
-    # Compute actual overhead vs lowest baseline
+    # Compute actual overhead vs fastest baseline
     baselines_perf = df03[df03["protocol"] != "gmcp_r"].groupby("protocol")["throughput_msg_per_sec"].mean()
-    min_baseline_tp = baselines_perf.min() if len(baselines_perf) > 0 else 0
-    overhead_us = ((1 / min_baseline_tp - 1 / gmcp_tp) * 1e6) if gmcp_tp > 0 and min_baseline_tp > 0 else 0
+    fastest_baseline_tp = baselines_perf.max() if len(baselines_perf) > 0 else 0
+    overhead_us = ((1 / gmcp_tp - 1 / fastest_baseline_tp) * 1e6) if gmcp_tp > 0 and fastest_baseline_tp > 0 else 0
     sections.append(
         f"\nGMCP-R achieves ~{fmt_num(gmcp_tp)} msg/s in local computation, "
         f"with ~{overhead_us:.0f} µs per-message overhead vs. the fastest baseline. "
@@ -228,8 +228,10 @@ def build_summary() -> str:
     conc_tp = df04.groupby("concurrency")["overall_throughput_msg_per_sec"].mean()
     peak_conc = conc_tp.idxmax()
     sections.append(
-        f"\nThroughput peaks at {peak_conc} concurrent client(s) and degrades slightly at higher "
-        "concurrency due to single-threaded TCP accept overhead.\n"
+        f"\nThroughput peaks at {peak_conc} concurrent client(s) and subsequently "
+        "degrades at higher concurrency. The cause may involve server implementation "
+        "characteristics, interpreter scheduling, and local resource contention; "
+        "no performance profiling has been conducted to establish a definitive cause.\n"
     )
 
     # ── Weak-Network Simulation ────────────────────────────────────────────
