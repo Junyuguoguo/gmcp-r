@@ -343,21 +343,12 @@ def run_one_experiment(
     # Uses internally saved server_state from update_after_accept()
     state_match = adapter.check_state_match() and sequence_match
 
-    # Memory/hash match for CSV columns
-    if protocol == "gmcp_r":
-        memory_match = bool(adapter.client_state.get("last_mem"))
-        hash_match = True
-    elif protocol in ("hash_chain", "authenticated_hash_chain"):
-        memory_match = True
-        hash_match = bool(adapter.client_state.get("last_hash"))
-    else:
-        memory_match = True
-        hash_match = True
-
     run_valid = (accepted_count == message_count) and (unrecovered == 0) and state_match
 
-    # Get state audit fields from adapter
+    # Get state audit fields from adapter (includes real memory/hash match)
     state_fields = adapter.get_final_state_for_csv()
+    memory_match = state_fields.get("memory_match", "")
+    hash_match = state_fields.get("hash_match", "")
 
     result = {
         "session_id": session_id,

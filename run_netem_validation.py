@@ -837,6 +837,8 @@ def main():
     # ---- Formal mode validation ----
     if args.formal:
         if args.conditions is not None:
+            if args.quick and args.formal:
+                parser.error('--quick and --formal are mutually exclusive')
             parser.error('--formal cannot use --conditions subset')
         if args.repeats is not None and args.repeats != 10:
             parser.error('--formal requires 10 repeats')
@@ -929,13 +931,7 @@ def main():
 
     # Collect metadata once (client-side)
     git_commit = get_git_commit()
-    git_dirty = False
-    try:
-        import subprocess as _sp
-        _d = _sp.check_output(["git", "status", "--porcelain"], stderr=_sp.DEVNULL, text=True).strip()
-        git_dirty = bool(_d)
-    except Exception:
-        pass
+    git_dirty = get_git_dirty()  # fail-closed: returns True on error
     python_version = get_python_version()
     os_info = get_os_info()
     command_line = get_command_line()
@@ -1106,19 +1102,19 @@ def main():
                 sane_issues.append(f"row {i}: success_rate={sr} out of range")
             # Git commit length must be 40
             gc = row.get("server_git_commit", "")
-            if gc and len(gc) != 40:
+            if not gc or len(gc) != 40:
                 issues.append(f"row {i}: server_git_commit length={len(gc)} (expected 40)")
             # Git dirty must be false
             gd = row.get("server_git_dirty", "")
-            if gd and gd not in ("false", "False", ""):
+            if str(gd).lower() != "false":
                 issues.append(f"row {i}: server_git_dirty={gd} (expected false)")
             # Client git commit length must be 40
             cgc = row.get("client_git_commit", "")
-            if cgc and len(cgc) != 40:
+            if not cgc or len(cgc) != 40:
                 issues.append(f"row {i}: client_git_commit length={len(cgc)} (expected 40)")
             # Client git dirty must be false
             cgd = row.get("client_git_dirty", "")
-            if cgd and cgd not in ("false", "False", ""):
+            if str(cgd).lower() != "false":
                 issues.append(f"row {i}: client_git_dirty={cgd} (expected false)")
             # Control conditions must not have netem
             if row.get("condition_name") == "control":
