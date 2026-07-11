@@ -832,13 +832,14 @@ def main():
     parser.add_argument("--conditions", default=None, help="Comma-separated condition names to run")
     args = parser.parse_args()
 
+    if args.quick and args.formal:
+        parser.error("--quick and --formal are mutually exclusive")
+
     repeats = 1 if args.quick else (args.repeats or REPEAT_COUNT)
 
     # ---- Formal mode validation ----
     if args.formal:
         if args.conditions is not None:
-            if args.quick and args.formal:
-                parser.error('--quick and --formal are mutually exclusive')
             parser.error('--formal cannot use --conditions subset')
         if args.repeats is not None and args.repeats != 10:
             parser.error('--formal requires 10 repeats')
