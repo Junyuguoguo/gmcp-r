@@ -374,5 +374,132 @@ class PaperDataConsistencyTests(unittest.TestCase):
         self.assertEqual(rates["gmcp_r"]["total"], 2)
 
 
+class ReleaseArtifactTests(unittest.TestCase):
+    """Tests for release artifact integrity and paper content correctness."""
+
+    PAPER_DATA_DIR = Path("paper_data")
+
+    EXPECTED_CSV_ROWS = {
+        "01_real_baseline.csv": 7200,
+        "02_ticket_attacks.csv": 300,
+        "03_performance.csv": 1200,
+        "04_concurrency.csv": 150,
+        "05_weak_network.csv": 150,
+        "06_memory_ticket_recovery.csv": 900,
+        "07_checkpoint_recovery.csv": 120,
+        "08_recovery_window.csv": 760,
+        "09_checkpoint_cost.csv": 2160,
+    }
+
+    def test_total_data_rows_12940(self):
+        """Check that all 9 CSVs total exactly 12,940 data rows."""
+        total = 0
+        for fname, expected in self.EXPECTED_CSV_ROWS.items():
+            path = self.PAPER_DATA_DIR / fname
+            with path.open(newline="", encoding="utf-8") as f:
+                count = sum(1 for _ in csv.DictReader(f))
+            self.assertEqual(
+                count, expected,
+                f"{fname}: expected {expected} rows, got {count}"
+            )
+            total += count
+        self.assertEqual(total, 12940, f"Total rows expected 12940, got {total}")
+
+    def test_baseline_summary_denominator(self):
+        """Check baseline summary denominator uses applicable+injected+sent."""
+        path = self.PAPER_DATA_DIR / "01_real_baseline.csv"
+        with path.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+        by_protocol = defaultdict(list)
+        for row in rows:
+            by_protocol[row["protocol"]].append(row)
+
+        for protocol, prows in by_protocol.items():
+            # The denominator for detection rate should only include rows where
+            # attack_applicable=True AND attack_injected=True
+            attacks = [
+                r for r in prows
+                if r["attack_type"] != "none"
+                and str(r.get("attack_applicable", "")).lower() == "true"
+                and str(r.get("attack_injected", "")).lower() == "true"
+            ]
+            # For seq_mac, forged_prev_mem_valid_mac is not applicable
+            if protocol == "seq_mac":
+                non_applicable = [
+                    r for r in prows
+                    if r["attack_type"] == "forged_prev_mem_valid_mac"
+                    and str(r.get("attack_applicable", "")).lower() == "false"
+                ]
+                self.assertTrue(
+                    len(non_applicable) > 0,
+                    f"seq_mac should mark forged_prev_mem_valid_mac as not applicable"
+                )
+
+    def test_na_rows_not_in_denominator(self):
+        """Check that N/A (not applicable) rows do not enter the denominator."""
+        path = self.PAPER_DATA_DIR / "01_real_baseline.csv"
+        with path.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+        # seq_mac + forged_prev_mem_valid_mac should be marked not applicable
+        na_rows = [
+            r for r in rows
+            if r["protocol"] == "seq_mac"
+            and r["attack_type"] == "forged_prev_mem_valid_mac"
+            and str(r.get("attack_applicable", "")).lower() == "false"
+        ]
+        self.assertGreater(len(na_rows), 0, "Expected N/A rows for seq_mac forged_prev_mem")
+
+        # All such rows should NOT be counted in detection denominator
+        for r in na_rows:
+            self.assertEqual(
+                str(r.get("attack_applicable", "")).lower(), "false",
+                "N/A rows must have attack_applicable=False"
+            )
+
+    def test_paper_contains_five_protocols(self):
+        """Paper must mention all five protocols."""
+        paper = Path("paper/main_zh.md")
+        self.assertTrue(paper.is_file(), "paper/main_zh.md not found")
+        content = paper.read_text(encoding="utf-8")
+        protocols = [
+            "GMCP-R", "Hash Chain", "Authenticated Hash Chain",
+            "Seq+MAC", "Ticket Only",
+        ]
+        for proto in protocols:
+            self.assertIn(proto, content, f"Paper missing protocol: {proto}")
+
+    def test_paper_contains_authenticated_hash_chain(self):
+        """Paper must specifically contain 'Authenticated Hash Chain'."""
+        paper = Path("paper/main_zh.md")
+        content = paper.read_text(encoding="utf-8")
+        self.assertIn("Authenticated Hash Chain", content)
+
+    def test_paper_no_old_seqmac_25_percent(self):
+        """Paper must not contain stale 'Seq+MAC 25%' conclusion."""
+        paper = Path("paper/main_zh.md")
+        content = paper.read_text(encoding="utf-8")
+        self.assertNotIn("Seq+MAC 25%", content)
+
+    def test_performance_30_repeats(self):
+        """Performance experiment uses 30 repeats per config."""
+        path = self.PAPER_DATA_DIR / "03_performance.csv"
+        with path.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        repeat_ids = set(int(r["repeat_id"]) for r in rows)
+        self.assertEqual(max(repeat_ids), 30)
+        self.assertEqual(min(repeat_ids), 1)
+
+    def test_concurrency_30_repeats(self):
+        """Concurrency experiment uses 30 repeats per config."""
+        path = self.PAPER_DATA_DIR / "04_concurrency.csv"
+        with path.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        repeat_ids = set(int(r["repeat_id"]) for r in rows)
+        self.assertEqual(max(repeat_ids), 30)
+        self.assertEqual(min(repeat_ids), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

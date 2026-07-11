@@ -28,7 +28,7 @@ Total paper-facing data rows: 12,940.
 
 ### Baseline Comparison
 
-Source: `results/real_baseline_comparison/summary_real_baseline_comparison_v2.csv`
+Source: `paper_data/01_real_baseline.csv` (30 repeats per config, recomputed)
 
 | Protocol | Normal Throughput | Normal RTT | Attack Detection | False Accept |
 |---|---:|---:|---:|---:|

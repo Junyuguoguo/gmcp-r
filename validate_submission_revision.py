@@ -60,10 +60,11 @@ def recompute_baseline_summary(rows: List[Dict[str, str]]) -> Dict[str, Dict[str
     for protocol, prows in by_protocol.items():
         normal = [r for r in prows if r.get("attack_type") == "none"]
         attacks = [
-            r for r in prows
-            if r.get("attack_type") != "none"
-            and parse_bool(r.get("attack_applicable", "True"))
-            and parse_bool(r.get("attack_injected", "False"))
+            row for row in prows
+            if row.get("attack_type") != "none"
+            and parse_bool(row.get("attack_applicable"))
+            and parse_bool(row.get("attack_injected"))
+            and parse_bool(row.get("attack_packet_sent"))
         ]
 
         normal_throughput = (
@@ -77,16 +78,25 @@ def recompute_baseline_summary(rows: List[Dict[str, str]]) -> Dict[str, Dict[str
 
         detected = sum(
             1 for r in attacks
-            if str(r.get("attack_detected_by_server", "")).lower() == "true"
+            if parse_bool(r.get("attack_packet_rejected"))
         )
+        false_accept = sum(
+            1 for r in attacks
+            if parse_bool(r.get("attack_packet_accepted"))
+        )
+        if attacks and detected + false_accept != len(attacks):
+            raise ValueError(
+                f"{protocol}: detected ({detected}) + false_accept ({false_accept}) "
+                f"!= attack_count ({len(attacks)})"
+            )
         detection_rate = detected / len(attacks) * 100 if attacks else 0
-        false_accept = (len(attacks) - detected) / len(attacks) * 100 if attacks else 0
+        false_accept_rate = false_accept / len(attacks) * 100 if attacks else 0
 
         summaries[protocol] = {
             "normal_throughput": round(normal_throughput, 2),
             "normal_rtt": round(normal_rtt, 3),
             "attack_detection_rate": round(detection_rate, 3),
-            "false_accept_rate": round(false_accept, 3),
+            "false_accept_rate": round(false_accept_rate, 3),
             "normal_count": len(normal),
             "attack_count": len(attacks),
         }
