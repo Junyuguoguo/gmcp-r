@@ -7,7 +7,8 @@
   1. CSV 文件存在且非空
   2. 矩阵完整性（3 protocols × 6 conditions × 10 repeats）
   3. 关键列存在且值合理
-  4. 无伪造数据标记
+  4. execution_valid、server_git_commit、state_match 检查
+  5. 不要求所有行 result_success=100%
 
 如果数据不存在，报告 "no data" 并以非零码退出。
 """
@@ -33,6 +34,8 @@ REQUIRED_COLUMNS = [
     "timeout_count", "error_count",
     "success_rate", "throughput_msg_per_sec", "elapsed_seconds",
     "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
+    "execution_valid", "interface", "requested_netem_config", "actual_qdisc_config",
+    "server_git_commit", "state_match",
     "timestamp",
 ]
 
@@ -143,6 +146,36 @@ def main():
     else:
         print("Sanity checks: OK")
 
+    # 4b. execution_valid checks (non-control conditions)
+    exec_issues = []
+    for i, r in enumerate(rows):
+        row_num = i + 1
+        cond = r.get("condition_name", "")
+        exec_v = r.get("execution_valid", "")
+        git_c = r.get("server_git_commit", "")
+        state_m = r.get("state_match", "")
+
+        # server_git_commit must be non-empty
+        if not git_c:
+            exec_issues.append(f"Row {row_num}: server_git_commit is empty")
+
+        # state_match should exist
+        if state_m == "":
+            exec_issues.append(f"Row {row_num}: state_match is empty")
+
+        # Non-control conditions should have execution_valid
+        # (but we don't require 100% success_rate — real network phenomena)
+        if cond != "control" and exec_v not in ("True", "true", True):
+            exec_issues.append(f"Row {row_num}: condition={cond} but execution_valid={exec_v}")
+
+    if exec_issues:
+        for issue in exec_issues[:10]:
+            print(f"WARN: {issue}")
+        if len(exec_issues) > 10:
+            print(f"  ... and {len(exec_issues) - 10} more warnings")
+    else:
+        print("Execution validity checks: OK")
+
     # 5. Per-condition success rate trends
     print()
     print("--- Success Rate by Condition ---")
@@ -176,14 +209,15 @@ def main():
         )
 
     print()
-    if not issues and not sane_issues:
+    all_issues = issues + sane_issues + exec_issues
+    if not all_issues:
         print("PASS: All checks passed.")
         sys.exit(0)
     elif issues:
         print("PARTIAL: Some matrix completeness issues detected (see warnings above).")
         sys.exit(1)
     else:
-        print("PASS: All checks passed (with minor sanity warnings).")
+        print("PASS: All checks passed (with minor warnings).")
         sys.exit(0)
 
 

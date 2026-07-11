@@ -5,14 +5,15 @@
 
 强制检查项：
   1. CSV 文件存在且非空
-  2. 矩阵完整性（4 protocols × 2 msg_counts × 2 payloads × 20 repeats = 320 行）
+  2. 矩阵完整性（5 protocols × 2 msg_counts × 2 payloads × 20 repeats = 400 行）
   3. 无重复组合
   4. run_valid = True（所有行）
   5. git_dirty = false（所有行）
   6. git_commit 长度 = 40
-  7. state_match = True（所有行）
+  7. state_match = True（所有行）— 独立比较
   8. accepted == message_count（所有行）
   9. rejected == 0, timeout == 0, error == 0（所有行）
+ 10. server_git_commit 非空（所有行）
 
 如果数据不存在，报告 "no data" 并以非零码退出。
 """
@@ -25,16 +26,16 @@ from collections import defaultdict
 
 CSV_PATH = "results/cross_host/cross_host_results.csv"
 
-EXPECTED_PROTOCOLS = {"gmcp_r", "seq_mac", "hash_chain", "authenticated_hash_chain"}
+EXPECTED_PROTOCOLS = {"gmcp_r", "seq_mac", "hash_chain", "authenticated_hash_chain", "ticket_only"}
 EXPECTED_MSG_COUNTS = {500, 1000}
 EXPECTED_PAYLOAD_SIZES = {128, 512}
 EXPECTED_REPEATS = set(range(1, 21))  # 1..20
-EXPECTED_TOTAL = 4 * 2 * 2 * 20  # 320
+EXPECTED_TOTAL = 5 * 2 * 2 * 20  # 400
 
 REQUIRED_COLUMNS = [
     "session_id", "experiment_type", "protocol",
     "client_host_id", "server_host_id", "network_path_type",
-    "server_host", "server_port", "baseline_ping_rtt_ms",
+    "server_host", "server_port", "tcp_connect_latency_ms",
     "message_count", "payload_size", "repeat_id",
     "sent_count", "accepted_count", "rejected_count",
     "timeout_count", "error_count",
@@ -47,6 +48,7 @@ REQUIRED_COLUMNS = [
     "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
     "timestamp",
     "git_commit", "git_branch", "git_dirty",
+    "server_git_commit", "server_python_version", "server_os_info", "server_hostname",
 ]
 
 
@@ -84,7 +86,7 @@ def main():
     else:
         print(f"Columns: OK ({len(actual_cols)} columns, all required columns present)")
 
-    # 3. Matrix completeness (320 rows)
+    # 3. Matrix completeness (400 rows)
     if len(rows) != EXPECTED_TOTAL:
         errors.append(f"Row count: expected {EXPECTED_TOTAL}, got {len(rows)}")
     else:
@@ -142,10 +144,10 @@ def main():
         if len(gc) != 40:
             errors.append(f"Row {row_num}: git_commit length={len(gc)} (must be 40)")
 
-        # state_match must be True
+        # state_match must be True (independent comparison)
         sm = r.get("state_match", "")
         if str(sm).lower() != "true":
-            errors.append(f"Row {row_num}: state_match={sm} (must be True)")
+            errors.append(f"Row {row_num}: state_match={sm} (must be True, independent comparison)")
 
         # accepted == message_count
         acc = int(r.get("accepted_count", 0))
@@ -172,6 +174,11 @@ def main():
         seqm = r.get("sequence_match", "True")
         if str(seqm).lower() != "true":
             errors.append(f"Row {row_num}: sequence_match={seqm} (must be True)")
+
+        # server_git_commit must be non-empty
+        sgc = r.get("server_git_commit", "")
+        if not sgc:
+            errors.append(f"Row {row_num}: server_git_commit is empty (must be non-empty)")
 
     # Report results
     print()
@@ -205,11 +212,12 @@ def main():
 
         print()
         print("PASS: All checks passed.")
-        print(f"  - {len(rows)} rows, matrix complete (320)")
+        print(f"  - {len(rows)} rows, matrix complete ({EXPECTED_TOTAL})")
         print(f"  - All run_valid=True")
         print(f"  - All git_dirty=false, git_commit=40 chars")
-        print(f"  - All state_match=True")
+        print(f"  - All state_match=True (independent comparison)")
         print(f"  - All accepted=message_count, rejected=0, timeout=0, error=0")
+        print(f"  - All server_git_commit non-empty")
         print(f"  - No duplicate combinations")
         sys.exit(0)
 

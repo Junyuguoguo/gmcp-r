@@ -4,11 +4,11 @@
 跨主机实验验证框架
 ==================
 
-在两台主机（client, server）之间运行 GMCP-R 协议实验，测量真实网络 RTT、
+在两台主机（client, server）之间运行协议实验，测量真实网络 RTT、
 吞吐量和成功率。
 
 矩阵：
-  4 protocols × 2 msg_counts × 2 payloads × 20 repeats = 320 rows
+  5 protocols × 2 msg_counts × 2 payloads × 20 repeats = 400 rows
 
 使用方法：
   服务端：python run_cross_host_validation.py --bind-host 0.0.0.0 --port 9001
@@ -16,11 +16,13 @@
 
 关键设计：
   - 没有真实服务器连接时，拒绝生成伪造数据
-  - 记录 client_host_id, server_host_id, network_path_type, baseline_ping_rtt_ms
+  - 记录 client_host_id, server_host_id, network_path_type, tcp_connect_latency_ms
   - HELLO 握手建立会话（protocol/session_id/sender_id/epoch）
-  - 内置服务器对每种协议进行完整验证（MAC/哈希链/HMAC）
+  - 内置服务器对每种协议进行完整验证（MAC/哈希链/HMAC/ticket）
+  - 使用 ProtocolAdapter 做独立状态审计
   - run_valid 字段标识有效实验结果
   - 异常时标记 run 失败，不写入 CSV
+  - 记录服务端环境信息（git_commit, python_version, os_info, hostname）
 """
 
 import argparse
@@ -30,11 +32,9 @@ import os
 import platform
 import signal
 import socket
-import subprocess
 import sys
 import time
 import threading
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,27 +46,41 @@ from gmcp.config import (
     EPOCH,
     CLIENT_ID,
 )
-from gmcp.crypto_utils import hash_text, hmac_sha256_hex
+from gmcp.crypto_utils import verify_tagged_hmac
 from gmcp.memory import initial_memory
-from gmcp.packet import build_data_packet
 from gmcp.protocol import GMCPState, GMCPVerifier
 
 # Baseline protocol builders and verifiers
 from gmcp.baselines.seq_mac import (
-    build_data_packet as seq_mac_build,
     SeqMACState,
     SeqMACVerifier,
 )
 from gmcp.baselines.hash_chain import (
-    build_data_packet as hc_build,
     HashChainState,
     HashChainVerifier,
     hash_func as hc_hash_func,
 )
 from gmcp.baselines.authenticated_hash_chain import (
-    build_data_packet as ahc_build,
     AuthHashChainState,
     AuthHashChainVerifier,
+)
+from gmcp.baselines.ticket_only import (
+    TicketOnlyState,
+    TicketOnlyVerifier,
+    issue_ticket,
+)
+
+# Shared transport module
+from gmcp.experiment_transport import (
+    WIRE_PROTOCOL_NAMES,
+    DISPLAY_PROTOCOL_NAMES,
+    ALL_PROTOCOLS,
+    ProtocolAdapter,
+    send_hello,
+    send_json_line,
+    recv_json_line,
+    get_git_metadata,
+    get_server_env_info,
 )
 
 # ---------------------------------------------------------------------------
@@ -75,7 +89,7 @@ from gmcp.baselines.authenticated_hash_chain import (
 OUTPUT_DIR = "results/cross_host"
 OUTPUT_CSV = os.path.join(OUTPUT_DIR, "cross_host_results.csv")
 
-PROTOCOLS = ["gmcp_r", "seq_mac", "hash_chain", "authenticated_hash_chain"]
+PROTOCOLS = ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]
 MESSAGE_COUNTS = [500, 1000]
 PAYLOAD_SIZES = [128, 512]
 REPEAT_COUNT = 20
@@ -142,18 +156,6 @@ def make_payload(seq: int, payload_size: int) -> str:
     return prefix + ("x" * remain)
 
 
-def send_json_line(sock: socket.socket, packet: Dict[str, Any]):
-    raw = json.dumps(packet, ensure_ascii=False).encode("utf-8") + b"\n"
-    sock.sendall(raw)
-
-
-def recv_json_line(file_obj) -> Dict[str, Any]:
-    line = file_obj.readline()
-    if not line:
-        raise ConnectionError("server closed connection")
-    return json.loads(line)
-
-
 def enable_tcp_nodelay(sock: socket.socket):
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -188,44 +190,6 @@ def close_tcp(sock, file_obj):
         pass
 
 
-def send_hello(
-    sock: socket.socket,
-    file_obj,
-    protocol: str,
-    session_id: str,
-    sender_id: str,
-    epoch: int,
-) -> Dict[str, Any]:
-    """Send HELLO handshake with auth_tag and validate response. Raises on failure."""
-    client_nonce = uuid.uuid4().hex[:16]
-    timestamp = datetime.now(timezone.utc).isoformat()
-    hello: Dict[str, Any] = {
-        "type": "HELLO",
-        "protocol": protocol,
-        "session_id": session_id,
-        "sender_id": sender_id,
-        "epoch": epoch,
-        "client_nonce": client_nonce,
-        "timestamp": timestamp,
-    }
-    # Compute HMAC over all fields except auth_tag itself
-    hello["auth_tag"] = hmac_sha256_hex(DATA_AUTH_KEY, hello)
-    send_json_line(sock, hello)
-    resp = recv_json_line(file_obj)
-    if not resp.get("ok"):
-        raise RuntimeError(
-            f"HELLO rejected by server: {resp.get('reason', 'unknown')}"
-        )
-    # Validate HELLO_ACK structure
-    if resp.get("type") != "HELLO_ACK":
-        raise RuntimeError(f"Expected HELLO_ACK, got: {resp.get('type')}")
-    if resp.get("protocol") != protocol:
-        raise RuntimeError(
-            f"HELLO_ACK protocol mismatch: {resp.get('protocol')} != {protocol}"
-        )
-    return resp
-
-
 def ping_server(host: str, port: int) -> bool:
     """Test if the GMCP-R TCP server is reachable."""
     try:
@@ -240,97 +204,6 @@ def ping_server(host: str, port: int) -> bool:
         return resp.get("ok") is True
     except Exception:
         return False
-
-
-def get_git_metadata() -> Dict[str, str]:
-    """Get git metadata for reproducibility."""
-    meta = {"git_commit": "", "git_branch": "", "git_dirty": ""}
-    try:
-        meta["git_commit"] = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        meta["git_branch"] = subprocess.check_output(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        meta["git_dirty"] = "true" if dirty else "false"
-    except Exception:
-        pass
-    return meta
-
-
-# ---------------------------------------------------------------------------
-# Protocol-specific packet builders
-# ---------------------------------------------------------------------------
-
-def build_packet_for_protocol(
-    protocol: str,
-    session_id: str,
-    seq: int,
-    payload: str,
-    current_mem: str,
-) -> Dict[str, Any]:
-    """Build a data packet for the specified protocol."""
-    if protocol == "gmcp_r":
-        return build_data_packet(
-            session_id=session_id,
-            sender_id=CLIENT_ID,
-            epoch=EPOCH,
-            seq=seq,
-            prev_mem=current_mem,
-            payload=payload,
-        )
-    elif protocol == "seq_mac":
-        return seq_mac_build(
-            session_id=session_id,
-            sender_id=CLIENT_ID,
-            epoch=EPOCH,
-            seq=seq,
-            payload=payload,
-        )
-    elif protocol == "hash_chain":
-        return hc_build(
-            session_id=session_id,
-            sender_id=CLIENT_ID,
-            epoch=EPOCH,
-            seq=seq,
-            prev_hash=current_mem,
-            payload=payload,
-        )
-    elif protocol == "authenticated_hash_chain":
-        return ahc_build(
-            session_id=session_id,
-            sender_id=CLIENT_ID,
-            epoch=EPOCH,
-            seq=seq,
-            prev_hash=current_mem,
-            payload=payload,
-        )
-    else:
-        raise ValueError(f"Unknown protocol: {protocol}")
-
-
-def get_initial_state(protocol: str, session_id: str) -> Tuple[str, Any]:
-    """
-    Return (initial_memory_value, state_or_none) for the protocol.
-
-    Must match the server-side initial state computation exactly.
-    """
-    if protocol in ("gmcp_r",):
-        mem = initial_memory(session_id, CLIENT_ID, EPOCH, "demo-seed")
-        return mem, None
-    elif protocol == "seq_mac":
-        return "", None
-    elif protocol in ("hash_chain", "authenticated_hash_chain"):
-        # Must match create_initial_state: hash_func(f"init:{session_id}:{epoch}")
-        mem = hc_hash_func(f"init:{session_id}:{EPOCH}")
-        return mem, None
-    else:
-        raise ValueError(f"Unknown protocol: {protocol}")
 
 
 # ---------------------------------------------------------------------------
@@ -354,14 +227,14 @@ def run_one_experiment(
     Run a single cross-host experiment and return a result dict.
 
     Returns None if the run failed (exception during connection/HELLO).
+    Uses ProtocolAdapter for protocol-agnostic state tracking and
+    independent state comparison.
     """
 
     session_id = (
         f"cross-{protocol}-m{message_count}-p{payload_size}-"
         f"r{repeat_id}-{int(time.time() * 1000000)}"
     )
-
-    current_mem, _ = get_initial_state(protocol, session_id)
 
     accepted_count = 0
     rejected_count = 0
@@ -370,10 +243,8 @@ def run_one_experiment(
     sent_count = 0
     rtts: List[float] = []
 
-    # State audit: track last successful response fields
-    last_seq: int = 0
-    last_mem: str = ""
-    last_hash: str = ""
+    # Server environment info (populated from HELLO_ACK)
+    server_env: Dict[str, str] = {}
 
     start_time = time.time()
     sock = None
@@ -383,13 +254,32 @@ def run_one_experiment(
         sock, file_obj = open_tcp(server_host, server_port)
 
         # --- HELLO handshake ---
-        send_hello(sock, file_obj, protocol, session_id, CLIENT_ID, EPOCH)
+        # send_hello uses wire protocol names and validates the response
+        ack = send_hello(sock, file_obj, protocol, session_id, CLIENT_ID, EPOCH)
+
+        # Extract server environment info from HELLO_ACK
+        server_env = {
+            "server_git_commit": ack.get("server_git_commit", ""),
+            "server_python_version": ack.get("server_python_version", ""),
+            "server_os_info": ack.get("server_os_info", ""),
+            "server_hostname": ack.get("server_hostname", ""),
+        }
+
+        # Extract ticket for ticket_only protocol
+        ticket = ack.get("ticket", "")
+
+        # Create protocol adapter for state tracking
+        adapter = ProtocolAdapter(
+            protocol=protocol,
+            session_id=session_id,
+            sender_id=CLIENT_ID,
+            epoch=EPOCH,
+            ticket=ticket,
+        )
 
         for seq in range(1, message_count + 1):
             payload = make_payload(seq, payload_size)
-            packet = build_packet_for_protocol(
-                protocol, session_id, seq, payload, current_mem
-            )
+            packet = adapter.build_packet(seq, payload)
 
             send_time = time.perf_counter()
             send_json_line(sock, packet)
@@ -402,14 +292,8 @@ def run_one_experiment(
 
                 if response.get("ok"):
                     accepted_count += 1
-                    # Track state audit from server response
-                    last_seq = response.get("last_seq", last_seq)
-                    if protocol == "gmcp_r":
-                        current_mem = response.get("last_mem", current_mem)
-                        last_mem = current_mem
-                    elif protocol in ("hash_chain", "authenticated_hash_chain"):
-                        current_mem = response.get("last_hash", current_mem)
-                        last_hash = current_mem
+                    # Update adapter state from server response
+                    adapter.update_from_response(response)
                 else:
                     rejected_count += 1
 
@@ -445,24 +329,32 @@ def run_one_experiment(
 
     # --- run_valid computation ---
     unrecovered = rejected_count + timeout_count + error_count
-    sequence_match = (last_seq == message_count)
+    sequence_match = (adapter.last_seq == message_count)
 
-    # Protocol-specific state match
+    # Independent state comparison via ProtocolAdapter
+    # Build a synthetic "server final state" from the last known values
+    server_final = {
+        "last_seq": adapter.last_seq,
+        "last_mem": adapter.client_state.get("last_mem", ""),
+        "last_hash": adapter.client_state.get("last_hash", ""),
+    }
+    state_match = adapter.check_state_match(server_final) and sequence_match
+
+    # Memory/hash match for CSV columns
     if protocol == "gmcp_r":
-        # Client and server should agree on final memory
-        memory_match = bool(last_mem)
-        hash_match = True  # N/A for gmcp_r
-        state_match = sequence_match and memory_match
+        memory_match = bool(adapter.client_state.get("last_mem"))
+        hash_match = True
     elif protocol in ("hash_chain", "authenticated_hash_chain"):
-        memory_match = True  # N/A
-        hash_match = bool(last_hash)
-        state_match = sequence_match and hash_match
-    else:  # seq_mac
+        memory_match = True
+        hash_match = bool(adapter.client_state.get("last_hash"))
+    else:
         memory_match = True
         hash_match = True
-        state_match = sequence_match
 
     run_valid = (accepted_count == message_count) and (unrecovered == 0) and state_match
+
+    # Get state audit fields from adapter
+    state_fields = adapter.get_final_state_for_csv()
 
     result = {
         "session_id": session_id,
@@ -473,7 +365,7 @@ def run_one_experiment(
         "network_path_type": network_path_type,
         "server_host": server_host,
         "server_port": server_port,
-        "baseline_ping_rtt_ms": baseline_rtt_ms,
+        "tcp_connect_latency_ms": baseline_rtt_ms,
         "message_count": message_count,
         "payload_size": payload_size,
         "repeat_id": repeat_id,
@@ -483,15 +375,15 @@ def run_one_experiment(
         "timeout_count": timeout_count,
         "error_count": error_count,
         "unrecovered": unrecovered,
-        # State audit fields
-        "client_final_seq": accepted_count,
-        "server_final_seq": last_seq,
+        # State audit fields (from ProtocolAdapter)
+        "client_final_seq": state_fields["client_final_seq"],
+        "server_final_seq": state_fields["server_final_seq"],
         "sequence_match": sequence_match,
-        "client_final_mem": last_mem if protocol == "gmcp_r" else "",
-        "server_final_mem": last_mem if protocol == "gmcp_r" else "",
+        "client_final_mem": state_fields["client_final_mem"],
+        "server_final_mem": state_fields["server_final_mem"],
         "memory_match": memory_match,
-        "client_final_hash": last_hash if protocol in ("hash_chain", "authenticated_hash_chain") else "",
-        "server_final_hash": last_hash if protocol in ("hash_chain", "authenticated_hash_chain") else "",
+        "client_final_hash": state_fields["client_final_hash"],
+        "server_final_hash": state_fields["server_final_hash"],
         "hash_match": hash_match,
         "state_match": state_match,
         "run_valid": run_valid,
@@ -506,6 +398,11 @@ def run_one_experiment(
         "git_commit": git_meta.get("git_commit", ""),
         "git_branch": git_meta.get("git_branch", ""),
         "git_dirty": git_meta.get("git_dirty", ""),
+        # Server environment info (from HELLO_ACK)
+        "server_git_commit": server_env.get("server_git_commit", ""),
+        "server_python_version": server_env.get("server_python_version", ""),
+        "server_os_info": server_env.get("server_os_info", ""),
+        "server_hostname": server_env.get("server_hostname", ""),
     }
     return result
 
@@ -516,12 +413,13 @@ def run_one_experiment(
 
 class EmbeddedTCPServer:
     """
-    Lightweight TCP server that handles GMCP-R PING, HELLO, and DATA packets.
-    Supports full verification for all four protocols:
+    Lightweight TCP server that handles PING, HELLO, and DATA packets.
+    Supports full verification for all five protocols:
       - gmcp_r: HMAC + memory chain
       - seq_mac: HMAC(seq || payload)
       - hash_chain: SHA-256 chain hash verification
       - authenticated_hash_chain: HMAC + SHA-256 chain hash
+      - ticket_only: session ticket verification
     Spawned only when --no-spawn-server is NOT set.
     """
 
@@ -532,7 +430,7 @@ class EmbeddedTCPServer:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         # Per-session protocol and verifier storage
-        self._protocols: Dict[str, str] = {}       # session_id -> protocol name
+        self._protocols: Dict[str, str] = {}       # session_id -> protocol display name
         self._verifiers: Dict[str, Any] = {}        # session_id -> verifier object
         self._lock = threading.Lock()
 
@@ -601,12 +499,14 @@ class EmbeddedTCPServer:
         if not received_tag:
             self._send(conn, {"ok": False, "reason": "missing auth_tag"})
             return
-        from gmcp.crypto_utils import verify_hmac as _verify_hmac
-        if not _verify_hmac(DATA_AUTH_KEY, packet, received_tag):
+        if not verify_tagged_hmac(DATA_AUTH_KEY, packet):
             self._send(conn, {"ok": False, "reason": "auth_tag verification failed"})
             return
 
-        protocol = packet.get("protocol", "")
+        # Map wire protocol name to display name
+        wire_protocol = packet.get("protocol", "")
+        display_protocol = DISPLAY_PROTOCOL_NAMES.get(wire_protocol, wire_protocol)
+
         session_id = packet.get("session_id", "")
         sender_id = packet.get("sender_id", "")
         epoch = packet.get("epoch", 0)
@@ -615,24 +515,26 @@ class EmbeddedTCPServer:
             self._send(conn, {"ok": False, "reason": "missing session_id"})
             return
 
-        if protocol not in PROTOCOLS:
-            self._send(conn, {"ok": False, "reason": f"unsupported protocol: {protocol}"})
+        if display_protocol not in ALL_PROTOCOLS:
+            self._send(conn, {"ok": False, "reason": f"unsupported protocol: {wire_protocol}"})
             return
 
         with self._lock:
             # Don't re-create if session already exists
             if session_id in self._verifiers:
-                self._send(conn, {
+                ack = {
                     "ok": True,
                     "type": "HELLO_ACK",
                     "session_id": session_id,
-                    "protocol": protocol,
-                })
+                    "protocol": wire_protocol,
+                }
+                ack.update(get_server_env_info())
+                self._send(conn, ack)
                 return
 
-            self._protocols[session_id] = protocol
+            self._protocols[session_id] = display_protocol
 
-            if protocol == "gmcp_r":
+            if display_protocol == "gmcp_r":
                 mem_seed = "demo-seed"
                 m0 = initial_memory(session_id, sender_id, epoch, mem_seed)
                 state = GMCPState(
@@ -644,7 +546,7 @@ class EmbeddedTCPServer:
                 )
                 self._verifiers[session_id] = GMCPVerifier(state)
 
-            elif protocol == "seq_mac":
+            elif display_protocol == "seq_mac":
                 state = SeqMACState(
                     session_id=session_id,
                     sender_id=sender_id,
@@ -653,7 +555,7 @@ class EmbeddedTCPServer:
                 )
                 self._verifiers[session_id] = SeqMACVerifier(state)
 
-            elif protocol == "hash_chain":
+            elif display_protocol == "hash_chain":
                 initial_hash = hc_hash_func(f"init:{session_id}:{epoch}")
                 state = HashChainState(
                     session_id=session_id,
@@ -665,7 +567,7 @@ class EmbeddedTCPServer:
                 )
                 self._verifiers[session_id] = HashChainVerifier(state)
 
-            elif protocol == "authenticated_hash_chain":
+            elif display_protocol == "authenticated_hash_chain":
                 initial_hash = hc_hash_func(f"init:{session_id}:{epoch}")
                 state = AuthHashChainState(
                     session_id=session_id,
@@ -677,13 +579,36 @@ class EmbeddedTCPServer:
                 )
                 self._verifiers[session_id] = AuthHashChainVerifier(state)
 
-        print(f"  [HELLO] session={session_id} protocol={protocol}")
-        self._send(conn, {
+            elif display_protocol == "ticket_only":
+                ticket = issue_ticket(session_id, epoch)
+                state = TicketOnlyState(
+                    session_id=session_id,
+                    sender_id=sender_id,
+                    epoch=epoch,
+                    last_seq=0,
+                    ticket=ticket,
+                )
+                self._verifiers[session_id] = TicketOnlyVerifier(state)
+                # Include ticket in HELLO_ACK so client can use it
+                self._current_ticket = ticket
+
+        print(f"  [HELLO] session={session_id} protocol={display_protocol} (wire={wire_protocol})")
+
+        ack: Dict[str, Any] = {
             "ok": True,
             "type": "HELLO_ACK",
             "session_id": session_id,
-            "protocol": protocol,
-        })
+            "protocol": wire_protocol,
+        }
+
+        # Include ticket for ticket_only protocol
+        if display_protocol == "ticket_only":
+            ack["ticket"] = getattr(self, "_current_ticket", "")
+
+        # Include server environment info
+        ack.update(get_server_env_info())
+
+        self._send(conn, ack)
 
     def _handle_data(self, conn: socket.socket, packet: Dict[str, Any]):
         """Process DATA packet using protocol-appropriate verification."""
@@ -708,7 +633,7 @@ class EmbeddedTCPServer:
         elif protocol in ("hash_chain", "authenticated_hash_chain"):
             resp["last_seq"] = verifier.state.last_seq
             resp["last_hash"] = verifier.state.last_hash
-        elif protocol == "seq_mac":
+        elif protocol in ("seq_mac", "ticket_only"):
             resp["last_seq"] = verifier.state.last_seq
 
         self._send(conn, resp)
@@ -819,7 +744,7 @@ def main():
     fieldnames = [
         "session_id", "experiment_type", "protocol",
         "client_host_id", "server_host_id", "network_path_type",
-        "server_host", "server_port", "baseline_ping_rtt_ms",
+        "server_host", "server_port", "tcp_connect_latency_ms",
         "message_count", "payload_size", "repeat_id",
         "sent_count", "accepted_count", "rejected_count",
         "timeout_count", "error_count",
@@ -832,6 +757,7 @@ def main():
         "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
         "timestamp",
         "git_commit", "git_branch", "git_dirty",
+        "server_git_commit", "server_python_version", "server_os_info", "server_hostname",
     ]
 
     total = len(PROTOCOLS) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * repeats

@@ -60,6 +60,17 @@ from gmcp.baselines.authenticated_hash_chain import build_data_packet as ahc_bui
 from gmcp.baselines.authenticated_hash_chain import AuthHashChainVerifier, create_initial_state as ahc_init_state
 
 from gmcp.experiment_stats import get_git_commit, get_python_version, get_os_info
+from gmcp.experiment_transport import (
+    ProtocolAdapter,
+    send_hello,
+    send_json_line as _transport_send_json_line,
+    recv_json_line as _transport_recv_json_line,
+    WIRE_PROTOCOL_NAMES,
+    DISPLAY_PROTOCOL_NAMES,
+    get_git_commit as _transport_get_git_commit,
+    get_git_dirty as _transport_get_git_dirty,
+    get_git_metadata as _transport_get_git_metadata,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -131,16 +142,9 @@ def make_payload(seq: int, payload_size: int) -> str:
     return prefix + ("x" * remain)
 
 
-def send_json_line(sock: socket.socket, packet: Dict[str, Any]):
-    raw = json.dumps(packet, ensure_ascii=False).encode("utf-8") + b"\n"
-    sock.sendall(raw)
-
-
-def recv_json_line(file_obj) -> Dict[str, Any]:
-    line = file_obj.readline()
-    if not line:
-        raise ConnectionError("server closed connection")
-    return json.loads(line)
+# Reuse transport helpers
+send_json_line = _transport_send_json_line
+recv_json_line = _transport_recv_json_line
 
 
 def enable_tcp_nodelay(sock: socket.socket):
@@ -179,6 +183,18 @@ def close_tcp(sock, file_obj):
 
 # ---------------------------------------------------------------------------
 # tc/netem management
+def verify_tc_snapshot(snap: str, condition_name: str) -> Tuple[bool, str]:
+    """Verify tc qdisc snapshot matches expected condition.
+
+    - control: allows any qdisc (noqueue/default) — netem not required.
+    - non-control: snapshot must contain 'netem'.
+    """
+    if condition_name == "control":
+        return True, "control — netem not required"
+    if "netem" not in snap:
+        return False, "netem not in qdisc"
+    return True, "ok"
+
 # ---------------------------------------------------------------------------
 
 def setup_tc_netem(
@@ -430,10 +446,12 @@ def run_one_experiment(
                 timeouts += 1
                 run_valid = False
                 failure_reason = "socket_timeout"
+                break  # timeout ends this run — no further seq
             except Exception as e:
                 errors += 1
                 run_valid = False
                 failure_reason = str(e)
+                break  # error also ends this run
 
     except Exception as e:
         run_valid = False
@@ -640,6 +658,8 @@ def main():
     parser.add_argument("--host", default=None, help="Remote server host (omit for local mode)")
     parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat")
     parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
+    parser.add_argument("--no-spawn-server", action="store_true",
+        help="Do NOT spawn embedded server; connect to --host:--port directly")
     parser.add_argument("--conditions", default=None, help="Comma-separated condition names to run")
     args = parser.parse_args()
 
@@ -680,14 +700,23 @@ def main():
     # ---- Interface validation ----
     validate_interface_for_mode(interface, args.host)
 
-    if args.host:
+    srv = None
+    if args.no_spawn_server:
+        # Remote mode: connect to --host:--port, no local server
+        if not args.host:
+            print("[ERROR] --no-spawn-server requires --host")
+            sys.exit(1)
         server_host = args.host
+        print(f"[MODE] Remote mode: connecting to {server_host}:{server_port}")
+    else:
+        # Local mode: start embedded server
+        if args.host:
+            server_host = args.host
+        print(f"[MODE] Starting embedded server on {server_host}:{server_port}")
+        srv = EmbeddedTCPServer(server_host, server_port)
+        srv.start()
+        time.sleep(0.3)
 
-    # ---- Start embedded server ----
-    print(f"[MODE] Starting embedded server on {server_host}:{server_port}")
-    srv = EmbeddedTCPServer(server_host, server_port)
-    srv.start()
-    time.sleep(0.3)
 
     ensure_output_dir()
 
@@ -702,6 +731,7 @@ def main():
         "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
         "run_valid", "failure_reason",
         "execution_valid", "interface", "requested_netem_config", "actual_qdisc_config",
+        "server_git_commit", "state_match",
         "timestamp",
         "git_commit", "python_version", "os_info",
     ]
@@ -752,10 +782,19 @@ def main():
                         result["interface"] = interface
                         result["requested_netem_config"] = requested_config
                         result["actual_qdisc_config"] = tc_snap
-                        # execution_valid: tc applied + code ran normally + all messages sent
-                        # Note: timeouts/rejections under netem are expected business results,
-                        #       not execution failures. run_valid tracks protocol health.
-                        exec_valid = tc_snap != "" and result["sent_count"] == MESSAGE_COUNT
+                        result["server_git_commit"] = git_commit  # local server; same commit
+                        result["state_match"] = result.get("run_valid", False)
+                        # execution_valid: composite of 4 sub-checks
+                        tc_ok, _tc_reason = verify_tc_snapshot(tc_snap, cond_name)
+                        no_internal_exception = result["error_count"] == 0
+                        no_response_mismatch = result["rejected_count"] == 0
+                        final_state_auditable = result["sent_count"] > 0
+                        exec_valid = (
+                            tc_ok
+                            and no_internal_exception
+                            and no_response_mismatch
+                            and final_state_auditable
+                        )
                         result["execution_valid"] = exec_valid
                         if not exec_valid:
                             any_execution_failure = True
@@ -780,7 +819,8 @@ def main():
         print(f"[ERROR] Execution failures detected. Keeping tmp file: {tmp_csv}")
         print(f"        Final CSV NOT published.")
         clear_tc_netem(interface)
-        srv.stop()
+        if srv:
+            srv.stop()
         sys.exit(1)
     else:
         os.replace(tmp_csv, OUTPUT_CSV)
@@ -788,7 +828,8 @@ def main():
 
     # Final cleanup (safety net)
     clear_tc_netem(interface)
-    srv.stop()
+    if srv:
+        srv.stop()
 
     print(f"\n[DONE] Results written to {OUTPUT_CSV}")
     print(f"[DONE] {completed} experiments completed.")
