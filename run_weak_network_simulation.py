@@ -774,6 +774,14 @@ def validate_result(result: Dict[str, Any]) -> Tuple[bool, str]:
             f"logical({result['logical_message_count']})"
         )
 
+    # 正式实验要求100%成功
+    if result.get("unrecovered_logical_messages", 0) != 0:
+        return False, f"unrecovered({result['unrecovered_logical_messages']}) > 0"
+    if result.get("server_rejected_attempt_count", 0) != 0:
+        return False, f"server_rejected({result['server_rejected_attempt_count']}) > 0"
+    if result.get("socket_timeout_count", 0) != 0:
+        return False, f"socket_timeouts({result['socket_timeout_count']}) > 0"
+
     return True, "ok"
 
 
@@ -1015,6 +1023,11 @@ def main():
 
         # 正式实验
         if args.formal:
+            # 正式 paper 数据禁止 dirty
+            if args.allow_dirty:
+                print("[FATAL] --allow-dirty is forbidden for formal paper data.", flush=True)
+                return 1
+
             # 先跑 smoke
             print("\n[PREFLIGHT] Running smoke test before formal experiment...", flush=True)
             if not run_smoke_test(args):
@@ -1023,10 +1036,8 @@ def main():
 
             results, formal_csv = run_formal_experiments(args, git_meta)
 
-            # 原子发布
-            if results:
-                atomic_publish(results, formal_csv, args.paper_output, expected_rows)
-
+            # 原子发布（空结果也会抛异常）
+            atomic_publish(results, formal_csv, args.paper_output, expected_rows)
             return 0
 
         # 默认：先 smoke 后 formal
@@ -1034,10 +1045,7 @@ def main():
             return 1
 
         results, formal_csv = run_formal_experiments(args, git_meta)
-
-        if results:
-            atomic_publish(results, formal_csv, args.paper_output, expected_rows)
-
+        atomic_publish(results, formal_csv, args.paper_output, expected_rows)
         return 0
 
     except Exception as e:

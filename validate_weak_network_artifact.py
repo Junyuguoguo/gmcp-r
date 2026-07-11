@@ -203,7 +203,7 @@ def validate() -> int:
                     f"loss={r['loss_rate']}, delay={r['delay_ms']}"
                 )
     else:
-        warnings.append("Column 'git_dirty' not present; skipping dirty check")
+        errors.append("Column 'git_dirty' not present; required for formal validation")
 
     # -------------------------------------------------------------------
     # 8. Protocol-specific state consistency
@@ -237,7 +237,7 @@ def validate() -> int:
                     f"loss={r['loss_rate']}, delay={r['delay_ms']}, repeat={r['repeat_id']}"
                 )
     else:
-        warnings.append("Column 'run_valid' not present; skipping")
+        errors.append("Column 'run_valid' not present; required for formal validation")
 
     # -------------------------------------------------------------------
     # Report

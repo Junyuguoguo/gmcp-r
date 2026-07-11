@@ -295,10 +295,16 @@ def build_summary() -> str:
             "WARNING: Some protocols failed to achieve 100% success in the lossless control group.\n"
         )
 
-    sections.append(
-        f"Under lossy conditions (loss>0), {display_name(best_proto)} achieves the highest "
-        f"mean success rate at {fmt_pct(best_rate)}.\n"
-    )
+    if all(abs(r - 100.0) < 0.01 for r in lossy_rates.values()):
+        sections.append(
+            "Under lossy conditions (loss>0), all three protocols achieve a 100% "
+            "logical-message success rate under the shared retry budget.\n"
+        )
+    else:
+        sections.append(
+            f"Under lossy conditions (loss>0), {display_name(best_proto)} achieves the highest "
+            f"mean success rate at {fmt_pct(best_rate)}.\n"
+        )
 
     # ── MemoryTicket Recovery ──────────────────────────────────────────────
     sections.append("\n## MemoryTicket Recovery\n")
