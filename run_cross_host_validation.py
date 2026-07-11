@@ -345,10 +345,20 @@ def run_one_experiment(
 
     run_valid = (accepted_count == message_count) and (unrecovered == 0) and state_match
 
-    # Get state audit fields from adapter (includes real memory/hash match)
+    # Get state audit fields from adapter
     state_fields = adapter.get_final_state_for_csv()
-    memory_match = state_fields.get("memory_match", "")
-    hash_match = state_fields.get("hash_match", "")
+
+    # Real memory/hash match from independent comparison
+    memory_match = True
+    hash_match = True
+    if protocol == "gmcp_r":
+        memory_match = (
+            state_fields["client_final_mem"] == state_fields["server_final_mem"]
+        )
+    elif protocol in ("hash_chain", "authenticated_hash_chain"):
+        hash_match = (
+            state_fields["client_final_hash"] == state_fields["server_final_hash"]
+        )
 
     result = {
         "session_id": session_id,

@@ -931,7 +931,7 @@ def main():
 
     # Collect metadata once (client-side)
     git_commit = get_git_commit()
-    git_dirty = get_git_dirty()  # fail-closed: returns True on error
+    git_dirty = _transport_get_git_dirty()  # fail-closed: returns True on error
     python_version = get_python_version()
     os_info = get_os_info()
     command_line = get_command_line()
