@@ -968,6 +968,13 @@ def atomic_publish(results: List[Dict[str, Any]], formal_csv: str,
     2. 写入临时文件
     3. os.replace 到目标
     """
+    # 检查 run_valid
+    invalid_runs = [r for r in results if r.get("run_valid") is not True]
+    if invalid_runs:
+        raise RuntimeError(
+            f"[PUBLISH] {len(invalid_runs)} invalid runs detected; refusing to publish."
+        )
+
     if len(results) != expected_rows:
         raise RuntimeError(
             f"[PUBLISH] Expected {expected_rows} rows, got {len(results)}. "
