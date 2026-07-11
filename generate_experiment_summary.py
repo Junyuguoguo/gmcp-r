@@ -295,7 +295,7 @@ def build_summary() -> str:
             "WARNING: Some protocols failed to achieve 100% success in the lossless control group.\n"
         )
 
-    if all(abs(r - 100.0) < 0.01 for r in lossy_rates.values()):
+    if all(abs(r - 100.0) < 0.01 for r in lossy_by_proto.values):
         sections.append(
             "Under lossy conditions (loss>0), all three protocols achieve a 100% "
             "logical-message success rate under the shared retry budget.\n"

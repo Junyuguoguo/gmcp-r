@@ -712,6 +712,22 @@ def run_one_experiment(
         "elapsed_seconds": round(elapsed, 4),
     }
 
+    # 计算 run_valid
+    protocol_match = {
+        "gmcp_r": audit.get("memory_match") is True,
+        "hash_chain": audit.get("hash_match") is True,
+        "seq_mac": audit.get("sequence_match") is True,
+    }.get(protocol, False)
+
+    result["run_valid"] = (
+        result["accepted_logical_messages"] == result["logical_message_count"]
+        and result["unrecovered_logical_messages"] == 0
+        and result["server_rejected_attempt_count"] == 0
+        and result["socket_timeout_count"] == 0
+        and audit.get("state_match") is True
+        and protocol_match
+    )
+
     return result
 
 
@@ -737,6 +753,7 @@ FIELDNAMES = [
     "client_final_hash", "server_final_hash", "hash_match",
     "sequence_match",
     "elapsed_seconds",
+    "run_valid",
     "git_commit_full", "git_dirty",
     "command_line", "python_version", "os_info", "hostname",
 ]

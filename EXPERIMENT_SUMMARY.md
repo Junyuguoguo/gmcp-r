@@ -70,87 +70,87 @@ Throughput peaks at 5 concurrent client(s) and subsequently degrades at higher c
 Source: `paper_data/05_weak_network.csv`
 | Protocol | Mean Success Rate | Mean Throughput | Mean RTT |
 |---|---:|---:|---:|
-| GMCP-R | 100.0% | 462.8 msg/s | 0.3 ms |
-| Hash Chain | 100.0% | 428.5 msg/s | 0.3 ms |
-| Seq+MAC | 100.0% | 470.7 msg/s | 0.3 ms |
+| GMCP-R | 100.0% | 407.9 msg/s | 0.3 ms |
+| Hash Chain | 100.0% | 476.0 msg/s | 0.3 ms |
+| Seq+MAC | 100.0% | 469.0 msg/s | 0.3 ms |
 
 ### Detailed Breakdown
 | Protocol | Loss % | Delay ms | Success Rate | Throughput | RTT | Repeats |
 |---|---:|---:|---:|---:|---:|---:|
-| GMCP-R | 0 | 0 | 100.0% | 9,213.9 msg/s | 0.1 ms | 2 |
-| GMCP-R | 0 | 20 | 100.0% | 41.6 msg/s | 0.4 ms | 2 |
+| GMCP-R | 0 | 0 | 100.0% | 7,859.6 msg/s | 0.1 ms | 2 |
+| GMCP-R | 0 | 20 | 100.0% | 41.5 msg/s | 0.3 ms | 2 |
 | GMCP-R | 0 | 50 | 100.0% | 18.5 msg/s | 0.4 ms | 2 |
 | GMCP-R | 0 | 100 | 100.0% | 9.6 msg/s | 0.4 ms | 2 |
 | GMCP-R | 0 | 200 | 100.0% | 4.9 msg/s | 0.4 ms | 2 |
-| GMCP-R | 1 | 0 | 100.0% | 1,439.9 msg/s | 0.1 ms | 2 |
-| GMCP-R | 1 | 20 | 100.0% | 39.0 msg/s | 0.4 ms | 2 |
-| GMCP-R | 1 | 50 | 100.0% | 18.1 msg/s | 0.4 ms | 2 |
-| GMCP-R | 1 | 100 | 100.0% | 9.6 msg/s | 0.4 ms | 2 |
-| GMCP-R | 1 | 200 | 100.0% | 4.8 msg/s | 0.4 ms | 2 |
-| GMCP-R | 2 | 0 | 100.0% | 335.1 msg/s | 0.1 ms | 2 |
-| GMCP-R | 2 | 20 | 100.0% | 37.1 msg/s | 0.4 ms | 2 |
-| GMCP-R | 2 | 50 | 100.0% | 17.6 msg/s | 0.4 ms | 2 |
-| GMCP-R | 2 | 100 | 100.0% | 9.1 msg/s | 0.4 ms | 2 |
-| GMCP-R | 2 | 200 | 100.0% | 4.6 msg/s | 0.4 ms | 2 |
-| GMCP-R | 5 | 0 | 100.0% | 195.3 msg/s | 0.2 ms | 2 |
-| GMCP-R | 5 | 20 | 100.0% | 30.3 msg/s | 0.4 ms | 2 |
-| GMCP-R | 5 | 50 | 100.0% | 15.9 msg/s | 0.4 ms | 2 |
-| GMCP-R | 5 | 100 | 100.0% | 8.3 msg/s | 0.4 ms | 2 |
-| GMCP-R | 5 | 200 | 100.0% | 4.4 msg/s | 0.4 ms | 2 |
-| GMCP-R | 10 | 0 | 100.0% | 61.7 msg/s | 0.2 ms | 2 |
-| GMCP-R | 10 | 20 | 100.0% | 26.1 msg/s | 0.4 ms | 2 |
-| GMCP-R | 10 | 50 | 100.0% | 13.7 msg/s | 0.4 ms | 2 |
+| GMCP-R | 1 | 0 | 100.0% | 1,434.8 msg/s | 0.1 ms | 2 |
+| GMCP-R | 1 | 20 | 100.0% | 35.0 msg/s | 0.4 ms | 2 |
+| GMCP-R | 1 | 50 | 100.0% | 17.2 msg/s | 0.4 ms | 2 |
+| GMCP-R | 1 | 100 | 100.0% | 9.3 msg/s | 0.4 ms | 2 |
+| GMCP-R | 1 | 200 | 100.0% | 4.7 msg/s | 0.4 ms | 2 |
+| GMCP-R | 2 | 0 | 100.0% | 319.6 msg/s | 0.2 ms | 2 |
+| GMCP-R | 2 | 20 | 100.0% | 33.3 msg/s | 0.4 ms | 2 |
+| GMCP-R | 2 | 50 | 100.0% | 16.8 msg/s | 0.4 ms | 2 |
+| GMCP-R | 2 | 100 | 100.0% | 8.9 msg/s | 0.4 ms | 2 |
+| GMCP-R | 2 | 200 | 100.0% | 4.7 msg/s | 0.4 ms | 2 |
+| GMCP-R | 5 | 0 | 100.0% | 198.7 msg/s | 0.2 ms | 2 |
+| GMCP-R | 5 | 20 | 100.0% | 33.4 msg/s | 0.4 ms | 2 |
+| GMCP-R | 5 | 50 | 100.0% | 16.6 msg/s | 0.4 ms | 2 |
+| GMCP-R | 5 | 100 | 100.0% | 8.6 msg/s | 0.4 ms | 2 |
+| GMCP-R | 5 | 200 | 100.0% | 4.5 msg/s | 0.4 ms | 2 |
+| GMCP-R | 10 | 0 | 100.0% | 63.2 msg/s | 0.2 ms | 2 |
+| GMCP-R | 10 | 20 | 100.0% | 28.7 msg/s | 0.4 ms | 2 |
+| GMCP-R | 10 | 50 | 100.0% | 14.5 msg/s | 0.4 ms | 2 |
 | GMCP-R | 10 | 100 | 100.0% | 7.7 msg/s | 0.4 ms | 2 |
 | GMCP-R | 10 | 200 | 100.0% | 4.2 msg/s | 0.4 ms | 2 |
-| Hash Chain | 0 | 0 | 100.0% | 8,646.5 msg/s | 0.1 ms | 2 |
-| Hash Chain | 0 | 20 | 100.0% | 37.6 msg/s | 0.3 ms | 2 |
-| Hash Chain | 0 | 50 | 100.0% | 17.5 msg/s | 0.3 ms | 2 |
-| Hash Chain | 0 | 100 | 100.0% | 9.3 msg/s | 0.3 ms | 2 |
-| Hash Chain | 0 | 200 | 100.0% | 4.8 msg/s | 0.3 ms | 2 |
-| Hash Chain | 1 | 0 | 100.0% | 1,102.6 msg/s | 0.1 ms | 2 |
-| Hash Chain | 1 | 20 | 100.0% | 35.2 msg/s | 0.3 ms | 2 |
-| Hash Chain | 1 | 50 | 100.0% | 17.0 msg/s | 0.4 ms | 2 |
-| Hash Chain | 1 | 100 | 100.0% | 9.3 msg/s | 0.3 ms | 2 |
+| Hash Chain | 0 | 0 | 100.0% | 9,782.7 msg/s | 0.1 ms | 2 |
+| Hash Chain | 0 | 20 | 100.0% | 37.0 msg/s | 0.3 ms | 2 |
+| Hash Chain | 0 | 50 | 100.0% | 17.5 msg/s | 0.4 ms | 2 |
+| Hash Chain | 0 | 100 | 100.0% | 9.3 msg/s | 0.4 ms | 2 |
+| Hash Chain | 0 | 200 | 100.0% | 4.8 msg/s | 0.4 ms | 2 |
+| Hash Chain | 1 | 0 | 100.0% | 1,135.5 msg/s | 0.1 ms | 2 |
+| Hash Chain | 1 | 20 | 100.0% | 34.7 msg/s | 0.4 ms | 2 |
+| Hash Chain | 1 | 50 | 100.0% | 17.1 msg/s | 0.4 ms | 2 |
+| Hash Chain | 1 | 100 | 100.0% | 9.3 msg/s | 0.4 ms | 2 |
 | Hash Chain | 1 | 200 | 100.0% | 4.7 msg/s | 0.4 ms | 2 |
-| Hash Chain | 2 | 0 | 100.0% | 391.4 msg/s | 0.1 ms | 2 |
-| Hash Chain | 2 | 20 | 100.0% | 33.8 msg/s | 0.3 ms | 2 |
-| Hash Chain | 2 | 50 | 100.0% | 17.0 msg/s | 0.3 ms | 2 |
-| Hash Chain | 2 | 100 | 100.0% | 9.1 msg/s | 0.3 ms | 2 |
-| Hash Chain | 2 | 200 | 100.0% | 4.7 msg/s | 0.3 ms | 2 |
-| Hash Chain | 5 | 0 | 100.0% | 168.1 msg/s | 0.1 ms | 2 |
-| Hash Chain | 5 | 20 | 100.0% | 29.6 msg/s | 0.3 ms | 2 |
-| Hash Chain | 5 | 50 | 100.0% | 15.1 msg/s | 0.3 ms | 2 |
-| Hash Chain | 5 | 100 | 100.0% | 8.5 msg/s | 0.3 ms | 2 |
-| Hash Chain | 5 | 200 | 100.0% | 4.5 msg/s | 0.3 ms | 2 |
-| Hash Chain | 10 | 0 | 100.0% | 96.7 msg/s | 0.2 ms | 2 |
-| Hash Chain | 10 | 20 | 100.0% | 24.1 msg/s | 0.4 ms | 2 |
-| Hash Chain | 10 | 50 | 100.0% | 13.9 msg/s | 0.3 ms | 2 |
-| Hash Chain | 10 | 100 | 100.0% | 8.0 msg/s | 0.4 ms | 2 |
-| Hash Chain | 10 | 200 | 100.0% | 4.1 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 0 | 0 | 100.0% | 9,922.5 msg/s | 0.1 ms | 2 |
-| Seq+MAC | 0 | 20 | 100.0% | 38.0 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 0 | 50 | 100.0% | 17.5 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 0 | 100 | 100.0% | 9.5 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 0 | 200 | 100.0% | 4.8 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 1 | 0 | 100.0% | 717.7 msg/s | 0.1 ms | 2 |
-| Seq+MAC | 1 | 20 | 100.0% | 34.7 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 1 | 50 | 100.0% | 16.8 msg/s | 0.3 ms | 2 |
+| Hash Chain | 2 | 0 | 100.0% | 406.3 msg/s | 0.1 ms | 2 |
+| Hash Chain | 2 | 20 | 100.0% | 37.4 msg/s | 0.4 ms | 2 |
+| Hash Chain | 2 | 50 | 100.0% | 17.9 msg/s | 0.3 ms | 2 |
+| Hash Chain | 2 | 100 | 100.0% | 9.3 msg/s | 0.4 ms | 2 |
+| Hash Chain | 2 | 200 | 100.0% | 4.8 msg/s | 0.4 ms | 2 |
+| Hash Chain | 5 | 0 | 100.0% | 165.3 msg/s | 0.2 ms | 2 |
+| Hash Chain | 5 | 20 | 100.0% | 32.2 msg/s | 0.4 ms | 2 |
+| Hash Chain | 5 | 50 | 100.0% | 15.9 msg/s | 0.4 ms | 2 |
+| Hash Chain | 5 | 100 | 100.0% | 8.7 msg/s | 0.4 ms | 2 |
+| Hash Chain | 5 | 200 | 100.0% | 4.5 msg/s | 0.4 ms | 2 |
+| Hash Chain | 10 | 0 | 100.0% | 95.9 msg/s | 0.2 ms | 2 |
+| Hash Chain | 10 | 20 | 100.0% | 23.8 msg/s | 0.4 ms | 2 |
+| Hash Chain | 10 | 50 | 100.0% | 13.8 msg/s | 0.4 ms | 2 |
+| Hash Chain | 10 | 100 | 100.0% | 7.9 msg/s | 0.4 ms | 2 |
+| Hash Chain | 10 | 200 | 100.0% | 4.1 msg/s | 0.4 ms | 2 |
+| Seq+MAC | 0 | 0 | 100.0% | 9,883.9 msg/s | 0.1 ms | 2 |
+| Seq+MAC | 0 | 20 | 100.0% | 37.6 msg/s | 0.4 ms | 2 |
+| Seq+MAC | 0 | 50 | 100.0% | 17.4 msg/s | 0.4 ms | 2 |
+| Seq+MAC | 0 | 100 | 100.0% | 9.4 msg/s | 0.4 ms | 2 |
+| Seq+MAC | 0 | 200 | 100.0% | 4.8 msg/s | 0.4 ms | 2 |
+| Seq+MAC | 1 | 0 | 100.0% | 710.7 msg/s | 0.1 ms | 2 |
+| Seq+MAC | 1 | 20 | 100.0% | 34.0 msg/s | 0.3 ms | 2 |
+| Seq+MAC | 1 | 50 | 100.0% | 16.6 msg/s | 0.3 ms | 2 |
 | Seq+MAC | 1 | 100 | 100.0% | 9.0 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 1 | 200 | 100.0% | 4.8 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 2 | 0 | 100.0% | 572.2 msg/s | 0.1 ms | 2 |
-| Seq+MAC | 2 | 20 | 100.0% | 34.6 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 2 | 50 | 100.0% | 17.1 msg/s | 0.3 ms | 2 |
+| Seq+MAC | 1 | 200 | 100.0% | 4.8 msg/s | 0.4 ms | 2 |
+| Seq+MAC | 2 | 0 | 100.0% | 562.5 msg/s | 0.1 ms | 2 |
+| Seq+MAC | 2 | 20 | 100.0% | 34.3 msg/s | 0.3 ms | 2 |
+| Seq+MAC | 2 | 50 | 100.0% | 17.1 msg/s | 0.4 ms | 2 |
 | Seq+MAC | 2 | 100 | 100.0% | 9.0 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 2 | 200 | 100.0% | 4.6 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 5 | 0 | 100.0% | 152.9 msg/s | 0.1 ms | 2 |
-| Seq+MAC | 5 | 20 | 100.0% | 30.6 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 5 | 50 | 100.0% | 16.4 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 5 | 100 | 100.0% | 8.1 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 5 | 200 | 100.0% | 4.4 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 10 | 0 | 100.0% | 95.4 msg/s | 0.2 ms | 2 |
-| Seq+MAC | 10 | 20 | 100.0% | 22.7 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 10 | 50 | 100.0% | 13.4 msg/s | 0.3 ms | 2 |
-| Seq+MAC | 10 | 100 | 100.0% | 7.7 msg/s | 0.3 ms | 2 |
+| Seq+MAC | 2 | 200 | 100.0% | 4.6 msg/s | 0.4 ms | 2 |
+| Seq+MAC | 5 | 0 | 100.0% | 157.1 msg/s | 0.1 ms | 2 |
+| Seq+MAC | 5 | 20 | 100.0% | 33.3 msg/s | 0.3 ms | 2 |
+| Seq+MAC | 5 | 50 | 100.0% | 17.1 msg/s | 0.3 ms | 2 |
+| Seq+MAC | 5 | 100 | 100.0% | 8.3 msg/s | 0.3 ms | 2 |
+| Seq+MAC | 5 | 200 | 100.0% | 4.5 msg/s | 0.3 ms | 2 |
+| Seq+MAC | 10 | 0 | 100.0% | 98.0 msg/s | 0.1 ms | 2 |
+| Seq+MAC | 10 | 20 | 100.0% | 24.9 msg/s | 0.3 ms | 2 |
+| Seq+MAC | 10 | 50 | 100.0% | 14.1 msg/s | 0.3 ms | 2 |
+| Seq+MAC | 10 | 100 | 100.0% | 7.9 msg/s | 0.3 ms | 2 |
 | Seq+MAC | 10 | 200 | 100.0% | 4.0 msg/s | 0.4 ms | 2 |
 
 **Note**: This is a **code-level simulation** (artificial `time.sleep` delays
@@ -158,7 +158,7 @@ and random message drops in the client code), not a real `tc/netem` or ns-3
 network emulation. Results should not be presented as real weak-network
 performance.
 All protocols achieve 100% success in the lossless control group (loss=0, delay=0).
-Under lossy conditions (loss>0), GMCP-R achieves the highest mean success rate at 100.0%.
+Under lossy conditions (loss>0), all three protocols achieve a 100% logical-message success rate under the shared retry budget.
 
 ## MemoryTicket Recovery
 Source: `paper_data/06_memory_ticket_recovery.csv`
