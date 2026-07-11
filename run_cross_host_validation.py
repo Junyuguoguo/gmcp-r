@@ -677,6 +677,11 @@ def main():
     )
     args = parser.parse_args()
 
+    # --- Formal mode: force repeats=20 ---
+    if args.formal:
+        if args.repeats is not None and args.repeats != 20:
+            parser.error('--formal requires exactly 20 repeats (or omit for default 20)')
+
     # --- Mutual exclusion: --quick and --formal ---
     if args.quick and args.formal:
         print("[ERROR] --quick and --formal are mutually exclusive.")
@@ -750,12 +755,12 @@ def main():
             sys.exit(1)
 
     # Determine output CSV based on mode
-    if args.formal:
-        output_csv = os.path.join(OUTPUT_DIR, "cross_host_results.csv")
-    elif args.quick:
+    if args.quick:
         output_csv = os.path.join(OUTPUT_DIR, "cross_host_smoke.csv")
+    elif args.formal:
+        output_csv = os.path.join(OUTPUT_DIR, "cross_host_results.csv")
     else:
-        output_csv = OUTPUT_CSV  # default: cross_host_results.csv
+        output_csv = os.path.join(OUTPUT_DIR, "cross_host_dev.csv")
 
     # Measure baseline RTT
     print("[INFO] Measuring baseline RTT ...")
@@ -890,16 +895,31 @@ def main():
             print("[VALIDATE] FAIL: git_dirty is not false for all rows")
             os.remove(tmp_csv)
             sys.exit(1)
-        # Formal mode: also check server_git_dirty
+        # Formal mode: also check server_git_dirty and cross-host authenticity
         if args.formal:
-            server_dirty = any(
-                r.get("server_git_dirty") not in ("false", "False", False, "")
-                for r in rows
-            )
-            if server_dirty:
-                print("[VALIDATE] FAIL: server_git_dirty is not false for all rows")
-                os.remove(tmp_csv)
-                sys.exit(1)
+            for i, r in enumerate(rows):
+                # server_git_dirty strict check (no empty string allowed)
+                server_dirty = r.get('server_git_dirty', '')
+                if server_dirty not in ('false', 'False', False):
+                    print(f"[VALIDATE] FAIL row {i+1}: server_git_dirty={server_dirty}")
+                    os.remove(tmp_csv)
+                    sys.exit(1)
+                # server_git_commit must be 40-char hex
+                serv_commit = r.get('server_git_commit', '')
+                if len(serv_commit) != 40:
+                    print(f"[VALIDATE] FAIL row {i+1}: server_git_commit length {len(serv_commit)} != 40")
+                    os.remove(tmp_csv)
+                    sys.exit(1)
+                # Real cross-host: server_hostname must differ from client_host_id
+                if r.get('server_hostname') == r.get('client_host_id'):
+                    print(f"[VALIDATE] FAIL row {i+1}: client and server on same host")
+                    os.remove(tmp_csv)
+                    sys.exit(1)
+                # Real cross-host: no loopback in formal data
+                if r.get('network_path_type') == 'loopback':
+                    print(f"[VALIDATE] FAIL row {i+1}: formal data cannot use loopback")
+                    os.remove(tmp_csv)
+                    sys.exit(1)
             client_dirty = any(
                 r.get("git_dirty") not in ("false", "False", False)
                 for r in rows

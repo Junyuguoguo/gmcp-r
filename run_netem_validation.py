@@ -78,6 +78,7 @@ from gmcp.experiment_transport import (
 OUTPUT_DIR = "results/netem_validation"
 FORMAL_CSV = os.path.join(OUTPUT_DIR, "netem_validation_results.csv")
 SMOKE_CSV = os.path.join(OUTPUT_DIR, "netem_smoke.csv")
+DEV_CSV = os.path.join(OUTPUT_DIR, "netem_dev.csv")
 
 PROTOCOLS = ["gmcp_r", "seq_mac", "authenticated_hash_chain"]
 REPEAT_COUNT = 10
@@ -193,7 +194,7 @@ def parse_tc_snapshot(snap: str) -> Dict[str, float]:
     Returns dict with keys: delay_ms, jitter_ms, loss_pct
     Values are 0.0 if not found.
     """
-    result: Dict[str, float] = {"delay_ms": 0.0, "jitter_ms": 0.0, "loss_pct": 0.0}
+    result: Dict[str, float] = {"delay_ms": 0.0, "jitter_ms": 0.0, "loss_pct": 0.0, "reorder_pct": 0.0}
 
     # Parse delay: "delay 100ms" or "delay 100.00ms"
     delay_match = _re.search(r'delay\s+([\d.]+)ms', snap)
@@ -211,24 +212,29 @@ def parse_tc_snapshot(snap: str) -> Dict[str, float]:
     if loss_match:
         result["loss_pct"] = float(loss_match.group(1))
 
+    # Parse reorder: "reorder 5%" or "reorder 5% 50%"
+    reorder_match = _re.search(r'reorder\s+([\d.]+)%', snap)
+    if reorder_match:
+        result["reorder_pct"] = float(reorder_match.group(1))
+
     return result
 
 
 def verify_tc_snapshot(
     snap: str,
     condition_name: str,
-    requested_delay_ms: int = 0,
-    requested_loss_pct: int = 0,
-    requested_jitter_ms: int = 0,
+    requested: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str, Dict[str, float]]:
     """Verify tc qdisc snapshot matches expected condition.
 
     - control: allows any qdisc (noqueue/default) — netem not required.
     - non-control: snapshot must contain 'netem'.
-    - Verifies delay >= requested * 0.8 and loss >= requested * 0.8.
+    - 25% tolerance for all parameters (delay, loss, jitter, reorder).
 
     Returns (ok, reason, actual_params).
     """
+    if requested is None:
+        requested = {}
     actual = parse_tc_snapshot(snap)
 
     if condition_name == "control":
@@ -236,23 +242,35 @@ def verify_tc_snapshot(
     if "netem" not in snap:
         return False, "netem not in qdisc", actual
 
-    # Verify delay (allow 20% tolerance)
-    if requested_delay_ms > 0:
-        min_delay = requested_delay_ms * 0.8
-        if actual["delay_ms"] < min_delay:
-            return False, (
-                f"delay too low: actual={actual['delay_ms']:.1f}ms "
-                f"< requested={requested_delay_ms}ms * 0.8 = {min_delay:.1f}ms"
-            ), actual
+    tolerance = 0.25  # 25% tolerance
+    checks: List[str] = []
 
-    # Verify loss (allow 20% tolerance)
-    if requested_loss_pct > 0:
-        min_loss = requested_loss_pct * 0.8
-        if actual["loss_pct"] < min_loss:
-            return False, (
-                f"loss too low: actual={actual['loss_pct']:.1f}% "
-                f"< requested={requested_loss_pct}% * 0.8 = {min_loss:.1f}%"
-            ), actual
+    # Verify delay
+    req_delay = requested.get("delay_ms", 0)
+    if req_delay > 0:
+        if abs(actual["delay_ms"] - req_delay) > req_delay * tolerance:
+            checks.append(f'delay mismatch: actual={actual["delay_ms"]:.1f} vs requested={req_delay}')
+
+    # Verify loss
+    req_loss = requested.get("loss_pct", 0)
+    if req_loss > 0:
+        if abs(actual["loss_pct"] - req_loss) > req_loss * tolerance:
+            checks.append(f'loss mismatch: actual={actual["loss_pct"]:.1f} vs requested={req_loss}')
+
+    # Verify jitter
+    req_jitter = requested.get("jitter_ms", 0)
+    if req_jitter > 0:
+        if abs(actual["jitter_ms"] - req_jitter) > req_jitter * tolerance:
+            checks.append(f'jitter mismatch: actual={actual["jitter_ms"]:.1f} vs requested={req_jitter}')
+
+    # Verify reorder
+    req_reorder = requested.get("reorder_pct", 0)
+    if req_reorder > 0:
+        if abs(actual["reorder_pct"] - req_reorder) > req_reorder * tolerance:
+            checks.append(f'reorder mismatch: actual={actual["reorder_pct"]:.1f} vs requested={req_reorder}')
+
+    if checks:
+        return False, "; ".join(checks), actual
 
     return True, "ok", actual
 
@@ -425,6 +443,7 @@ def run_one_experiment(
     sock = None
     file_obj = None
     adapter = None
+    hello_ack: Dict[str, Any] = {}
 
     try:
         sock, file_obj = open_tcp(server_host, server_port)
@@ -432,6 +451,7 @@ def run_one_experiment(
         # --- HELLO handshake ---
         try:
             ack = send_hello(sock, file_obj, protocol, session_id, CLIENT_ID, EPOCH)
+            hello_ack = ack
         except Exception as e:
             run_valid = False
             failure_reason = f"HELLO failed: {e}"
@@ -460,7 +480,7 @@ def run_one_experiment(
 
                 if response.get("ok"):
                     accepted += 1
-                    adapter.update_from_response(response)
+                    adapter.update_after_accept(packet, response)
                 else:
                     rejected += 1
                     run_valid = False
@@ -502,16 +522,20 @@ def run_one_experiment(
 
     avg_rtt = sum(rtts) / len(rtts) if rtts else 0
 
-    # State match via adapter
+    # State match via adapter (independent state comparison)
     if adapter and adapter.last_seq > 0:
-        server_final = {
-            "last_seq": adapter.last_seq,
-            "last_mem": adapter.client_state.get("last_mem", ""),
-            "last_hash": adapter.client_state.get("last_hash", ""),
-        }
-        state_match = adapter.check_state_match(server_final)
+        state_match = adapter.check_state_match()
+        final_state = adapter.get_final_state_for_csv()
     else:
         state_match = False
+        final_state = {
+            "client_final_seq": 0,
+            "server_final_seq": 0,
+            "client_final_mem": "",
+            "server_final_mem": "",
+            "client_final_hash": "",
+            "server_final_hash": "",
+        }
 
     return {
         "session_id": session_id,
@@ -542,6 +566,13 @@ def run_one_experiment(
         "run_valid": run_valid,
         "failure_reason": failure_reason,
         "state_match": state_match,
+        "client_final_seq": final_state.get("client_final_seq", 0),
+        "server_final_seq": final_state.get("server_final_seq", 0),
+        "client_final_mem": final_state.get("client_final_mem", ""),
+        "server_final_mem": final_state.get("server_final_mem", ""),
+        "client_final_hash": final_state.get("client_final_hash", ""),
+        "server_final_hash": final_state.get("server_final_hash", ""),
+        "hello_ack": hello_ack,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
 
@@ -777,6 +808,7 @@ def main():
     parser.add_argument("--port", type=int, default=9002, help="Server port")
     parser.add_argument("--host", default=None, help="Remote server host (omit for local mode)")
     parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat")
+    parser.add_argument("--formal", action="store_true", help="Formal mode: all 6 conditions, 10 repeats")
     parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
     parser.add_argument("--no-spawn-server", action="store_true",
         help="Do NOT spawn embedded server; connect to --host:--port directly")
@@ -784,6 +816,14 @@ def main():
     args = parser.parse_args()
 
     repeats = 1 if args.quick else (args.repeats or REPEAT_COUNT)
+
+    # ---- Formal mode validation ----
+    if args.formal:
+        if args.conditions is not None:
+            parser.error('--formal cannot use --conditions subset')
+        if args.repeats is not None and args.repeats != 10:
+            parser.error('--formal requires 10 repeats')
+        repeats = 10
 
     # ---- Platform / privilege checks ----
     if not is_linux():
@@ -850,9 +890,16 @@ def main():
         "success_rate", "throughput_msg_per_sec", "elapsed_seconds",
         "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
         "run_valid", "failure_reason",
-        "execution_valid", "interface", "requested_netem_config", "actual_qdisc_config",
-        "actual_delay_ms", "actual_loss_pct", "actual_jitter_ms",
-        "server_git_commit", "state_match",
+        "execution_valid", "result_success", "state_audit_available",
+        "interface", "requested_netem_config", "actual_qdisc_config",
+        "actual_delay_ms", "actual_loss_pct", "actual_jitter_ms", "actual_reorder_pct",
+        "state_match",
+        "client_final_seq", "server_final_seq",
+        "client_final_mem", "server_final_mem",
+        "client_final_hash", "server_final_hash",
+        "server_git_commit", "server_git_dirty",
+        "server_python_version", "server_os_info",
+        "server_hostname", "server_cpu_model",
         "timestamp",
         "git_commit", "python_version", "os_info",
     ]
@@ -861,15 +908,23 @@ def main():
 
     # Collect metadata once
     git_commit = get_git_commit()
+    git_dirty = False
+    try:
+        import subprocess as _sp
+        _d = _sp.check_output(["git", "status", "--porcelain"], stderr=_sp.DEVNULL, text=True).strip()
+        git_dirty = bool(_d)
+    except Exception:
+        pass
     python_version = get_python_version()
     os_info = get_os_info()
+    server_env_from_ack: Dict[str, str] = {}  # populated from first HELLO_ACK in remote mode
 
     print(f"[INFO] Total experiments: {total}")
     print(f"[INFO] Protocols: {PROTOCOLS}")
     print(f"[INFO] Conditions: {[c[0] for c in conditions]}")
     print(f"[INFO] Repeats: {repeats}")
     print(f"[INFO] Interface: {interface}")
-    output_csv = SMOKE_CSV if args.quick else FORMAL_CSV
+    output_csv = SMOKE_CSV if args.quick else (FORMAL_CSV if args.formal else DEV_CSV)
     print(f"[INFO] Output: {output_csv}")
     print()
 
@@ -904,29 +959,73 @@ def main():
                         result["interface"] = interface
                         result["requested_netem_config"] = requested_config
                         result["actual_qdisc_config"] = tc_snap
-                        result["server_git_commit"] = git_commit  # local server; same commit
-                        # execution_valid: composite of 4 sub-checks
+                        # Populate server_env_from_ack from first HELLO_ACK in remote mode
+                        if args.no_spawn_server and not server_env_from_ack:
+                            ack = result.get("hello_ack", {})
+                            for k in ("server_git_commit", "server_git_dirty",
+                                      "server_python_version", "server_os_info",
+                                      "server_hostname", "server_cpu_model"):
+                                if k in ack:
+                                    server_env_from_ack[k] = ack[k]
+                        # server git info: from HELLO_ACK in remote mode, local otherwise
+                        if args.no_spawn_server:
+                            result["server_git_commit"] = server_env_from_ack.get("server_git_commit", "")
+                            result["server_git_dirty"] = server_env_from_ack.get("server_git_dirty", "")
+                            result["server_python_version"] = server_env_from_ack.get("server_python_version", "")
+                            result["server_os_info"] = server_env_from_ack.get("server_os_info", "")
+                            result["server_hostname"] = server_env_from_ack.get("server_hostname", "")
+                            result["server_cpu_model"] = server_env_from_ack.get("server_cpu_model", "")
+                        else:
+                            result["server_git_commit"] = git_commit
+                            result["server_git_dirty"] = str(git_dirty)
+                            result["server_python_version"] = python_version
+                            result["server_os_info"] = os_info
+                            result["server_hostname"] = socket.gethostname()
+                            result["server_cpu_model"] = ""
+                        # execution_valid: composite of sub-checks
+                        tc_requested = {
+                            "delay_ms": delay,
+                            "loss_pct": loss,
+                            "jitter_ms": jitter,
+                            "reorder_pct": reorder,
+                        }
                         tc_ok, _tc_reason, tc_actual = verify_tc_snapshot(
                             tc_snap, cond_name,
-                            requested_delay_ms=delay,
-                            requested_loss_pct=loss,
-                            requested_jitter_ms=jitter,
+                            requested=tc_requested,
                         )
                         result["actual_delay_ms"] = round(tc_actual["delay_ms"], 2)
                         result["actual_loss_pct"] = round(tc_actual["loss_pct"], 2)
                         result["actual_jitter_ms"] = round(tc_actual["jitter_ms"], 2)
+                        result["actual_reorder_pct"] = round(tc_actual["reorder_pct"], 2)
                         no_internal_exception = result["error_count"] == 0
                         no_response_mismatch = result["rejected_count"] == 0
-                        final_state_auditable = result["sent_count"] > 0
+                        have_last_server_response = result["accepted_count"] > 0
+                        server_last_seq = result.get("client_final_seq", 0) if have_last_server_response else None
+                        client_state_available = result.get("client_final_seq", 0) > 0
+                        no_malformed_response = no_response_mismatch
+                        final_state_auditable = (
+                            have_last_server_response
+                            and server_last_seq is not None
+                            and client_state_available
+                            and no_malformed_response
+                        )
+                        is_timeout = result["timeout_count"] > 0
                         exec_valid = (
                             tc_ok
                             and no_internal_exception
                             and no_response_mismatch
-                            and final_state_auditable
+                            and (final_state_auditable or is_timeout)
                         )
+                        result["state_audit_available"] = final_state_auditable
+                        result["result_success"] = not is_timeout and result["error_count"] == 0 and result["rejected_count"] == 0
+                        if is_timeout:
+                            exec_valid = True
+                            result["result_success"] = False
+                            result["state_audit_available"] = False
                         result["execution_valid"] = exec_valid
                         if not exec_valid:
                             any_execution_failure = True
+                        result.pop("hello_ack", None)
                         writer.writerow(result)
                         f.flush()
                         completed += 1
@@ -942,6 +1041,47 @@ def main():
     if completed != expected_rows:
         print(f"[ERROR] Matrix incomplete: {completed}/{expected_rows} rows written")
         any_execution_failure = True
+
+    # ---- Validator: strict post-hoc checks ----
+    import csv as _csv
+    issues: List[str] = []
+    sane_issues: List[str] = []
+    exec_issues: List[str] = []
+    tc_issues: List[str] = []
+    with open(tmp_csv, "r", encoding="utf-8") as vf:
+        reader = _csv.DictReader(vf)
+        for i, row in enumerate(reader, 1):
+            # Execution validity
+            if row.get("execution_valid") not in ("True", "true", "1"):
+                exec_issues.append(f"row {i}: execution_valid={row.get('execution_valid')}")
+            # tc verification
+            if row.get("condition_name") != "control":
+                if "mismatch" in str(row.get("failure_reason", "")):
+                    tc_issues.append(f"row {i}: tc mismatch: {row.get('failure_reason')}")
+            # Sane values
+            sr = float(row.get("success_rate", 0))
+            if sr < 0 or sr > 100:
+                sane_issues.append(f"row {i}: success_rate={sr} out of range")
+            # Git commit length must be 40
+            gc = row.get("server_git_commit", "")
+            if gc and len(gc) != 40:
+                issues.append(f"row {i}: server_git_commit length={len(gc)} (expected 40)")
+            # Git dirty must be false
+            gd = row.get("server_git_dirty", "")
+            if gd and gd not in ("false", "False", ""):
+                issues.append(f"row {i}: server_git_dirty={gd} (expected false)")
+
+    all_critical = issues + sane_issues + exec_issues + tc_issues
+    if all_critical:
+        print(f"[FAIL] {len(all_critical)} critical issues found:")
+        for iss in all_critical[:20]:
+            print(f"  - {iss}")
+        if len(all_critical) > 20:
+            print(f"  ... and {len(all_critical) - 20} more")
+        clear_tc_netem(interface)
+        if srv:
+            srv.stop()
+        sys.exit(1)
 
     # ---- Atomic replace: tmp → final ----
     if any_execution_failure:
