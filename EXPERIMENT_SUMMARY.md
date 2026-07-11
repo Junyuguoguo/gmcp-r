@@ -75,9 +75,9 @@ concurrency due to single-threaded TCP accept overhead.
 Source: `paper_data/05_weak_network.csv`
 | Protocol | Mean Success Rate | Mean Throughput | Mean RTT |
 |---|---:|---:|---:|
-| Gmcp R | 100.0% | 72.8 msg/s | 79.9 ms |
-| Hash Chain | 0.2% | 0.0 msg/s | 23.8 ms |
-| Seq Mac | 0.0% | 0.0 msg/s | 0.0 ms |
+| Gmcp R | 100.0% | 576.4 msg/s | 0.3 ms |
+| Hash Chain | 100.0% | 572.3 msg/s | 0.3 ms |
+| Seq Mac | 100.0% | 472.9 msg/s | 0.4 ms |
 
 **Note**: This is a **code-level simulation** (artificial `time.sleep` delays
 and random message drops in the client code), not a real `tc/netem` or ns-3
