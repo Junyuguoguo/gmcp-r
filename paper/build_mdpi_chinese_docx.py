@@ -942,9 +942,9 @@ def build_document():
         ["类别", "配置"],
         [
             ["客户端环境", "Python 3.11，macOS / Darwin 24.6.0（部分实验元数据记录）"],
-            ["服务器环境", "Python 3.11，同一主机 TCP loopback（127.0.0.1:9000/9001）"],
+            ["服务器环境", "Python 3.11，同一主机 TCP loopback（localhost:9000 / 127.0.0.1:9001）"],
             ["传输协议", "TCP/IP；GMCP-R 默认端口 9000，baseline 默认端口 9001"],
-            ["基线协议", "Hash Chain、Seq+MAC、Ticket Only"],
+            ["基线协议", "四种基线协议：Hash Chain、Authenticated Hash Chain、Seq+MAC、Ticket Only"],
             ["消息数量", "100、500、1000；并发实验为每客户端 200 条"],
             ["载荷大小", "64、128、256、512、1024 bytes（按实验类型不同取子集）"],
             ["攻击类型", "drop、modify、replay、prev_mem；票据实验另含 expired、replayed、tampered、rollback、wrong_session"],
@@ -1155,15 +1155,15 @@ def build_document():
     )
     add_table(
         doc,
-        "附录表 A1. 弱网仿真初步结果（25 种参数组合 x 2 次重复）",
+        "附录表 A1. 代码级发送丢弃与延迟实验（25 种参数组合 x 2 次重复）",
         ["协议", "成功率均值", "成功率标准差", "平均吞吐量 (msg/s)", "平均 RTT (ms)"],
         [
-            ["GMCP-R", "100.0%", "0.0%", "72.81", "79.90"],
-            ["Hash Chain", "0.18%", "0.24%", "0.00", "23.77"],
-            ["Seq+MAC", "0.0%", "0.0%", "0.00", "0.00"],
+            ["GMCP-R", "100.0%", "0.0%", "1159.5", "20.3"],
+            ["Hash Chain", "100.0%", "0.0%", "1113.7", "20.3"],
+            ["Seq+MAC", "100.0%", "0.0%", "1097.8", "20.3"],
         ],
         [1600, 1800, 1900, 2250, 1810],
-        source="数据来源：results/weak_network_simulation/summary_weak_network_simulation.csv。",
+        source="数据来源：paper_data/05_weak_network.csv。三种协议在统一重试预算下均达到100%成功率。实验为代码级应用层模拟，非tc/netem。",
     )
     add_figure(
         doc,
