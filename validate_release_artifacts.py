@@ -211,6 +211,11 @@ def verify_docx_content(root: Path) -> list:
             from docx import Document
             doc = Document(str(docx_path))
             full_text = "\n".join(p.text for p in doc.paragraphs)
+            # Also extract table cell text
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        full_text += "\n" + cell.text
 
             # Check key terms exist in DOCX
             key_terms = ["GMCP-R", "MemoryTicket", "Checkpoint"]
