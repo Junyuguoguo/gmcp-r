@@ -8,11 +8,13 @@
   2. 矩阵完整性（3 protocols × 6 conditions × 10 repeats = 180 行）
   3. 关键列存在且值合理
   4. execution_valid=True（非 control 行）
-  5. server_git_dirty=false
-  6. tc 参数匹配（actual_delay/loss 在 requested * 0.8 以上）
-  7. 不强制 100% success_rate（真实网络现象）
+  5. server_git_dirty=false, client_git_dirty=false
+  6. server_git_commit, client_git_commit 长度=40
+  7. tc 参数匹配（actual_delay/loss 在 requested * 0.8 以上）
+  8. control 条件确认无 netem 残留
+  9. 不强制 100% success_rate（真实网络现象）
 
-如果任何 issue 或 exec_issue，以非零码退出。
+任何 issue / sane_issue / exec_issue / tc_issue 均以非零码退出。
 """
 
 import csv
@@ -38,7 +40,13 @@ REQUIRED_COLUMNS = [
     "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
     "execution_valid", "interface", "requested_netem_config", "actual_qdisc_config",
     "actual_delay_ms", "actual_loss_pct", "actual_jitter_ms",
-    "server_git_commit", "state_match",
+    "execution_mode", "impairment_direction", "tc_endpoint",
+    "server_git_commit", "server_git_dirty",
+    "client_git_commit", "client_git_dirty",
+    "client_hostname", "client_cpu_model",
+    "client_python_version", "client_os_info",
+    "command_line",
+    "state_match",
     "timestamp",
 ]
 
@@ -166,15 +174,33 @@ def main():
         exec_v = r.get("execution_valid", "")
         git_c = r.get("server_git_commit", "")
         git_dirty = r.get("server_git_dirty", "")
+        client_gc = r.get("client_git_commit", "")
+        client_dirty = r.get("client_git_dirty", "")
         state_m = r.get("state_match", "")
 
         # server_git_commit must be non-empty
         if not git_c:
             exec_issues.append(f"Row {row_num}: server_git_commit is empty")
 
+        # server_git_commit length must be 40
+        if git_c and len(git_c) != 40:
+            exec_issues.append(f"Row {row_num}: server_git_commit length={len(git_c)} (expected 40)")
+
         # server_git_dirty must be false (if column exists)
         if "server_git_dirty" in r and git_dirty not in ("false", "False", ""):
             exec_issues.append(f"Row {row_num}: server_git_dirty={git_dirty} (expected false)")
+
+        # client_git_commit must be non-empty
+        if not client_gc:
+            exec_issues.append(f"Row {row_num}: client_git_commit is empty")
+
+        # client_git_commit length must be 40
+        if client_gc and len(client_gc) != 40:
+            exec_issues.append(f"Row {row_num}: client_git_commit length={len(client_gc)} (expected 40)")
+
+        # client_git_dirty must be false
+        if "client_git_dirty" in r and client_dirty not in ("false", "False", ""):
+            exec_issues.append(f"Row {row_num}: client_git_dirty={client_dirty} (expected false)")
 
         # state_match should exist
         if state_m == "":
@@ -183,6 +209,12 @@ def main():
         # Non-control conditions must have execution_valid=True
         if cond != "control" and exec_v not in ("True", "true", True):
             exec_issues.append(f"Row {row_num}: condition={cond} but execution_valid={exec_v}")
+
+        # Control conditions must not have netem in actual_qdisc_config
+        if cond == "control":
+            actual_qdisc = r.get("actual_qdisc_config", "")
+            if "netem" in actual_qdisc:
+                exec_issues.append(f"Row {row_num}: control condition has netem in actual_qdisc_config")
 
     # 6. tc parameter matching (actual vs requested)
     tc_issues = []
@@ -260,19 +292,15 @@ def main():
             f"avg_rtt={avg_rtt:7.2f}ms"
         )
 
-    # 9. Final verdict — strict: any issue or exec_issue → FAIL
+    # 9. Final verdict — strict: any issue type → FAIL
     print()
-    all_critical = issues + exec_issues
-    all_warnings = sane_issues + tc_issues
+    all_critical = issues + sane_issues + exec_issues + tc_issues
 
     if all_critical:
         for issue in all_critical:
             print(f"FAIL: {issue}")
         print(f"\nFAIL: {len(all_critical)} critical issue(s) found. Exiting with error.")
         sys.exit(1)
-    elif all_warnings:
-        print(f"PASS: All critical checks passed ({len(all_warnings)} warning(s)).")
-        sys.exit(0)
     else:
         print("PASS: All checks passed.")
         sys.exit(0)

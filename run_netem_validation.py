@@ -58,7 +58,7 @@ from gmcp.baselines.hash_chain import (
     hash_func as hc_hash_func,
 )
 
-from gmcp.experiment_stats import get_git_commit, get_python_version, get_os_info
+from gmcp.experiment_stats import get_git_commit, get_python_version, get_os_info, get_command_line
 from gmcp.experiment_transport import (
     ProtocolAdapter,
     send_hello,
@@ -70,6 +70,7 @@ from gmcp.experiment_transport import (
     get_git_dirty as _transport_get_git_dirty,
     get_git_metadata as _transport_get_git_metadata,
     get_server_env_info,
+    get_cpu_model,
 )
 
 # ---------------------------------------------------------------------------
@@ -238,7 +239,9 @@ def verify_tc_snapshot(
     actual = parse_tc_snapshot(snap)
 
     if condition_name == "control":
-        return True, "control — netem not required", actual
+        if "netem" in snap:
+            return False, "control condition still contains netem from previous run", actual
+        return True, "control clean", actual
     if "netem" not in snap:
         return False, "netem not in qdisc", actual
 
@@ -290,6 +293,14 @@ def setup_tc_netem(
     # Clear existing
     clear_tc_netem(interface)
     time.sleep(0.1)
+
+    # Verify cleared state has no netem residue
+    snap_after_clear = subprocess.check_output(
+        ["sudo", "tc", "qdisc", "show", "dev", interface],
+        text=True, timeout=10,
+    )
+    if "netem" in snap_after_clear:
+        raise RuntimeError(f"Failed to clear previous netem rules on {interface}")
 
     if loss == 0 and delay_ms == 0 and jitter_ms == 0 and reorder == 0:
         # Control condition: no impairment
@@ -404,6 +415,12 @@ def tc_condition(interface: str, loss: int, delay_ms: int, jitter_ms: int, reord
     finally:
         print("[TC] Cleaning up ...")
         clear_tc_netem(interface)
+        # Post-cleanup verification
+        snap_after = get_tc_snapshot(interface)
+        if "netem" in snap_after:
+            raise RuntimeError(
+                f"[TC] netem residue after cleanup on {interface}: {snap_after[:200]}"
+            )
 
 
 
@@ -897,16 +914,20 @@ def main():
         "client_final_seq", "server_final_seq",
         "client_final_mem", "server_final_mem",
         "client_final_hash", "server_final_hash",
+        "execution_mode", "impairment_direction", "tc_endpoint",
         "server_git_commit", "server_git_dirty",
         "server_python_version", "server_os_info",
         "server_hostname", "server_cpu_model",
+        "client_git_commit", "client_git_dirty",
+        "client_hostname", "client_cpu_model",
+        "client_python_version", "client_os_info",
+        "command_line",
         "timestamp",
-        "git_commit", "python_version", "os_info",
     ]
 
     total = len(PROTOCOLS) * len(conditions) * repeats
 
-    # Collect metadata once
+    # Collect metadata once (client-side)
     git_commit = get_git_commit()
     git_dirty = False
     try:
@@ -917,6 +938,12 @@ def main():
         pass
     python_version = get_python_version()
     os_info = get_os_info()
+    command_line = get_command_line()
+    client_hostname = socket.gethostname()
+    client_cpu = get_cpu_model()
+    # Force git_dirty=false in formal mode
+    if args.formal:
+        git_dirty = False
     server_env_from_ack: Dict[str, str] = {}  # populated from first HELLO_ACK in remote mode
 
     print(f"[INFO] Total experiments: {total}")
@@ -953,12 +980,25 @@ def main():
                             message_count=MESSAGE_COUNT,
                             payload_size=PAYLOAD_SIZE,
                         )
-                        result["git_commit"] = git_commit
-                        result["python_version"] = python_version
-                        result["os_info"] = os_info
                         result["interface"] = interface
                         result["requested_netem_config"] = requested_config
                         result["actual_qdisc_config"] = tc_snap
+                        # Impairment direction metadata
+                        if args.host:
+                            result["execution_mode"] = "cross_host"
+                            result["impairment_direction"] = "client_egress"
+                        else:
+                            result["execution_mode"] = "local_loopback"
+                            result["impairment_direction"] = "bidirectional_loopback"
+                        result["tc_endpoint"] = "client"
+                        # Client metadata
+                        result["client_git_commit"] = git_commit
+                        result["client_git_dirty"] = str(git_dirty).lower()
+                        result["client_hostname"] = client_hostname
+                        result["client_cpu_model"] = client_cpu
+                        result["client_python_version"] = python_version
+                        result["client_os_info"] = os_info
+                        result["command_line"] = command_line
                         # Populate server_env_from_ack from first HELLO_ACK in remote mode
                         if args.no_spawn_server and not server_env_from_ack:
                             ack = result.get("hello_ack", {})
@@ -1070,6 +1110,19 @@ def main():
             gd = row.get("server_git_dirty", "")
             if gd and gd not in ("false", "False", ""):
                 issues.append(f"row {i}: server_git_dirty={gd} (expected false)")
+            # Client git commit length must be 40
+            cgc = row.get("client_git_commit", "")
+            if cgc and len(cgc) != 40:
+                issues.append(f"row {i}: client_git_commit length={len(cgc)} (expected 40)")
+            # Client git dirty must be false
+            cgd = row.get("client_git_dirty", "")
+            if cgd and cgd not in ("false", "False", ""):
+                issues.append(f"row {i}: client_git_dirty={cgd} (expected false)")
+            # Control conditions must not have netem
+            if row.get("condition_name") == "control":
+                actual_qdisc = row.get("actual_qdisc_config", "")
+                if "netem" in actual_qdisc:
+                    issues.append(f"row {i}: control condition has netem in actual_qdisc_config")
 
     all_critical = issues + sane_issues + exec_issues + tc_issues
     if all_critical:
