@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+跨主机实验验证框架
+==================
+
+在两台主机（client, server）之间运行 GMCP-R 协议实验，测量真实网络 RTT、
+吞吐量和成功率。
+
+矩阵：
+  4 protocols × 2 msg_counts × 2 payloads × 20 repeats = 320 rows
+
+使用方法：
+  服务端：python run_cross_host_validation.py --bind-host 0.0.0.0 --port 9001
+  客户端：python run_cross_host_validation.py --host <server-ip> --port 9001 --no-spawn-server
+
+关键设计：
+  - 没有真实服务器连接时，拒绝生成伪造数据
+  - 记录 client_host_id, server_host_id, network_path_type, baseline_ping_rtt_ms
+"""
+
+import argparse
+import csv
+import json
+import os
+import platform
+import socket
+import subprocess
+import sys
+import time
+import threading
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# GMCP-R imports
+# ---------------------------------------------------------------------------
+from gmcp.config import (
+    DATA_AUTH_KEY,
+    EPOCH,
+    CLIENT_ID,
+)
+from gmcp.crypto_utils import hash_text, hmac_sha256_hex
+from gmcp.memory import initial_memory
+from gmcp.packet import build_data_packet
+from gmcp.protocol import GMCPState, GMCPVerifier
+from gmcp.checkpoint_manager import CheckpointManager
+from gmcp.session_registry import SessionContext, SessionRegistry
+
+# Baseline protocol builders
+from gmcp.baselines.seq_mac import build_data_packet as seq_mac_build
+from gmcp.baselines.hash_chain import build_data_packet as hc_build
+from gmcp.baselines.authenticated_hash_chain import build_data_packet as ahc_build
+from gmcp.baselines.ticket_only import build_data_packet as ticket_build
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+OUTPUT_DIR = "results/cross_host"
+OUTPUT_CSV = os.path.join(OUTPUT_DIR, "cross_host_results.csv")
+
+PROTOCOLS = ["gmcp_r", "seq_mac", "hash_chain", "authenticated_hash_chain"]
+MESSAGE_COUNTS = [500, 1000]
+PAYLOAD_SIZES = [128, 512]
+REPEAT_COUNT = 20
+
+SOCKET_TIMEOUT = 10.0
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def get_host_id() -> str:
+    """Return a short identifier for this machine."""
+    return platform.node() or socket.gethostname() or "unknown-host"
+
+
+def measure_baseline_rtt(host: str, port: int, samples: int = 5) -> float:
+    """
+    Measure baseline TCP RTT to server (no GMCP payload).
+    Returns median RTT in milliseconds.  Returns -1.0 on failure.
+    """
+    rtts: List[float] = []
+    for _ in range(samples):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3.0)
+            t0 = time.perf_counter()
+            sock.connect((host, port))
+            t1 = time.perf_counter()
+            sock.close()
+            rtts.append((t1 - t0) * 1000.0)
+        except Exception:
+            pass
+    if not rtts:
+        return -1.0
+    rtts.sort()
+    return round(rtts[len(rtts) // 2], 2)
+
+
+def classify_network_path(host: str) -> str:
+    """Classify the network path type based on the target host."""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return "loopback"
+    # Simple heuristic: private ranges → LAN, else WAN
+    parts = host.split(".")
+    if len(parts) == 4:
+        first = int(parts[0])
+        second = int(parts[1])
+        if first == 10:
+            return "lan"
+        if first == 172 and 16 <= second <= 31:
+            return "lan"
+        if first == 192 and second == 168:
+            return "lan"
+    return "wan"
+
+
+def ensure_output_dir():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def make_payload(seq: int, payload_size: int) -> str:
+    prefix = "cross-%d-" % seq
+    remain = max(0, payload_size - len(prefix))
+    return prefix + ("x" * remain)
+
+
+def send_json_line(sock: socket.socket, packet: Dict[str, Any]):
+    raw = json.dumps(packet, ensure_ascii=False).encode("utf-8") + b"\n"
+    sock.sendall(raw)
+
+
+def recv_json_line(file_obj) -> Dict[str, Any]:
+    line = file_obj.readline()
+    if not line:
+        raise ConnectionError("server closed connection")
+    return json.loads(line)
+
+
+def enable_tcp_nodelay(sock: socket.socket):
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
+
+def open_tcp(host: str, port: int):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    enable_tcp_nodelay(sock)
+    sock.settimeout(SOCKET_TIMEOUT)
+    sock.connect((host, port))
+    file_obj = sock.makefile("r", encoding="utf-8", newline="\n")
+    return sock, file_obj
+
+
+def close_tcp(sock, file_obj):
+    try:
+        if file_obj:
+            file_obj.close()
+    except Exception:
+        pass
+    try:
+        if sock:
+            sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        if sock:
+            sock.close()
+    except Exception:
+        pass
+
+
+def ping_server(host: str, port: int) -> bool:
+    """Test if the GMCP-R TCP server is reachable."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3.0)
+        sock.connect((host, port))
+        file_obj = sock.makefile("r", encoding="utf-8", newline="\n")
+        msg = {"type": "PING", "timestamp": time.time()}
+        send_json_line(sock, msg)
+        resp = recv_json_line(file_obj)
+        close_tcp(sock, file_obj)
+        return resp.get("ok") is True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Protocol-specific packet builders
+# ---------------------------------------------------------------------------
+
+def build_packet_for_protocol(
+    protocol: str,
+    session_id: str,
+    seq: int,
+    payload: str,
+    current_mem: str,
+) -> Dict[str, Any]:
+    """Build a data packet for the specified protocol."""
+    if protocol == "gmcp_r":
+        return build_data_packet(
+            session_id=session_id,
+            sender_id=CLIENT_ID,
+            epoch=EPOCH,
+            seq=seq,
+            prev_mem=current_mem,
+            payload=payload,
+        )
+    elif protocol == "seq_mac":
+        return seq_mac_build(
+            session_id=session_id,
+            sender_id=CLIENT_ID,
+            epoch=EPOCH,
+            seq=seq,
+            payload=payload,
+        )
+    elif protocol == "hash_chain":
+        return hc_build(
+            session_id=session_id,
+            sender_id=CLIENT_ID,
+            epoch=EPOCH,
+            seq=seq,
+            prev_hash=current_mem,
+            payload=payload,
+        )
+    elif protocol == "authenticated_hash_chain":
+        return ahc_build(
+            session_id=session_id,
+            sender_id=CLIENT_ID,
+            epoch=EPOCH,
+            seq=seq,
+            prev_hash=current_mem,
+            payload=payload,
+        )
+    else:
+        raise ValueError(f"Unknown protocol: {protocol}")
+
+
+def get_initial_state(protocol: str, session_id: str) -> Tuple[str, Any]:
+    """
+    Return (initial_memory_value, state_or_none) for the protocol.
+    """
+    if protocol in ("gmcp_r",):
+        mem = initial_memory(session_id, CLIENT_ID, EPOCH, "demo-seed")
+        return mem, None
+    elif protocol == "seq_mac":
+        return "", None
+    elif protocol in ("hash_chain", "authenticated_hash_chain"):
+        mem = hash_text(f"init:{session_id}")
+        return mem, None
+    else:
+        raise ValueError(f"Unknown protocol: {protocol}")
+
+
+# ---------------------------------------------------------------------------
+# Single experiment
+# ---------------------------------------------------------------------------
+
+def run_one_experiment(
+    protocol: str,
+    message_count: int,
+    payload_size: int,
+    repeat_id: int,
+    server_host: str,
+    server_port: int,
+    client_host_id: str,
+    server_host_id: str,
+    network_path_type: str,
+    baseline_rtt_ms: float,
+) -> Dict[str, Any]:
+    """Run a single cross-host experiment and return a result dict."""
+
+    session_id = (
+        f"cross-{protocol}-m{message_count}-p{payload_size}-"
+        f"r{repeat_id}-{int(time.time() * 1000000)}"
+    )
+
+    current_mem, _ = get_initial_state(protocol, session_id)
+
+    accepted_count = 0
+    rejected_count = 0
+    timeout_count = 0
+    error_count = 0
+    sent_count = 0
+    rtts: List[float] = []
+
+    start_time = time.time()
+    sock = None
+    file_obj = None
+
+    try:
+        sock, file_obj = open_tcp(server_host, server_port)
+
+        for seq in range(1, message_count + 1):
+            payload = make_payload(seq, payload_size)
+            packet = build_packet_for_protocol(
+                protocol, session_id, seq, payload, current_mem
+            )
+
+            send_time = time.perf_counter()
+            send_json_line(sock, packet)
+            sent_count += 1
+
+            try:
+                response = recv_json_line(file_obj)
+                recv_time = time.perf_counter()
+                rtts.append((recv_time - send_time) * 1000.0)
+
+                if response.get("ok"):
+                    accepted_count += 1
+                    if protocol == "gmcp_r":
+                        current_mem = response.get("last_mem", current_mem)
+                else:
+                    rejected_count += 1
+
+            except socket.timeout:
+                timeout_count += 1
+            except Exception as e:
+                error_count += 1
+
+    except Exception as e:
+        print(f"  [ERROR] {protocol} r{repeat_id}: {e}")
+    finally:
+        close_tcp(sock, file_obj)
+
+    elapsed = time.time() - start_time
+
+    success_rate = accepted_count / message_count * 100 if message_count > 0 else 0
+    throughput = accepted_count / elapsed if elapsed > 0 else 0
+
+    def percentile(values: List[float], pct: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        pos = (len(ordered) - 1) * pct
+        low = int(pos)
+        high = min(low + 1, len(ordered) - 1)
+        weight = pos - low
+        return ordered[low] * (1 - weight) + ordered[high] * weight
+
+    avg_rtt = sum(rtts) / len(rtts) if rtts else 0
+
+    return {
+        "session_id": session_id,
+        "experiment_type": "cross_host",
+        "protocol": protocol,
+        "client_host_id": client_host_id,
+        "server_host_id": server_host_id,
+        "network_path_type": network_path_type,
+        "server_host": server_host,
+        "server_port": server_port,
+        "baseline_ping_rtt_ms": baseline_rtt_ms,
+        "message_count": message_count,
+        "payload_size": payload_size,
+        "repeat_id": repeat_id,
+        "sent_count": sent_count,
+        "accepted_count": accepted_count,
+        "rejected_count": rejected_count,
+        "timeout_count": timeout_count,
+        "error_count": error_count,
+        "success_rate": round(success_rate, 2),
+        "throughput_msg_per_sec": round(throughput, 2),
+        "elapsed_seconds": round(elapsed, 3),
+        "avg_rtt_ms": round(avg_rtt, 2),
+        "p50_rtt_ms": round(percentile(rtts, 0.50), 2),
+        "p95_rtt_ms": round(percentile(rtts, 0.95), 2),
+        "p99_rtt_ms": round(percentile(rtts, 0.99), 2),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Embedded server (optional)
+# ---------------------------------------------------------------------------
+
+def _session_factory(session_id: str, checkpoint_interval: int) -> SessionContext:
+    """Factory for creating new SessionContext objects."""
+    mem_seed = "demo-seed"
+    m0 = initial_memory(session_id, CLIENT_ID, EPOCH, mem_seed)
+    state = GMCPState(
+        session_id=session_id,
+        sender_id=CLIENT_ID,
+        epoch=EPOCH,
+        last_seq=0,
+        last_mem=m0,
+    )
+    verifier = GMCPVerifier(state)
+    cp_mgr = CheckpointManager(
+        session_id=session_id,
+        epoch=EPOCH,
+        checkpoint_interval=checkpoint_interval,
+    )
+    return SessionContext(
+        session_id=session_id,
+        state=state,
+        verifier=verifier,
+        checkpoint_manager=cp_mgr,
+    )
+
+
+class EmbeddedTCPServer:
+    """
+    Lightweight TCP server that handles GMCP-R PING and DATA packets.
+    Spawned only when --no-spawn-server is NOT set.
+    """
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self._registry = SessionRegistry(factory=_session_factory)
+        self._server_sock: Optional[socket.socket] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+
+    def start(self):
+        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_sock.bind((self.host, self.port))
+        self._server_sock.listen(16)
+        self._running = True
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        print(f"[SERVER] Listening on {self.host}:{self.port}")
+
+    def stop(self):
+        self._running = False
+        if self._server_sock:
+            try:
+                self._server_sock.close()
+            except Exception:
+                pass
+
+    def _accept_loop(self):
+        while self._running:
+            try:
+                conn, addr = self._server_sock.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                threading.Thread(
+                    target=self._handle_client, args=(conn, addr), daemon=True
+                ).start()
+            except OSError:
+                break
+
+    def _handle_client(self, conn: socket.socket, addr):
+        file_obj = None
+        try:
+            file_obj = conn.makefile("r", encoding="utf-8", newline="\n")
+            while True:
+                line = file_obj.readline()
+                if not line:
+                    break
+                try:
+                    packet = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                ptype = packet.get("type", "")
+
+                if ptype == "PING":
+                    resp = {"ok": True, "type": "PONG", "server_time": time.time()}
+                    self._send(conn, resp)
+                elif ptype == "DATA":
+                    resp = self._handle_data(packet)
+                    self._send(conn, resp)
+                else:
+                    self._send(conn, {"ok": False, "reason": f"unknown type: {ptype}"})
+        except (ConnectionError, socket.timeout, OSError):
+            pass
+        finally:
+            close_tcp(conn, file_obj)
+
+    def _handle_data(self, packet: Dict[str, Any]) -> Dict[str, Any]:
+        session_id = packet.get("session_id", "unknown")
+        protocol = packet.get("protocol", "gmcp_r")
+
+        ctx = self._registry.get_or_create(session_id)
+
+        if protocol == "gmcp_r":
+            ok, reason = ctx.verifier.verify_data_packet(packet)
+            return {
+                "ok": ok,
+                "reason": reason,
+                "last_seq": ctx.state.last_seq,
+                "last_mem": ctx.state.last_mem,
+            }
+        else:
+            # Baseline protocols: basic verification
+            seq = packet.get("seq", 0)
+            if seq <= ctx.state.last_seq:
+                return {"ok": False, "reason": "replay_or_stale_seq"}
+            ctx.state.last_seq = seq
+            return {"ok": True, "reason": "ok", "last_seq": ctx.state.last_seq}
+
+    @staticmethod
+    def _send(conn: socket.socket, resp: Dict[str, Any]):
+        raw = json.dumps(resp, ensure_ascii=False).encode("utf-8") + b"\n"
+        try:
+            conn.sendall(raw)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="GMCP-R cross-host experiment validation framework"
+    )
+    parser.add_argument("--host", default=None, help="Server host to connect to (client mode)")
+    parser.add_argument("--port", type=int, default=9001, help="Server port (default: 9001)")
+    parser.add_argument("--bind-host", default="127.0.0.1", help="Bind address for server mode")
+    parser.add_argument(
+        "--no-spawn-server",
+        action="store_true",
+        help="Do NOT spawn an embedded server; connect to an external server at --host:--port",
+    )
+    parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat only")
+    parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
+    args = parser.parse_args()
+
+    repeats = 1 if args.quick else (args.repeats or REPEAT_COUNT)
+
+    # Determine mode
+    if args.no_spawn_server:
+        # CLIENT MODE: must have a reachable server
+        if not args.host:
+            print("[ERROR] --host is required when --no-spawn-server is set.")
+            sys.exit(1)
+
+        server_host = args.host
+        server_port = args.port
+
+        print(f"[CLIENT] Target server: {server_host}:{server_port}")
+        print("[CLIENT] Checking server reachability ...")
+        if not ping_server(server_host, server_port):
+            print("[FATAL] Cannot reach GMCP-R server. Refusing to generate data.")
+            print("        Start the server first:")
+            print(f"        python run_cross_host_validation.py --bind-host 0.0.0.0 --port {server_port}")
+            sys.exit(1)
+        print("[CLIENT] Server is reachable.")
+    else:
+        # SERVER + CLIENT mode: spawn embedded server
+        server_host = "127.0.0.1"
+        server_port = args.port
+        print(f"[MODE] Spawning embedded server on {args.bind_host}:{server_port}")
+        srv = EmbeddedTCPServer(args.bind_host, server_port)
+        srv.start()
+        time.sleep(0.3)
+
+    # Measure baseline RTT
+    print("[INFO] Measuring baseline RTT ...")
+    baseline_rtt = measure_baseline_rtt(server_host, server_port)
+    print(f"[INFO] Baseline RTT: {baseline_rtt:.2f} ms")
+
+    client_host_id = get_host_id()
+    server_host_id = server_host if args.no_spawn_server else get_host_id()
+    network_path_type = classify_network_path(server_host)
+
+    ensure_output_dir()
+
+    fieldnames = [
+        "session_id", "experiment_type", "protocol",
+        "client_host_id", "server_host_id", "network_path_type",
+        "server_host", "server_port", "baseline_ping_rtt_ms",
+        "message_count", "payload_size", "repeat_id",
+        "sent_count", "accepted_count", "rejected_count",
+        "timeout_count", "error_count",
+        "success_rate", "throughput_msg_per_sec", "elapsed_seconds",
+        "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
+        "timestamp",
+    ]
+
+    total = len(PROTOCOLS) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * repeats
+    print(f"[INFO] Total experiments: {total}")
+    print(f"[INFO] Protocols: {PROTOCOLS}")
+    print(f"[INFO] Message counts: {MESSAGE_COUNTS}")
+    print(f"[INFO] Payload sizes: {PAYLOAD_SIZES}")
+    print(f"[INFO] Repeats: {repeats}")
+    print(f"[INFO] Output: {OUTPUT_CSV}")
+    print()
+
+    # Check if server is truly reachable (hard guard)
+    if not ping_server(server_host, server_port):
+        print("[FATAL] Server not reachable at experiment start. Aborting.")
+        sys.exit(1)
+
+    completed = 0
+    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for protocol in PROTOCOLS:
+            for msg_count in MESSAGE_COUNTS:
+                for payload_size in PAYLOAD_SIZES:
+                    for repeat_id in range(1, repeats + 1):
+                        result = run_one_experiment(
+                            protocol=protocol,
+                            message_count=msg_count,
+                            payload_size=payload_size,
+                            repeat_id=repeat_id,
+                            server_host=server_host,
+                            server_port=server_port,
+                            client_host_id=client_host_id,
+                            server_host_id=server_host_id,
+                            network_path_type=network_path_type,
+                            baseline_rtt_ms=baseline_rtt,
+                        )
+                        writer.writerow(result)
+                        f.flush()
+                        completed += 1
+                        acc = result["accepted_count"]
+                        rej = result["rejected_count"]
+                        print(
+                            f"  [{completed}/{total}] {protocol} m={msg_count} "
+                            f"p={payload_size} r={repeat_id}: "
+                            f"accepted={acc} rejected={rej} "
+                            f"rtt={result['avg_rtt_ms']:.1f}ms"
+                        )
+
+    print(f"\n[DONE] Results written to {OUTPUT_CSV}")
+    print(f"[DONE] {completed} experiments completed.")
+
+
+if __name__ == "__main__":
+    main()

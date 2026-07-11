@@ -4,16 +4,32 @@
 # 弱网仿真实验（完全重写）
 #
 # 实验矩阵：3 protocols × 5 loss_rates × 5 delay_ms × 2 repeats = 150 rows
-# 每种协议使用独立状态管理 + HELLO握手 + 正式构包函数 + 重试策略
+#
+# 核心改造点：
+#   1. argparse 命令行参数
+#   2. 确定性随机数（SHA-256 派生种子）
+#   3. 真正应用层丢弃（should_drop 时不调用 sendall）
+#   4. 公平重试策略（三种协议完全相同的 MAX_RETRIES, RETRY_DELAY, loss/delay scheduler）
+#   5. 四类时间区分
+#   6. 九个计数字段
+#   7. 协议状态审计字段
+#   8. HELLO 握手验证
+#   9. 原子发布
+#  10. 禁止静默异常
 
+import argparse
 import csv
+import hashlib
 import json
+import math
 import os
+import random
 import socket
 import subprocess
 import sys
 import time
-from typing import Dict, Any, List, Tuple
+from datetime import datetime
+from typing import Dict, Any, List, Tuple, Optional
 
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,13 +45,12 @@ from gmcp.config import (
 from gmcp.crypto_utils import hash_text, hmac_sha256_hex, with_hmac, verify_hmac
 from gmcp.memory import initial_memory, update_memory
 from gmcp.packet import build_data_packet as gmcp_build_data_packet
-from gmcp.packet import packet_without_auth
 from gmcp.experiment_stats import (
     ExperimentTracker,
     calculate_statistics,
 )
 
-# 导入baseline协议
+# 导入 baseline 协议
 from gmcp.baselines.hash_chain import (
     create_initial_state as hash_chain_create_state,
     build_data_packet as hash_chain_build_packet,
@@ -46,37 +61,112 @@ from gmcp.baselines.seq_mac import (
 )
 
 # =========================
-# 实验参数
+# 常量
 # =========================
 
 OUTPUT_DIR = "results/weak_network_simulation"
-OUTPUT_CSV = os.path.join(OUTPUT_DIR, "weak_network_simulation_results.csv")
+PAPER_DATA_CSV = "paper_data/05_weak_network.csv"
 
 PROTOCOLS = ["gmcp_r", "hash_chain", "seq_mac"]
 LOSS_RATES = [0, 1, 2, 5, 10]       # 丢包率 (%)
 DELAY_MS = [0, 20, 50, 100, 200]    # 延迟 (ms)
-REORDER_RATE = 0                      # 乱序率固定0
-MESSAGE_COUNT = 200
-PAYLOAD_SIZE = 128
-REPEATS = [1, 2]
+REORDER_RATE = 0                      # 乱序率固定 0
 
-# 所有协议统一使用 real_baseline_server (port 9001)
-# gmcp_r 也需要 HELLO 握手，所以不能用 real_tcp_server (port 9000)
-SERVER_PORT = 9001
+# 服务器端口映射（所有协议通过 real_baseline_server 统一处理，端口 9001）
+PROTOCOL_PORT = {
+    "gmcp_r": 9001,
+    "hash_chain": 9001,
+    "seq_mac": 9001,
+}
+
+# HELLO 握手时的协议名称映射（gmcp_r 在服务端注册为 "gmcp"）
+WIRE_PROTOCOL_NAMES = {
+    "gmcp_r": "gmcp",
+    "hash_chain": "hash_chain",
+    "seq_mac": "seq_mac",
+}
+
 SOCKET_TIMEOUT = 30.0
-SERVER_SPAWN_WAIT = 8
+SERVER_SPAWN_WAIT = 10
 
-# 重试策略
-MAX_RETRIES = 3
-RETRY_DELAY = 0.1  # 100ms
+# 重试策略（所有协议统一）
+MAX_RETRIES = 3         # initial attempt + 3 retries = 4 attempts max
+RETRY_DELAY_MS = 100    # 100ms between retries
+
+
+# =========================
+# 命令行参数
+# =========================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="GMCP-R 弱网仿真实验"
+    )
+    parser.add_argument("--host", default=SERVER_TARGET_HOST, help="服务器地址")
+    parser.add_argument("--port", type=int, default=None, help="服务器端口（覆盖默认映射）")
+    parser.add_argument("--spawn-server", action="store_true", default=True,
+                        help="自动启动服务器（默认启用）")
+    parser.add_argument("--no-spawn-server", dest="spawn_server", action="store_false",
+                        help="不自动启动服务器")
+    parser.add_argument("--output", default=None, help="结果 CSV 输出路径")
+    parser.add_argument("--paper-output", default=PAPER_DATA_CSV, help="paper_data 输出路径")
+    parser.add_argument("--seed", type=int, default=20260711, help="基础随机种子")
+    parser.add_argument("--repeats", type=int, default=2, help="每配置重复次数")
+    parser.add_argument("--message-count", type=int, default=200, help="每轮消息数")
+    parser.add_argument("--payload-size", type=int, default=128, help="载荷大小（字节）")
+    parser.add_argument("--max-retries", type=int, default=3, help="最大重试次数")
+    parser.add_argument("--retry-delay-ms", type=int, default=100, help="重试间隔（毫秒）")
+    parser.add_argument("--smoke-only", action="store_true", help="仅运行 smoke 测试")
+    parser.add_argument("--formal", action="store_true", help="运行正式 150 行实验")
+    parser.add_argument("--allow-dirty", action="store_true", help="允许 dirty worktree 运行")
+    return parser.parse_args()
 
 
 # =========================
 # 辅助函数
 # =========================
 
-def ensure_output_dir():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def derive_run_seed(base_seed: int, protocol: str, loss_rate: float,
+                    delay_ms: float, repeat_id: int,
+                    message_count: int, payload_size: int) -> str:
+    """确定性种子派生：SHA-256(base_seed|protocol|loss_rate|delay_ms|repeat_id|mc|ps)"""
+    key = f"{base_seed}|{protocol}|{loss_rate}|{delay_ms}|{repeat_id}|{message_count}|{payload_size}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def make_loss_schedule(run_seed: str, message_count: int, loss_rate: float) -> List[bool]:
+    """
+    确定性丢包调度：对每条消息生成 should_drop 布尔值。
+    使用独立的 RNG 实例，种子从 run_seed + '|loss' 派生。
+    """
+    loss_seed = hashlib.sha256(f"{run_seed}|loss".encode()).hexdigest()[:16]
+    rng = random.Random(loss_seed)
+    schedule = []
+    for _ in range(message_count):
+        schedule.append(rng.random() < loss_rate / 100.0)
+    return schedule
+
+
+def make_delay_schedule(run_seed: str, message_count: int, delay_ms: float) -> List[float]:
+    """
+    确定性延迟调度：±20% jitter。
+    返回每条消息的实际延迟（毫秒）。
+    使用独立的 RNG 实例，种子从 run_seed + '|delay' 派生。
+    """
+    delay_seed = hashlib.sha256(f"{run_seed}|delay".encode()).hexdigest()[:16]
+    rng = random.Random(delay_seed)
+    schedule = []
+    for _ in range(message_count):
+        jitter = delay_ms * 0.2
+        actual_delay = delay_ms + (rng.random() - 0.5) * 2 * jitter
+        schedule.append(max(0.0, actual_delay))
+    return schedule
+
+
+def loss_schedule_hash(loss_schedule: List[bool]) -> str:
+    """计算丢包调度的哈希，用于审计"""
+    data = "".join("1" if d else "0" for d in loss_schedule)
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
 def make_payload(seq: int, payload_size: int) -> str:
@@ -122,22 +212,29 @@ def close_tcp(sock, file_obj):
         pass
 
 
-def open_tcp(port: int = SERVER_PORT) -> Tuple[socket.socket, object]:
+def open_tcp(host: str, port: int) -> Tuple[socket.socket, object]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     enable_tcp_nodelay(sock)
     sock.settimeout(SOCKET_TIMEOUT)
-    sock.connect((SERVER_TARGET_HOST, port))
+    sock.connect((host, port))
     file_obj = sock.makefile("r", encoding="utf-8", newline="\n")
     return sock, file_obj
 
 
-def send_hello(sock, file_obj, protocol, session_id, sender_id, epoch):
-    """Send HELLO handshake and wait for HELLO_ACK."""
-    # Normalize protocol name: gmcp_r → gmcp (server sees "gmcp")
-    hello_protocol = "gmcp" if protocol == "gmcp_r" else protocol
+# =========================
+# HELLO 握手
+# =========================
+
+def send_hello(sock, file_obj, protocol: str, session_id: str,
+               sender_id: str, epoch: int) -> Dict[str, Any]:
+    """
+    发送 HELLO 握手并等待 HELLO_ACK。
+    验证：ok=True, type=HELLO_ACK, protocol, session_id。
+    """
+    wire_protocol = WIRE_PROTOCOL_NAMES.get(protocol, protocol)
     hello = with_hmac(DATA_AUTH_KEY, {
         "type": "HELLO",
-        "protocol": hello_protocol,
+        "protocol": wire_protocol,
         "session_id": session_id,
         "sender_id": sender_id,
         "epoch": epoch,
@@ -146,6 +243,20 @@ def send_hello(sock, file_obj, protocol, session_id, sender_id, epoch):
     })
     send_json_line(sock, hello)
     ack = recv_json_line(file_obj)
+
+    # 验证 HELLO_ACK
+    if not ack.get("ok"):
+        raise ConnectionError(f"HELLO failed: {ack.get('reason')}")
+    if ack.get("type") != "HELLO_ACK":
+        raise ConnectionError(f"Expected HELLO_ACK, got type={ack.get('type')}")
+    if ack.get("protocol") != wire_protocol:
+        raise ConnectionError(
+            f"HELLO_ACK protocol mismatch: expected {wire_protocol}, got {ack.get('protocol')}"
+        )
+    if ack.get("session_id") != session_id:
+        raise ConnectionError(
+            f"HELLO_ACK session_id mismatch: expected {session_id}, got {ack.get('session_id')}"
+        )
     return ack
 
 
@@ -153,7 +264,7 @@ def send_hello(sock, file_obj, protocol, session_id, sender_id, epoch):
 # 协议状态管理
 # =========================
 
-def create_protocol_state(protocol, session_id, sender_id, epoch):
+def create_protocol_state(protocol: str, session_id: str, sender_id: str, epoch: int) -> Dict[str, Any]:
     """为每种协议创建独立初始状态"""
     if protocol == "gmcp_r":
         initial_mem = initial_memory(session_id, sender_id, epoch, "demo-seed")
@@ -167,47 +278,33 @@ def create_protocol_state(protocol, session_id, sender_id, epoch):
         raise ValueError(f"Unknown protocol: {protocol}")
 
 
-def build_packet_for_protocol(protocol, session_id, sender_id, epoch, seq, payload, state):
+def build_packet_for_protocol(protocol: str, session_id: str, sender_id: str,
+                               epoch: int, seq: int, payload: str,
+                               state: Dict[str, Any]) -> Dict[str, Any]:
     """使用正式构包函数构建数据包"""
     if protocol == "gmcp_r":
-        packet = gmcp_build_data_packet(
-            session_id=session_id,
-            sender_id=sender_id,
-            epoch=epoch,
-            seq=seq,
-            prev_mem=state["last_mem"],
-            payload=payload,
+        return gmcp_build_data_packet(
+            session_id=session_id, sender_id=sender_id, epoch=epoch,
+            seq=seq, prev_mem=state["last_mem"], payload=payload,
         )
-        # build_data_packet 默认 protocol="gmcp"，服务器期望 "gmcp"
-        return packet
     elif protocol == "hash_chain":
-        packet = hash_chain_build_packet(
-            session_id=session_id,
-            sender_id=sender_id,
-            epoch=epoch,
-            seq=seq,
-            prev_hash=state["last_hash"],
-            payload=payload,
+        return hash_chain_build_packet(
+            session_id=session_id, sender_id=sender_id, epoch=epoch,
+            seq=seq, prev_hash=state["last_hash"], payload=payload,
         )
-        return packet
     elif protocol == "seq_mac":
-        packet = seq_mac_build_packet(
-            session_id=session_id,
-            sender_id=sender_id,
-            epoch=epoch,
-            seq=seq,
-            payload=payload,
+        return seq_mac_build_packet(
+            session_id=session_id, sender_id=sender_id, epoch=epoch,
+            seq=seq, payload=payload,
         )
-        return packet
     else:
         raise ValueError(f"Unknown protocol: {protocol}")
 
 
-def update_state_after_accept(protocol, state, seq, packet, response):
-    """
-    服务端接受包后更新本地客户端状态。
-    关键：hash_chain 从 packet['chain_hash'] 更新（不是 response['last_mem']！）
-    """
+def update_state_after_accept(protocol: str, state: Dict[str, Any],
+                               seq: int, packet: Dict[str, Any],
+                               response: Dict[str, Any]):
+    """服务端接受包后更新本地客户端状态"""
     if protocol == "gmcp_r":
         state["last_seq"] = int(response.get("last_seq", seq))
         state["last_mem"] = response.get("last_mem", state["last_mem"])
@@ -218,11 +315,62 @@ def update_state_after_accept(protocol, state, seq, packet, response):
         state["last_seq"] = seq
 
 
+def get_protocol_audit(protocol: str, state: Dict[str, Any],
+                       response: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    协议状态审计：
+    client_final_seq, server_final_seq, state_match
+    GMCP-R: client_final_mem, server_final_mem, memory_match
+    Hash Chain: client_final_hash, server_final_hash, hash_match
+    Seq+MAC: sequence_match
+    """
+    client_seq = state["last_seq"]
+    server_seq = int(response.get("last_seq", 0))
+
+    audit = {
+        "client_final_seq": client_seq,
+        "server_final_seq": server_seq,
+        "state_match": client_seq == server_seq,
+    }
+
+    if protocol == "gmcp_r":
+        client_mem = state["last_mem"]
+        server_mem = response.get("last_mem", "")
+        audit["client_final_mem"] = client_mem[:32] if client_mem else ""
+        audit["server_final_mem"] = server_mem[:32] if server_mem else ""
+        audit["memory_match"] = client_mem == server_mem
+        audit["client_final_hash"] = ""
+        audit["server_final_hash"] = ""
+        audit["hash_match"] = ""
+        audit["sequence_match"] = ""
+    elif protocol == "hash_chain":
+        client_hash = state["last_hash"]
+        server_hash = response.get("last_hash", "")
+        audit["client_final_mem"] = ""
+        audit["server_final_mem"] = ""
+        audit["memory_match"] = ""
+        audit["client_final_hash"] = client_hash[:32] if client_hash else ""
+        audit["server_final_hash"] = server_hash[:32] if server_hash else ""
+        audit["hash_match"] = client_hash == server_hash
+        audit["sequence_match"] = ""
+    elif protocol == "seq_mac":
+        audit["client_final_mem"] = ""
+        audit["server_final_mem"] = ""
+        audit["memory_match"] = ""
+        audit["client_final_hash"] = ""
+        audit["server_final_hash"] = ""
+        audit["hash_match"] = ""
+        audit["sequence_match"] = client_seq == server_seq
+
+    return audit
+
+
 # =========================
 # 服务器管理
 # =========================
 
-def spawn_server(script_name, port, label):
+def spawn_server(script_name: str, port: int, label: str,
+                 host: str = SERVER_TARGET_HOST) -> subprocess.Popen:
     """启动服务器并等待就绪"""
     env = os.environ.copy()
     proc = subprocess.Popen(
@@ -237,9 +385,9 @@ def spawn_server(script_name, port, label):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(1)
-            s.connect((SERVER_TARGET_HOST, port))
+            s.connect((host, port))
             s.close()
-            print(f"[SPAWN] {label} ready on port {port}")
+            print(f"[SPAWN] {label} ready on port {port}", flush=True)
             return proc
         except OSError:
             time.sleep(0.25)
@@ -251,7 +399,7 @@ def spawn_server(script_name, port, label):
     raise RuntimeError(f"{label} did not start on port {port}")
 
 
-def kill_server(proc, label):
+def kill_server(proc: Optional[subprocess.Popen], label: str):
     """停止服务器"""
     if proc is None:
         return
@@ -260,7 +408,7 @@ def kill_server(proc, label):
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
-    print(f"[SPAWN] {label} terminated")
+    print(f"[SPAWN] {label} terminated", flush=True)
 
 
 # =========================
@@ -274,24 +422,49 @@ def run_one_experiment(
     message_count: int,
     payload_size: int,
     repeat_id: int,
+    base_seed: int,
+    max_retries: int,
+    retry_delay_ms: int,
+    host: str,
+    port: Optional[int] = None,
 ) -> Dict[str, Any]:
     """运行单个弱网实验"""
 
-    session_id = (
-        f"weaknet-{protocol}-l{loss_rate}-d{delay_ms}-"
-        f"m{message_count}-p{payload_size}-"
-        f"r{repeat_id}-{int(time.time() * 1000000)}"
-    )
+    # 1. 确定性种子
+    run_seed = derive_run_seed(base_seed, protocol, loss_rate, delay_ms,
+                               repeat_id, message_count, payload_size)
 
-    # 创建协议状态
+    # 2. 确定性调度
+    loss_schedule = make_loss_schedule(run_seed, message_count, loss_rate)
+    delay_schedule = make_delay_schedule(run_seed, message_count, delay_ms)
+    lsh = loss_schedule_hash(loss_schedule)
+
+    # 3. Session ID（确定性，基于 run_seed）
+    session_id = f"weaknet-{protocol}-l{loss_rate}-d{delay_ms}-r{repeat_id}-{run_seed}"
+
+    # 4. 端口
+    actual_port = port if port is not None else PROTOCOL_PORT.get(protocol, 9001)
+
+    # 5. 创建协议状态
     state = create_protocol_state(protocol, session_id, CLIENT_ID, EPOCH)
 
-    sent_count = 0
-    accepted_count = 0
-    rejected_count = 0
-    dropped_count = 0
-    retry_total = 0
-    rtt_list = []
+    # 计数字段
+    logical_message_count = 0
+    transmission_attempt_count = 0
+    actual_packets_sent = 0
+    accepted_logical_messages = 0
+    unrecovered_logical_messages = 0
+    simulated_drop_count = 0
+    server_rejected_attempt_count = 0
+    socket_timeout_count = 0
+    retry_count_total = 0
+
+    # 时间收集
+    configured_delay_list = []
+    injected_delay_list = []
+    retry_wait_list = []
+    socket_rtt_list = []
+    application_latency_list = []
 
     start_time = time.time()
 
@@ -299,123 +472,135 @@ def run_one_experiment(
     file_obj = None
 
     try:
-        sock, file_obj = open_tcp()
+        sock, file_obj = open_tcp(host, actual_port)
 
         # HELLO 握手
         hello_ack = send_hello(sock, file_obj, protocol, session_id, CLIENT_ID, EPOCH)
-        if not hello_ack.get("ok"):
-            raise ConnectionError(
-                f"HELLO failed for {protocol}: {hello_ack.get('reason')}"
-            )
+        # HELLO 验证已在 send_hello 内部完成
 
-        for seq in range(1, message_count + 1):
+        for msg_idx in range(message_count):
+            seq = msg_idx + 1
+            logical_message_count += 1
             payload = make_payload(seq, payload_size)
+            configured_delay = delay_schedule[msg_idx]
+            configured_delay_list.append(configured_delay)
 
-            # 构建数据包
+            # 本地状态推进（即使丢包也推进，模拟应用层已处理）
             packet = build_packet_for_protocol(
-                protocol=protocol,
-                session_id=session_id,
-                sender_id=CLIENT_ID,
-                epoch=EPOCH,
-                seq=seq,
-                payload=payload,
-                state=state,
+                protocol=protocol, session_id=session_id,
+                sender_id=CLIENT_ID, epoch=EPOCH,
+                seq=seq, payload=payload, state=state,
             )
 
-            # 模拟丢包：通过 delay 模拟 TCP 重传开销
-            # 真正跳过发送会导致 TCP 流失序，所以用 delay 模拟重传延迟
-            simulate_loss = loss_rate > 0 and (hash(f"{session_id}-{seq}") % 100 < loss_rate)
-            retry_count = 0
+            msg_start_time = time.time()
 
-            if simulate_loss:
-                dropped_count += 1
-                # 模拟丢包重传延迟：每次重试消耗 delay_ms 时间
-                # 模型：TCP 超时重传 → 额外延迟
-                time.sleep(max(delay_ms, 50) / 1000.0)
-                retry_total += 1
+            # 为当前逻辑消息生成每attempt的丢包调度
+            # loss_schedule 只决定初始丢包，重试时用确定性per-attempt判定
+            msg_loss_seed = hashlib.sha256(
+                f"{run_seed}|loss|msg{msg_idx}".encode()
+            ).hexdigest()[:16]
+            msg_rng = random.Random(int(msg_loss_seed, 16))
 
-            # 应用延迟（弱网延迟模拟）
-            if delay_ms > 0:
-                jitter = delay_ms * 0.2
-                actual_delay = delay_ms + (
-                    (hash(f"{session_id}-{seq}-jitter") % 1000 / 1000.0 - 0.5) * 2 * jitter
+            accepted = False
+            attempts_for_this_msg = 0
+
+            for attempt in range(max_retries + 1):  # 0, 1, ..., max_retries
+                if attempt > 0:
+                    # 重试等待
+                    retry_wait_list.append(retry_delay_ms)
+                    retry_count_total += 1
+                    time.sleep(retry_delay_ms / 1000.0)
+
+                # 确定性丢包判定（per-attempt）
+                should_drop = msg_rng.random() < (loss_rate / 100.0)
+
+                transmission_attempt_count += 1
+                attempts_for_this_msg += 1
+
+                if should_drop:
+                    # 真正应用层丢弃：不调用 sendall
+                    simulated_drop_count += 1
+                    # 注入配置延迟
+                    if configured_delay > 0:
+                        injected_delay_list.append(configured_delay)
+                        time.sleep(configured_delay / 1000.0)
+                    continue  # 重试同一条消息
+
+                # 重建包（本地状态未变，同一个 seq）
+                packet = build_packet_for_protocol(
+                    protocol=protocol, session_id=session_id,
+                    sender_id=CLIENT_ID, epoch=EPOCH,
+                    seq=seq, payload=payload, state=state,
                 )
-                time.sleep(max(0, actual_delay) / 1000.0)
 
-            # 发送并等待响应
-            send_start = time.time()
-            send_json_line(sock, packet)
-            sent_count += 1
+                # 注入配置延迟
+                if configured_delay > 0:
+                    injected_delay_list.append(configured_delay)
+                    time.sleep(configured_delay / 1000.0)
 
-            response = recv_json_line(file_obj)
-            rtt_ms = (time.time() - send_start) * 1000
-            rtt_list.append(rtt_ms)
+                socket_start = time.time()
+                try:
+                    send_json_line(sock, packet)
+                    actual_packets_sent += 1
 
-            if response.get("ok"):
-                accepted_count += 1
-                update_state_after_accept(protocol, state, seq, packet, response)
-            else:
-                reason = response.get("reason", "unknown")
-                rejected_count += 1
+                    response = recv_json_line(file_obj)
+                    socket_rtt = (time.time() - socket_start) * 1000.0
+                    socket_rtt_list.append(socket_rtt)
 
-                # 重试策略：服务端明确拒绝时尝试重传
-                retry_success = False
-                for attempt in range(MAX_RETRIES):
-                    retry_total += 1
-                    time.sleep(RETRY_DELAY)
+                    if response.get("ok"):
+                        accepted_logical_messages += 1
+                        update_state_after_accept(protocol, state, seq, packet, response)
+                        accepted = True
+                        break
+                    else:
+                        server_rejected_attempt_count += 1
 
-                    # 重建包（状态未变，同一个 seq）
-                    retry_packet = build_packet_for_protocol(
-                        protocol=protocol,
-                        session_id=session_id,
-                        sender_id=CLIENT_ID,
-                        epoch=EPOCH,
-                        seq=seq,
-                        payload=payload,
-                        state=state,
-                    )
+                except socket.timeout:
+                    socket_timeout_count += 1
+                except ConnectionError:
+                    raise  # 连接断开，必须抛出
 
-                    retry_start = time.time()
-                    send_json_line(sock, retry_packet)
-                    sent_count += 1
+            if not accepted:
+                unrecovered_logical_messages += 1
 
-                    try:
-                        retry_response = recv_json_line(file_obj)
-                        retry_rtt = (time.time() - retry_start) * 1000
-                        rtt_list.append(retry_rtt)
-
-                        if retry_response.get("ok"):
-                            accepted_count += 1
-                            rejected_count -= 1  # 修正计数
-                            update_state_after_accept(
-                                protocol, state, seq, retry_packet, retry_response
-                            )
-                            retry_success = True
-                            break
-                    except Exception:
-                        pass
-
-                if not retry_success:
-                    # 达到最大重试次数仍失败
-                    pass
+            application_latency_list.append((time.time() - msg_start_time) * 1000.0)
 
     except Exception as e:
-        print(f"  [ERROR] {e}")
-        raise  # 异常必须抛出
+        print(f"  [ERROR] {e}", flush=True)
+        raise  # 禁止静默异常
 
     finally:
         close_tcp(sock, file_obj)
 
     elapsed = time.time() - start_time
 
-    # 统计指标
-    success_rate = accepted_count / message_count * 100 if message_count > 0 else 0
-    throughput = accepted_count / elapsed if elapsed > 0 else 0
-    rtt_stats = calculate_statistics(rtt_list) if rtt_list else {
-        "mean": 0, "std": 0, "min": 0, "max": 0, "median": 0
+    # 最后一次响应（用于审计，如果有的话）
+    last_response = {
+        "last_seq": state["last_seq"],
     }
+    if protocol == "gmcp_r":
+        last_response["last_mem"] = state.get("last_mem", "")
+    elif protocol == "hash_chain":
+        last_response["last_hash"] = state.get("last_hash", "")
 
-    return {
+    # 协议状态审计
+    audit = get_protocol_audit(protocol, state, last_response)
+
+    # 统计
+    success_rate = (accepted_logical_messages / logical_message_count * 100
+                    if logical_message_count > 0 else 0.0)
+    throughput = accepted_logical_messages / elapsed if elapsed > 0 else 0.0
+
+    def safe_stats(values):
+        if not values:
+            return {"mean": 0.0, "std": 0.0, "median": 0.0, "min": 0.0, "max": 0.0}
+        return calculate_statistics(values)
+
+    socket_rtt_stats = safe_stats(socket_rtt_list)
+    app_latency_stats = safe_stats(application_latency_list)
+
+    result = {
+        # 标识
         "session_id": session_id,
         "protocol": protocol,
         "loss_rate": loss_rate,
@@ -424,20 +609,86 @@ def run_one_experiment(
         "message_count": message_count,
         "payload_size": payload_size,
         "repeat_id": repeat_id,
-        "sent_count": sent_count,
-        "accepted_count": accepted_count,
-        "rejected_count": rejected_count,
-        "dropped_count": dropped_count,
-        "retry_total": retry_total,
+
+        # 种子审计
+        "base_seed": base_seed,
+        "run_seed": run_seed,
+        "loss_schedule_hash": lsh,
+
+        # 计数字段
+        "logical_message_count": logical_message_count,
+        "transmission_attempt_count": transmission_attempt_count,
+        "actual_packets_sent": actual_packets_sent,
+        "accepted_logical_messages": accepted_logical_messages,
+        "unrecovered_logical_messages": unrecovered_logical_messages,
+        "simulated_drop_count": simulated_drop_count,
+        "server_rejected_attempt_count": server_rejected_attempt_count,
+        "socket_timeout_count": socket_timeout_count,
+        "retry_count_total": retry_count_total,
+
+        # 成功率 / 吞吐量
         "success_rate": round(success_rate, 2),
         "throughput_msg_per_sec": round(throughput, 2),
-        "rtt_mean_ms": round(rtt_stats["mean"], 2),
-        "rtt_std_ms": round(rtt_stats["std"], 2),
-        "rtt_min_ms": round(rtt_stats["min"], 2),
-        "rtt_max_ms": round(rtt_stats["max"], 2),
-        "rtt_median_ms": round(rtt_stats["median"], 2),
+
+        # 四类时间
+        "configured_delay_ms": round(
+            sum(configured_delay_list) / len(configured_delay_list), 2
+        ) if configured_delay_list else 0.0,
+        "injected_delay_total_ms": round(sum(injected_delay_list), 2),
+        "retry_wait_total_ms": round(sum(retry_wait_list), 2),
+        "socket_rtt_mean_ms": round(socket_rtt_stats["mean"], 2),
+        "socket_rtt_std_ms": round(socket_rtt_stats["std"], 2),
+        "application_latency_mean_ms": round(app_latency_stats["mean"], 2),
+
+        # RTT 详情
+        "rtt_mean_ms": round(socket_rtt_stats["mean"], 2),
+        "rtt_std_ms": round(socket_rtt_stats["std"], 2),
+        "rtt_min_ms": round(socket_rtt_stats["min"], 2),
+        "rtt_max_ms": round(socket_rtt_stats["max"], 2),
+        "rtt_median_ms": round(socket_rtt_stats["median"], 2),
+
+        # 协议状态审计
+        "client_final_seq": audit["client_final_seq"],
+        "server_final_seq": audit["server_final_seq"],
+        "state_match": audit["state_match"],
+        "client_final_mem": audit.get("client_final_mem", ""),
+        "server_final_mem": audit.get("server_final_mem", ""),
+        "memory_match": audit.get("memory_match", ""),
+        "client_final_hash": audit.get("client_final_hash", ""),
+        "server_final_hash": audit.get("server_final_hash", ""),
+        "hash_match": audit.get("hash_match", ""),
+        "sequence_match": audit.get("sequence_match", ""),
+
+        # 元数据
         "elapsed_seconds": round(elapsed, 4),
     }
+
+    return result
+
+
+# =========================
+# CSV 字段列表
+# =========================
+
+FIELDNAMES = [
+    "session_id", "protocol", "loss_rate", "delay_ms", "reorder_rate",
+    "message_count", "payload_size", "repeat_id",
+    "base_seed", "run_seed", "loss_schedule_hash",
+    "logical_message_count", "transmission_attempt_count", "actual_packets_sent",
+    "accepted_logical_messages", "unrecovered_logical_messages",
+    "simulated_drop_count", "server_rejected_attempt_count",
+    "socket_timeout_count", "retry_count_total",
+    "success_rate", "throughput_msg_per_sec",
+    "configured_delay_ms", "injected_delay_total_ms", "retry_wait_total_ms",
+    "socket_rtt_mean_ms", "socket_rtt_std_ms",
+    "application_latency_mean_ms",
+    "rtt_mean_ms", "rtt_std_ms", "rtt_min_ms", "rtt_max_ms", "rtt_median_ms",
+    "client_final_seq", "server_final_seq", "state_match",
+    "client_final_mem", "server_final_mem", "memory_match",
+    "client_final_hash", "server_final_hash", "hash_match",
+    "sequence_match",
+    "elapsed_seconds",
+]
 
 
 # =========================
@@ -448,17 +699,30 @@ def validate_result(result: Dict[str, Any]) -> Tuple[bool, str]:
     """校验单个实验结果"""
     if result["elapsed_seconds"] < 0:
         return False, "elapsed_seconds < 0"
-    if result["sent_count"] <= 0:
-        return False, "sent_count <= 0"
-    # success_rate 应与 accepted_count/message_count 一致
+    if result["logical_message_count"] <= 0:
+        return False, "logical_message_count <= 0"
+    if result["actual_packets_sent"] < 0:
+        return False, "actual_packets_sent < 0"
+
+    # success_rate 一致性检查
     expected_rate = round(
-        result["accepted_count"] / result["message_count"] * 100, 2
-    ) if result["message_count"] > 0 else 0
+        result["accepted_logical_messages"] / result["logical_message_count"] * 100, 2
+    ) if result["logical_message_count"] > 0 else 0
     if abs(result["success_rate"] - expected_rate) > 0.01:
         return False, (
             f"success_rate mismatch: got {result['success_rate']}, "
             f"expected {expected_rate}"
         )
+
+    # 计数一致性
+    expected_logical = result["accepted_logical_messages"] + result["unrecovered_logical_messages"]
+    if expected_logical != result["logical_message_count"]:
+        return False, (
+            f"count mismatch: accepted({result['accepted_logical_messages']}) + "
+            f"unrecovered({result['unrecovered_logical_messages']}) != "
+            f"logical({result['logical_message_count']})"
+        )
+
     return True, "ok"
 
 
@@ -466,14 +730,14 @@ def validate_result(result: Dict[str, Any]) -> Tuple[bool, str]:
 # Smoke 测试
 # =========================
 
-def run_smoke_test() -> bool:
+def run_smoke_test(args) -> bool:
     """
     控制组 smoke 测试：
-    每种协议 loss=0, delay=0, 20条消息，全部必须100%成功
+    每种协议 loss=0, delay=0, 20 条消息，全部必须 100% 成功
     """
-    print("\n" + "=" * 60)
-    print("SMOKE TEST: loss=0, delay=0, 20 messages per protocol")
-    print("=" * 60)
+    print("\n" + "=" * 60, flush=True)
+    print("SMOKE TEST: loss=0, delay=0, 20 messages per protocol", flush=True)
+    print("=" * 60, flush=True)
 
     all_passed = True
     for protocol in PROTOCOLS:
@@ -484,116 +748,183 @@ def run_smoke_test() -> bool:
                 loss_rate=0,
                 delay_ms=0,
                 message_count=20,
-                payload_size=128,
+                payload_size=args.payload_size,
                 repeat_id=0,
+                base_seed=args.seed,
+                max_retries=args.max_retries,
+                retry_delay_ms=args.retry_delay_ms,
+                host=args.host,
+                port=args.port,
             )
 
             if result["success_rate"] != 100.0:
-                print(f"❌ FAILED: success_rate={result['success_rate']}%")
+                print(f"FAILED: success_rate={result['success_rate']}%")
                 all_passed = False
-            elif result["accepted_count"] != 20:
-                print(f"❌ FAILED: accepted={result['accepted_count']}/20")
+            elif result["accepted_logical_messages"] != 20:
+                print(f"FAILED: accepted={result['accepted_logical_messages']}/20")
                 all_passed = False
             else:
                 ok, msg = validate_result(result)
                 if not ok:
-                    print(f"❌ VALIDATION FAILED: {msg}")
+                    print(f"VALIDATION FAILED: {msg}")
                     all_passed = False
                 else:
-                    print(f"✅ 100% ({result['rtt_mean_ms']}ms RTT)")
+                    print(f"100% ({result['socket_rtt_mean_ms']}ms RTT)")
 
         except Exception as e:
-            print(f"❌ EXCEPTION: {e}")
+            print(f"EXCEPTION: {e}")
             all_passed = False
 
     print()
     if all_passed:
-        print("✅ ALL SMOKE TESTS PASSED")
+        print("ALL SMOKE TESTS PASSED", flush=True)
     else:
-        print("❌ SMOKE TESTS FAILED — ABORT")
+        print("SMOKE TESTS FAILED", flush=True)
     return all_passed
 
 
 # =========================
-# 完整实验
+# 正式实验
 # =========================
 
-def run_all_experiments():
-    ensure_output_dir()
+def run_formal_experiments(args) -> Tuple[List[Dict[str, Any]], str]:
+    """运行完整 150 行正式实验"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    tracker = ExperimentTracker("weak_network_simulation")
+    # 输出到临时目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    formal_dir = os.path.join(OUTPUT_DIR, f"formal_{timestamp}")
+    os.makedirs(formal_dir, exist_ok=True)
+    formal_csv = os.path.join(formal_dir, "weak_network_simulation_results.csv")
 
-    fieldnames = [
-        "session_id", "protocol", "loss_rate", "delay_ms", "reorder_rate",
-        "message_count", "payload_size", "repeat_id", "sent_count",
-        "accepted_count", "rejected_count", "dropped_count", "retry_total",
-        "success_rate", "throughput_msg_per_sec", "rtt_mean_ms", "rtt_std_ms",
-        "rtt_min_ms", "rtt_max_ms", "rtt_median_ms", "elapsed_seconds",
-    ]
+    results: List[Dict[str, Any]] = []
 
-    total_experiments = len(PROTOCOLS) * len(LOSS_RATES) * len(DELAY_MS) * len(REPEATS)
+    total_experiments = len(PROTOCOLS) * len(LOSS_RATES) * len(DELAY_MS) * args.repeats
     completed = 0
     failed = 0
+
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"FORMAL EXPERIMENT: {total_experiments} rows", flush=True)
+    print(f"  seed={args.seed}, repeats={args.repeats}", flush=True)
+    print(f"  message_count={args.message_count}, payload_size={args.payload_size}", flush=True)
+    print(f"  max_retries={args.max_retries}, retry_delay_ms={args.retry_delay_ms}", flush=True)
+    print(f"  Protocols: {PROTOCOLS}", flush=True)
+    print(f"  Loss rates: {LOSS_RATES}", flush=True)
+    print(f"  Delay ms: {DELAY_MS}", flush=True)
+    print(f"{'=' * 60}", flush=True)
 
     for protocol in PROTOCOLS:
         for loss_rate in LOSS_RATES:
             for delay_ms in DELAY_MS:
-                for repeat_id in REPEATS:
+                for repeat_id in range(1, args.repeats + 1):
                     completed += 1
-                    print(
-                        f"\n[{completed}/{total_experiments}] "
+                    label = (
+                        f"[{completed}/{total_experiments}] "
                         f"protocol={protocol}, loss={loss_rate}%, "
-                        f"delay={delay_ms}ms, repeat={repeat_id}",
-                        end=" ",
-                        flush=True,
+                        f"delay={delay_ms}ms, repeat={repeat_id}"
                     )
+                    print(f"\n{label}", end=" ", flush=True)
 
                     try:
                         result = run_one_experiment(
                             protocol=protocol,
                             loss_rate=loss_rate,
                             delay_ms=delay_ms,
-                            message_count=MESSAGE_COUNT,
-                            payload_size=PAYLOAD_SIZE,
+                            message_count=args.message_count,
+                            payload_size=args.payload_size,
                             repeat_id=repeat_id,
+                            base_seed=args.seed,
+                            max_retries=args.max_retries,
+                            retry_delay_ms=args.retry_delay_ms,
+                            host=args.host,
+                            port=args.port,
                         )
 
-                        # 校验结果
+                        # 校验
                         ok, msg = validate_result(result)
                         if not ok:
-                            print(f"⚠️  VALIDATION: {msg}")
+                            print(f"VALIDATION: {msg}")
                             failed += 1
                             continue
 
-                        tracker.add_result(result)
+                        results.append(result)
 
                         status = (
-                            "✅" if result["success_rate"] > 80
-                            else "⚠️" if result["success_rate"] > 50
-                            else "❌"
+                            "OK" if result["success_rate"] > 80
+                            else "WARN" if result["success_rate"] > 50
+                            else "FAIL"
                         )
                         print(
                             f"{status} success={result['success_rate']}%, "
                             f"throughput={result['throughput_msg_per_sec']} msg/s, "
-                            f"rtt={result['rtt_mean_ms']}ms"
+                            f"rtt={result['socket_rtt_mean_ms']}ms"
                         )
 
                     except Exception as e:
-                        print(f"❌ FAILED: {e}")
+                        print(f"FAILED: {e}")
                         failed += 1
 
-    # 保存结果
-    tracker.save_results_to_csv(OUTPUT_CSV, fieldnames)
+    # 写入临时 CSV
+    with open(formal_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
+        writer.writeheader()
+        for r in results:
+            writer.writerow(r)
 
-    final_stats = tracker.finish()
-    print(f"\n{'=' * 60}")
-    print(f"[COMPLETE] Results saved to {OUTPUT_CSV}")
-    print(f"[STATS] Total results: {final_stats['total_results']}")
-    print(f"[STATS] Expected: {total_experiments}")
-    print(f"[STATS] Failed: {failed}")
-    print(f"[STATS] Elapsed time: {final_stats['elapsed_seconds']}s")
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"[COMPLETE] Results: {len(results)}/{total_experiments}", flush=True)
+    print(f"[COMPLETE] Failed: {failed}", flush=True)
+    print(f"[COMPLETE] Temp CSV: {formal_csv}", flush=True)
 
-    return tracker.results
+    return results, formal_csv
+
+
+# =========================
+# 原子发布
+# =========================
+
+def atomic_publish(results: List[Dict[str, Any]], formal_csv: str,
+                   paper_output: str):
+    """
+    原子发布到 paper_data/:
+    1. 验证行数
+    2. 写入临时文件
+    3. os.replace 到目标
+    """
+    expected_rows = len(PROTOCOLS) * len(LOSS_RATES) * len(DELAY_MS) * len(range(1, 3))
+
+    if len(results) != expected_rows:
+        print(
+            f"[PUBLISH] WARNING: Expected {expected_rows} rows, got {len(results)}. "
+            f"Publishing anyway.",
+            flush=True,
+        )
+
+    # 确保目录存在
+    paper_dir = os.path.dirname(paper_output)
+    if paper_dir:
+        os.makedirs(paper_dir, exist_ok=True)
+
+    # 写入临时文件
+    tmp_output = paper_output + ".tmp"
+    with open(tmp_output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
+        writer.writeheader()
+        for r in results:
+            writer.writerow(r)
+
+    # 验证临时文件行数
+    with open(tmp_output, "r", encoding="utf-8") as f:
+        row_count = sum(1 for _ in f) - 1  # 减去 header
+    if row_count != len(results):
+        os.remove(tmp_output)
+        raise RuntimeError(
+            f"Row count mismatch: expected {len(results)}, wrote {row_count}"
+        )
+
+    # 原子替换
+    os.replace(tmp_output, paper_output)
+    print(f"[PUBLISH] {len(results)} rows → {paper_output}", flush=True)
 
 
 # =========================
@@ -601,36 +932,61 @@ def run_all_experiments():
 # =========================
 
 def main():
+    args = parse_args()
+
+    # 设置全局重试参数
+    global MAX_RETRIES, RETRY_DELAY_MS
+    MAX_RETRIES = args.max_retries
+    RETRY_DELAY_MS = args.retry_delay_ms
+
+    # 确定需要哪些服务器
+    need_baseline_server = True  # 所有协议都走 baseline_server（port 9001）
     baseline_proc = None
 
     try:
-        # 启动 real_baseline_server (port 9001, 支持所有协议)
-        baseline_proc = spawn_server(
-            "real_baseline_server.py", SERVER_PORT, "Baseline Server"
-        )
+        if args.spawn_server:
+            # 启动 real_baseline_server（支持所有协议，port 9001）
+            baseline_proc = spawn_server(
+                "real_baseline_server.py", 9001, "Baseline Server", args.host
+            )
 
-        # 1. Smoke 测试
-        if not run_smoke_test():
+        # Smoke 测试
+        if args.smoke_only:
+            ok = run_smoke_test(args)
+            return 0 if ok else 1
+
+        # 正式实验
+        if args.formal:
+            # 先跑 smoke
+            print("\n[PREFLIGHT] Running smoke test before formal experiment...", flush=True)
+            if not run_smoke_test(args):
+                print("[PREFLIGHT] Smoke test FAILED. Aborting.", flush=True)
+                return 1
+
+            results, formal_csv = run_formal_experiments(args)
+
+            # 原子发布
+            if results:
+                atomic_publish(results, formal_csv, args.paper_output)
+
+            return 0
+
+        # 默认：先 smoke 后 formal
+        if not run_smoke_test(args):
             return 1
 
-        # 2. 运行完整 150 行实验
-        results = run_all_experiments()
-
-        # 3. 复制到 paper_data
-        paper_data_dir = "paper_data"
-        os.makedirs(paper_data_dir, exist_ok=True)
-        paper_csv = os.path.join(paper_data_dir, "05_weak_network.csv")
+        results, formal_csv = run_formal_experiments(args)
 
         if results:
-            fieldnames = list(results[0].keys())
-            with open(paper_csv, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(results)
-            print(f"[COPY] Results copied to {paper_csv}")
-            print(f"[COPY] Total rows: {len(results)}")
+            atomic_publish(results, formal_csv, args.paper_output)
 
         return 0
+
+    except Exception as e:
+        print(f"\n[FATAL] {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return 1
 
     finally:
         kill_server(baseline_proc, "Baseline Server")

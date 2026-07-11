@@ -3,12 +3,14 @@
 #
 # Release artifact validator for GMCP-R.
 # Checks CSV integrity, row counts, cross-reference consistency,
-# paper content correctness, and stale content absence.
+# paper content correctness, summary regeneration, paper number
+# verification, and stale content absence.
 # Exits nonzero with one line per violation.
 
 import csv
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -58,6 +60,48 @@ STALE_PHRASES = [
     "Ticket Only 50%",
 ]
 
+# ---------------------------------------------------------------------------
+# Paper-specific numeric claims to verify against CSV data
+# Each entry: (csv_file, filter_func_description, column, filter_kwargs, expected_value, tolerance, paper_ref)
+# ---------------------------------------------------------------------------
+PAPER_NUMERIC_CLAIMS = [
+    # Table 1: Baseline comparison - GMCP-R throughput
+    {
+        "csv": "paper_data/01_real_baseline.csv",
+        "desc": "GMCP-R normal throughput (Table 1)",
+        "protocol": "gmcp_r",
+        "filter": lambda df: df[(df["protocol"] == "gmcp_r") & (df["attack_applicable"] == True) & (df["attack_injected"] == False) & (df["sent_count"] > 0)],
+        "column": "throughput_msg_per_sec",
+        "agg": "mean",
+        "expected": 10341,
+        "tolerance": 500,  # ±500 msg/s
+    },
+    # Table 1: Ticket Only detection rate
+    {
+        "csv": "paper_data/01_real_baseline.csv",
+        "desc": "Ticket Only detection rate (Table 1)",
+        "protocol": "ticket_only",
+        "filter": lambda df: df[(df["protocol"] == "ticket_only") & (df["attack_applicable"] == True) & (df["attack_injected"] == True) & (df["sent_count"] > 0)],
+        "column": "attack_detected_by_server",
+        "agg": "mean",
+        "expected": 83.3,
+        "tolerance": 2.0,
+        "multiply": 100,
+    },
+    # Table 1: Ticket Only false accept rate
+    {
+        "csv": "paper_data/01_real_baseline.csv",
+        "desc": "Ticket Only false accept rate (Table 1)",
+        "protocol": "ticket_only",
+        "filter": lambda df: df[(df["protocol"] == "ticket_only") & (df["attack_applicable"] == True) & (df["attack_injected"] == True) & (df["sent_count"] > 0)],
+        "column": "attack_detected_by_server",
+        "agg": "mean",
+        "expected": 16.7,
+        "tolerance": 2.0,
+        "transform": lambda v: (1 - v) * 100,
+    },
+]
+
 
 def fail(errors: list) -> int:
     """Print errors and return nonzero exit code."""
@@ -70,6 +114,126 @@ def read_csv_rows(path: str) -> list:
     """Read CSV and return list of row dicts."""
     with open(path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
+
+
+def verify_paper_numbers(root: Path) -> list:
+    """Verify specific paper numeric claims against CSV data."""
+    errors = []
+
+    for claim in PAPER_NUMERIC_CLAIMS:
+        csv_path = root / claim["csv"]
+        if not csv_path.is_file():
+            errors.append(f"Cannot verify '{claim['desc']}': CSV missing")
+            continue
+
+        try:
+            import pandas as pd
+            df = pd.read_csv(csv_path)
+            filtered = claim["filter"](df)
+            if len(filtered) == 0:
+                errors.append(f"Cannot verify '{claim['desc']}': no matching rows")
+                continue
+
+            value = filtered[claim["column"]].mean()
+            if "multiply" in claim:
+                value = value * claim["multiply"]
+            if "transform" in claim:
+                value = claim["transform"](value)
+
+            expected = claim["expected"]
+            tolerance = claim["tolerance"]
+            if abs(value - expected) > tolerance:
+                errors.append(
+                    f"Paper number mismatch '{claim['desc']}': "
+                    f"CSV={value:.2f}, paper={expected}, tolerance=±{tolerance}"
+                )
+        except Exception as e:
+            errors.append(f"Error verifying '{claim['desc']}': {e}")
+
+    return errors
+
+
+def verify_summary_regeneration(root: Path) -> list:
+    """Regenerate summary and compare with existing file."""
+    errors = []
+    summary_path = root / "EXPERIMENT_SUMMARY.md"
+
+    if not summary_path.is_file():
+        errors.append("EXPERIMENT_SUMMARY.md not found")
+        return errors
+
+    existing = summary_path.read_text(encoding="utf-8")
+
+    try:
+        # Import and run the summary generator
+        sys.path.insert(0, str(root))
+        from generate_experiment_summary import build_summary
+        regenerated = build_summary()
+
+        if existing.strip() != regenerated.strip():
+            # Find first difference
+            existing_lines = existing.strip().splitlines()
+            regenerated_lines = regenerated.strip().splitlines()
+            for i, (e, r) in enumerate(zip(existing_lines, regenerated_lines)):
+                if e != r:
+                    errors.append(
+                        f"Summary drift at line {i+1}: "
+                        f"existing='{e[:80]}...' vs regenerated='{r[:80]}...'"
+                    )
+                    break
+            else:
+                if len(existing_lines) != len(regenerated_lines):
+                    errors.append(
+                        f"Summary line count differs: existing={len(existing_lines)}, "
+                        f"regenerated={len(regenerated_lines)}"
+                    )
+    except Exception as e:
+        errors.append(f"Error regenerating summary: {e}")
+
+    return errors
+
+
+def verify_docx_content(root: Path) -> list:
+    """Verify DOCX exists and contains expected content."""
+    errors = []
+    docx_candidates = list((root / "paper").glob("*.docx"))
+
+    if not docx_candidates:
+        # DOCX is optional
+        return errors
+
+    for docx_path in docx_candidates:
+        if docx_path.stat().st_size == 0:
+            errors.append(f"DOCX is empty: {docx_path.relative_to(root)}")
+            continue
+
+        try:
+            from docx import Document
+            doc = Document(str(docx_path))
+            full_text = "\n".join(p.text for p in doc.paragraphs)
+
+            # Check key terms exist in DOCX
+            key_terms = ["GMCP-R", "MemoryTicket", "Checkpoint"]
+            for term in key_terms:
+                if term not in full_text:
+                    errors.append(
+                        f"DOCX '{docx_path.name}' missing key term: {term}"
+                    )
+
+            # Check stale phrases
+            for phrase in STALE_PHRASES:
+                if phrase in full_text:
+                    errors.append(
+                        f"Stale phrase '{phrase}' found in DOCX '{docx_path.name}'"
+                    )
+
+        except ImportError:
+            # python-docx not installed; skip DOCX content check
+            pass
+        except Exception as e:
+            errors.append(f"Error reading DOCX '{docx_path.name}': {e}")
+
+    return errors
 
 
 def validate() -> int:
@@ -137,7 +301,6 @@ def validate() -> int:
     for doc_name, content in doc_row_strings:
         for rel_path, expected_count in EXPECTED_CSV_ROWS.items():
             fname = os.path.basename(rel_path)
-            # Look for "7,200" or "7200" style in the doc
             formatted = f"{expected_count:,}"
             plain = str(expected_count)
             if fname in content:
@@ -157,7 +320,6 @@ def validate() -> int:
             perf_protocols = sorted(
                 set(row.get("protocol", "") for row in perf_rows if row.get("protocol"))
             )
-            # Check that EXPERIMENT_SUMMARY.md references performance data
             summary_path = root / "EXPERIMENT_SUMMARY.md"
             if summary_path.is_file():
                 summary_content = summary_path.read_text(encoding="utf-8")
@@ -245,7 +407,7 @@ def validate() -> int:
             if not rows:
                 continue
             if "git_commit" not in rows[0]:
-                continue  # Column doesn't exist; skip
+                continue
             empty_commits = sum(
                 1 for r in rows if not r.get("git_commit", "").strip()
             )
@@ -257,14 +419,19 @@ def validate() -> int:
             pass
 
     # -----------------------------------------------------------------------
-    # 11. DOCX exists and is non-empty (if present)
+    # 11. DOCX exists and content verification
     # -----------------------------------------------------------------------
-    docx_candidates = list((root / "paper").glob("*.docx"))
-    if docx_candidates:
-        for docx in docx_candidates:
-            if docx.stat().st_size == 0:
-                errors.append(f"DOCX is empty: {docx.relative_to(root)}")
-    # No DOCX is acceptable (optional artifact)
+    errors.extend(verify_docx_content(root))
+
+    # -----------------------------------------------------------------------
+    # 12. Summary regeneration comparison
+    # -----------------------------------------------------------------------
+    errors.extend(verify_summary_regeneration(root))
+
+    # -----------------------------------------------------------------------
+    # 13. Paper numeric claims verification
+    # -----------------------------------------------------------------------
+    errors.extend(verify_paper_numbers(root))
 
     # -----------------------------------------------------------------------
     # Report

@@ -26,6 +26,10 @@ jobs:
         run: |
           python -m unittest discover -v -s tests -p 'test*.py'
 
+      - name: Validate weak-network artifact
+        run: |
+          python validate_weak_network_artifact.py
+
       - name: Validate submission revision (smoke)
         run: |
           python validate_submission_revision.py --mode smoke
@@ -33,3 +37,8 @@ jobs:
       - name: Validate release artifacts
         run: |
           python validate_release_artifacts.py
+
+      - name: Regenerate and verify summary
+        run: |
+          python generate_experiment_summary.py --output /tmp/summary_check.md
+          diff EXPERIMENT_SUMMARY.md /tmp/summary_check.md || (echo "FAIL: Summary drift detected" && exit 1)
