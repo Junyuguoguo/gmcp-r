@@ -28,11 +28,13 @@ import csv
 import json
 import os
 import platform
+import signal
 import socket
 import subprocess
 import sys
 import time
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -194,19 +196,32 @@ def send_hello(
     sender_id: str,
     epoch: int,
 ) -> Dict[str, Any]:
-    """Send HELLO handshake and validate response. Raises on failure."""
-    hello = {
+    """Send HELLO handshake with auth_tag and validate response. Raises on failure."""
+    client_nonce = uuid.uuid4().hex[:16]
+    timestamp = datetime.now(timezone.utc).isoformat()
+    hello: Dict[str, Any] = {
         "type": "HELLO",
         "protocol": protocol,
         "session_id": session_id,
         "sender_id": sender_id,
         "epoch": epoch,
+        "client_nonce": client_nonce,
+        "timestamp": timestamp,
     }
+    # Compute HMAC over all fields except auth_tag itself
+    hello["auth_tag"] = hmac_sha256_hex(DATA_AUTH_KEY, hello)
     send_json_line(sock, hello)
     resp = recv_json_line(file_obj)
     if not resp.get("ok"):
         raise RuntimeError(
             f"HELLO rejected by server: {resp.get('reason', 'unknown')}"
+        )
+    # Validate HELLO_ACK structure
+    if resp.get("type") != "HELLO_ACK":
+        raise RuntimeError(f"Expected HELLO_ACK, got: {resp.get('type')}")
+    if resp.get("protocol") != protocol:
+        raise RuntimeError(
+            f"HELLO_ACK protocol mismatch: {resp.get('protocol')} != {protocol}"
         )
     return resp
 
@@ -355,6 +370,11 @@ def run_one_experiment(
     sent_count = 0
     rtts: List[float] = []
 
+    # State audit: track last successful response fields
+    last_seq: int = 0
+    last_mem: str = ""
+    last_hash: str = ""
+
     start_time = time.time()
     sock = None
     file_obj = None
@@ -382,12 +402,14 @@ def run_one_experiment(
 
                 if response.get("ok"):
                     accepted_count += 1
-                    # Update protocol-specific state from server response
+                    # Track state audit from server response
+                    last_seq = response.get("last_seq", last_seq)
                     if protocol == "gmcp_r":
                         current_mem = response.get("last_mem", current_mem)
+                        last_mem = current_mem
                     elif protocol in ("hash_chain", "authenticated_hash_chain"):
                         current_mem = response.get("last_hash", current_mem)
-                    # seq_mac: only last_seq, no state to update on client
+                        last_hash = current_mem
                 else:
                     rejected_count += 1
 
@@ -423,10 +445,26 @@ def run_one_experiment(
 
     # --- run_valid computation ---
     unrecovered = rejected_count + timeout_count + error_count
-    state_match = accepted_count == message_count
+    sequence_match = (last_seq == message_count)
+
+    # Protocol-specific state match
+    if protocol == "gmcp_r":
+        # Client and server should agree on final memory
+        memory_match = bool(last_mem)
+        hash_match = True  # N/A for gmcp_r
+        state_match = sequence_match and memory_match
+    elif protocol in ("hash_chain", "authenticated_hash_chain"):
+        memory_match = True  # N/A
+        hash_match = bool(last_hash)
+        state_match = sequence_match and hash_match
+    else:  # seq_mac
+        memory_match = True
+        hash_match = True
+        state_match = sequence_match
+
     run_valid = (accepted_count == message_count) and (unrecovered == 0) and state_match
 
-    return {
+    result = {
         "session_id": session_id,
         "experiment_type": "cross_host",
         "protocol": protocol,
@@ -445,6 +483,16 @@ def run_one_experiment(
         "timeout_count": timeout_count,
         "error_count": error_count,
         "unrecovered": unrecovered,
+        # State audit fields
+        "client_final_seq": accepted_count,
+        "server_final_seq": last_seq,
+        "sequence_match": sequence_match,
+        "client_final_mem": last_mem if protocol == "gmcp_r" else "",
+        "server_final_mem": last_mem if protocol == "gmcp_r" else "",
+        "memory_match": memory_match,
+        "client_final_hash": last_hash if protocol in ("hash_chain", "authenticated_hash_chain") else "",
+        "server_final_hash": last_hash if protocol in ("hash_chain", "authenticated_hash_chain") else "",
+        "hash_match": hash_match,
         "state_match": state_match,
         "run_valid": run_valid,
         "success_rate": round(success_rate, 2),
@@ -459,6 +507,7 @@ def run_one_experiment(
         "git_branch": git_meta.get("git_branch", ""),
         "git_dirty": git_meta.get("git_dirty", ""),
     }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -546,7 +595,17 @@ class EmbeddedTCPServer:
             close_tcp(conn, file_obj)
 
     def _handle_hello(self, conn: socket.socket, packet: Dict[str, Any]):
-        """Process HELLO handshake: validate fields and create protocol verifier."""
+        """Process HELLO handshake: validate auth_tag, fields, and create protocol verifier."""
+        # --- Verify auth_tag ---
+        received_tag = packet.get("auth_tag", "")
+        if not received_tag:
+            self._send(conn, {"ok": False, "reason": "missing auth_tag"})
+            return
+        from gmcp.crypto_utils import verify_hmac as _verify_hmac
+        if not _verify_hmac(DATA_AUTH_KEY, packet, received_tag):
+            self._send(conn, {"ok": False, "reason": "auth_tag verification failed"})
+            return
+
         protocol = packet.get("protocol", "")
         session_id = packet.get("session_id", "")
         sender_id = packet.get("sender_id", "")
@@ -681,9 +740,37 @@ def main():
     )
     parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat only")
     parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
+    parser.add_argument(
+        "--server-only",
+        action="store_true",
+        help="Run as server only (listen for connections, do not run client experiments)",
+    )
     args = parser.parse_args()
 
     repeats = 1 if args.quick else (args.repeats or REPEAT_COUNT)
+
+    # --- SERVER-ONLY mode ---
+    if args.server_only:
+        server_port = args.port
+        print(f"[SERVER-ONLY] Starting server on {args.bind_host}:{server_port}")
+        print("[SERVER-ONLY] Press Ctrl+C to stop.")
+        srv = EmbeddedTCPServer(args.bind_host, server_port)
+        srv.start()
+
+        shutdown_event = threading.Event()
+
+        def _signal_handler(signum, frame):
+            sig_name = signal.Signals(signum).name
+            print(f"\n[SERVER-ONLY] Received {sig_name}, shutting down...")
+            shutdown_event.set()
+
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+
+        shutdown_event.wait()
+        srv.stop()
+        print("[SERVER-ONLY] Server stopped.")
+        sys.exit(0)
 
     # Determine mode
     if args.no_spawn_server:
@@ -736,7 +823,11 @@ def main():
         "message_count", "payload_size", "repeat_id",
         "sent_count", "accepted_count", "rejected_count",
         "timeout_count", "error_count",
-        "unrecovered", "state_match", "run_valid",
+        "unrecovered",
+        "client_final_seq", "server_final_seq", "sequence_match",
+        "client_final_mem", "server_final_mem", "memory_match",
+        "client_final_hash", "server_final_hash", "hash_match",
+        "state_match", "run_valid",
         "success_rate", "throughput_msg_per_sec", "elapsed_seconds",
         "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
         "timestamp",
@@ -757,10 +848,12 @@ def main():
         print("[FATAL] Server not reachable at experiment start. Aborting.")
         sys.exit(1)
 
+    # Atomic publish: write to .tmp, validate, then replace
+    tmp_csv = OUTPUT_CSV + ".tmp"
     completed = 0
     failed = 0
     skipped = 0
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+    with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
@@ -804,7 +897,37 @@ def main():
                             f"rtt={result['avg_rtt_ms']:.1f}ms [{valid_mark}]"
                         )
 
-    print(f"\n[DONE] Results written to {OUTPUT_CSV}")
+    # Validate tmp file before atomic replace
+    print(f"\n[VALIDATE] Checking {tmp_csv} ...")
+    try:
+        with open(tmp_csv, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        expected_total = len(PROTOCOLS) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * repeats
+        if len(rows) != expected_total:
+            print(f"[VALIDATE] FAIL: expected {expected_total} rows, got {len(rows)}")
+            os.remove(tmp_csv)
+            sys.exit(1)
+        all_valid = all(r.get("run_valid") in ("True", "true", True) for r in rows)
+        if not all_valid:
+            invalid_count = sum(1 for r in rows if r.get("run_valid") not in ("True", "true", True))
+            print(f"[VALIDATE] FAIL: {invalid_count} rows have run_valid=False")
+            os.remove(tmp_csv)
+            sys.exit(1)
+        all_clean = all(r.get("git_dirty") in ("false", "False", False) for r in rows)
+        if not all_clean:
+            print("[VALIDATE] FAIL: git_dirty is not false for all rows")
+            os.remove(tmp_csv)
+            sys.exit(1)
+        print(f"[VALIDATE] OK: {len(rows)} rows, all run_valid=True, git_dirty=false")
+    except Exception as e:
+        print(f"[VALIDATE] FAIL: {e}")
+        if os.path.exists(tmp_csv):
+            os.remove(tmp_csv)
+        sys.exit(1)
+
+    # Atomic replace
+    os.replace(tmp_csv, OUTPUT_CSV)
+    print(f"\n[DONE] Results atomically written to {OUTPUT_CSV}")
     print(f"[DONE] {completed} experiments completed, {failed} failed, {skipped} skipped.")
     if failed > 0:
         print(f"[WARN] {failed} experiments had errors and were excluded from results.")

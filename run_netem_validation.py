@@ -13,11 +13,14 @@ tc/netem 弱网实验验证框架
 使用方法（需要 sudo 权限）：
   sudo python run_netem_validation.py --interface eth0
   sudo python run_netem_validation.py --interface eth0 --quick   # 1 repeat
+  sudo python run_netem_validation.py --host 10.0.0.1 --interface eth0  # cross-host
 
 关键设计：
   - 没有 sudo 权限时拒绝生成数据
   - 使用 trap 确保实验结束后清理 tc 规则（通过 context manager）
   - 6 个代表性条件覆盖从正常到极端恶劣的网络场景
+  - 本机模式强制 --interface lo，跨主机模式校验 ip route
+  - 原子发布：tmp → 矩阵验证 → tc快照 → execution_valid → os.replace()
 """
 
 import csv
@@ -30,7 +33,7 @@ import time
 import platform
 from datetime import datetime
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # GMCP-R imports
@@ -234,18 +237,75 @@ def clear_tc_netem(interface: str) -> bool:
         return False
 
 
+def get_tc_snapshot(interface: str) -> str:
+    """Get current tc qdisc configuration for the interface."""
+    try:
+        result = subprocess.run(
+            ["sudo", "tc", "qdisc", "show", "dev", interface],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def validate_interface_for_mode(interface: str, host: Optional[str]) -> None:
+    """
+    Validate network interface matches the execution mode.
+    - Local mode (no --host): force --interface lo
+    - Cross-host mode (with --host): validate ip route get output matches --interface
+    """
+    if host is None:
+        # Local mode: must use loopback
+        if interface != "lo":
+            print(f"[ERROR] Local mode (no --host) requires --interface lo, got '{interface}'")
+            sys.exit(1)
+    else:
+        # Cross-host mode: validate interface via ip route get
+        try:
+            result = subprocess.run(
+                ["ip", "route", "get", host],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                print(f"[ERROR] Cannot resolve route to {host}: {result.stderr.strip()}")
+                sys.exit(1)
+            # Parse output: "10.0.0.1 via ... dev eth0 ..."
+            route_output = result.stdout.strip()
+            if f"dev {interface}" not in route_output:
+                # Extract actual interface
+                parts = route_output.split()
+                actual_iface = ""
+                if "dev" in parts:
+                    idx = parts.index("dev")
+                    if idx + 1 < len(parts):
+                        actual_iface = parts[idx + 1]
+                print(f"[ERROR] Interface mismatch: requested '{interface}', "
+                      f"but route to {host} uses '{actual_iface}'")
+                print(f"        Route output: {route_output}")
+                sys.exit(1)
+            print(f"[OK] Interface '{interface}' validated for route to {host}")
+        except FileNotFoundError:
+            print("[WARN] 'ip' command not found, skipping interface validation")
+        except Exception as e:
+            print(f"[WARN] Interface validation failed: {e}")
+
+
 @contextmanager
-def tc_condition(interface: str, loss: int, delay_ms: int, jitter_ms: int, reorder: int):
+def tc_condition(interface: str, loss: int, delay_ms: int, jitter_ms: int, reorder: int) -> Generator[str, None, None]:
     """
     Context manager that sets a tc/netem condition and guarantees cleanup.
+    Yields tc snapshot string after applying rules.
     """
     condition_desc = f"loss={loss}% delay={delay_ms}ms jitter={jitter_ms}ms reorder={reorder}%"
     print(f"[TC] Applying: {condition_desc}")
     ok = setup_tc_netem(interface, loss, delay_ms, jitter_ms, reorder)
     if not ok:
         raise RuntimeError(f"[TC] Failed to apply condition: {condition_desc}")
+    snapshot = get_tc_snapshot(interface)
+    print(f"[TC] Snapshot: {snapshot[:120]}...")
     try:
-        yield
+        yield snapshot
     finally:
         print("[TC] Cleaning up ...")
         clear_tc_netem(interface)
@@ -292,13 +352,13 @@ def build_packet_for_protocol(
         raise ValueError(f"Unknown protocol: {protocol}")
 
 
-def get_initial_state(protocol: str, session_id: str) -> str:
+def get_initial_state(protocol: str, session_id: str, epoch: int = EPOCH) -> str:
     if protocol == "gmcp_r":
         return initial_memory(session_id, CLIENT_ID, EPOCH, "demo-seed")
     elif protocol == "seq_mac":
         return ""
     elif protocol == "authenticated_hash_chain":
-        return hash_text(f"init:{session_id}")
+        return hash_text(f"init:{session_id}:{epoch}")
     else:
         raise ValueError(f"Unknown protocol: {protocol}")
 
@@ -322,7 +382,7 @@ def run_one_experiment(
         f"r{repeat_id}-{int(time.time() * 1000000)}"
     )
 
-    current_mem = get_initial_state(protocol, session_id)
+    current_mem = get_initial_state(protocol, session_id, EPOCH)
 
     accepted = 0
     rejected = 0
@@ -359,6 +419,8 @@ def run_one_experiment(
                     accepted += 1
                     if protocol == "gmcp_r":
                         current_mem = response.get("last_mem", current_mem)
+                    elif protocol == "authenticated_hash_chain":
+                        current_mem = response["last_hash"]
                 else:
                     rejected += 1
                     run_valid = False
@@ -546,6 +608,8 @@ class EmbeddedTCPServer:
         resp = {"ok": ok, "reason": reason, "last_seq": ctx.state.last_seq}
         if protocol == "gmcp_r":
             resp["last_mem"] = ctx.state.last_mem
+        elif protocol == "authenticated_hash_chain" and ok:
+            resp["last_hash"] = ctx.state.last_hash
         return resp
 
     @staticmethod
@@ -573,6 +637,7 @@ def main():
         help="Network interface to apply tc/netem rules (default: lo0/lo)",
     )
     parser.add_argument("--port", type=int, default=9002, help="Server port")
+    parser.add_argument("--host", default=None, help="Remote server host (omit for local mode)")
     parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat")
     parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
     parser.add_argument("--conditions", default=None, help="Comma-separated condition names to run")
@@ -612,6 +677,11 @@ def main():
     server_host = "127.0.0.1"
     server_port = args.port
     interface = args.interface
+    # ---- Interface validation ----
+    validate_interface_for_mode(interface, args.host)
+
+    if args.host:
+        server_host = args.host
 
     # ---- Start embedded server ----
     print(f"[MODE] Starting embedded server on {server_host}:{server_port}")
@@ -631,6 +701,7 @@ def main():
         "success_rate", "throughput_msg_per_sec", "elapsed_seconds",
         "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
         "run_valid", "failure_reason",
+        "execution_valid", "interface", "requested_netem_config", "actual_qdisc_config",
         "timestamp",
         "git_commit", "python_version", "os_info",
     ]
@@ -650,18 +721,20 @@ def main():
     print(f"[INFO] Output: {OUTPUT_CSV}")
     print()
 
+    # ---- Atomic publish: write to tmp first ----
+    tmp_csv = OUTPUT_CSV + ".tmp"
     completed = 0
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+    any_execution_failure = False
+    with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-
         for cond_name, cond_desc, loss, delay, jitter, reorder in conditions:
             print(f"\n{'='*60}")
             print(f"[CONDITION] {cond_name}: {cond_desc}")
             print(f"            loss={loss}% delay={delay}ms jitter={jitter}ms reorder={reorder}%")
             print(f"{'='*60}")
-
-            with tc_condition(interface, loss, delay, jitter, reorder):
+            requested_config = f"loss={loss}% delay={delay}ms jitter={jitter}ms reorder={reorder}%"
+            with tc_condition(interface, loss, delay, jitter, reorder) as tc_snap:
                 for protocol in PROTOCOLS:
                     for repeat_id in range(1, repeats + 1):
                         result = run_one_experiment(
@@ -676,14 +749,42 @@ def main():
                         result["git_commit"] = git_commit
                         result["python_version"] = python_version
                         result["os_info"] = os_info
+                        result["interface"] = interface
+                        result["requested_netem_config"] = requested_config
+                        result["actual_qdisc_config"] = tc_snap
+                        # execution_valid: tc applied + code ran normally + all messages sent
+                        # Note: timeouts/rejections under netem are expected business results,
+                        #       not execution failures. run_valid tracks protocol health.
+                        exec_valid = tc_snap != "" and result["sent_count"] == MESSAGE_COUNT
+                        result["execution_valid"] = exec_valid
+                        if not exec_valid:
+                            any_execution_failure = True
                         writer.writerow(result)
                         f.flush()
                         completed += 1
                         print(
                             f"  [{completed}/{total}] {protocol} {cond_name} r{repeat_id}: "
                             f"acc={result['accepted_count']} rej={result['rejected_count']} "
-                            f"rtt={result['avg_rtt_ms']:.1f}ms"
+                            f"rtt={result['avg_rtt_ms']:.1f}ms "
+                            f"exec={'OK' if exec_valid else 'FAIL'}"
                         )
+
+    # ---- Validate matrix completeness ----
+    expected_rows = len(PROTOCOLS) * len(conditions) * repeats
+    if completed != expected_rows:
+        print(f"[ERROR] Matrix incomplete: {completed}/{expected_rows} rows written")
+        any_execution_failure = True
+
+    # ---- Atomic replace: tmp → final ----
+    if any_execution_failure:
+        print(f"[ERROR] Execution failures detected. Keeping tmp file: {tmp_csv}")
+        print(f"        Final CSV NOT published.")
+        clear_tc_netem(interface)
+        srv.stop()
+        sys.exit(1)
+    else:
+        os.replace(tmp_csv, OUTPUT_CSV)
+        print(f"[OK] All {completed} experiments passed execution_valid")
 
     # Final cleanup (safety net)
     clear_tc_netem(interface)
