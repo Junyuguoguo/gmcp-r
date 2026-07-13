@@ -31,6 +31,7 @@ from gmcp.config import (
 from gmcp.memory import initial_memory
 from gmcp.protocol import GMCPState, GMCPVerifier
 from gmcp.crypto_utils import verify_hmac
+from gmcp.experiment_transport import get_server_env_info
 from gmcp.ticket import build_memory_ticket
 
 from gmcp.baselines.hash_chain import (
@@ -372,6 +373,9 @@ def handle_client(conn, addr, registry: SessionRegistry):
                     "session_id": bound_session_id,
                     "server_time": recv_time,
                 }
+
+                # Include server provenance/environment metadata
+                hello_ack.update(get_server_env_info())
 
                 # For ticket_only protocol, include a ticket signature
                 if bound_protocol == "ticket_only":
