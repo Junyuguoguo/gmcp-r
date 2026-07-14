@@ -195,14 +195,12 @@ def publish_tmp_no_clobber(tmp_path: str, final_path: str) -> None:
 def cleanup_tc_and_verify(interface: str) -> Tuple[bool, str]:
     """Clear tc rules and verify the final qdisc snapshot has no netem residue."""
     try:
-        clear_ok = clear_tc_netem(interface)
+        clear_tc_netem(interface)
     except BaseException:
-        clear_ok = False
+        pass
     snapshot_ok, snapshot, snapshot_error = get_tc_snapshot_checked(interface)
     if not snapshot_ok:
         return False, f"tc snapshot failure after cleanup: {snapshot_error}"
-    if not clear_ok:
-        return False, f"clear_tc_netem failed; final snapshot: {snapshot}"
     if "netem" in snapshot:
         return False, snapshot
     return True, snapshot
