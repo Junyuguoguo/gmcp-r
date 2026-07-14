@@ -1,21 +1,11 @@
 # -*- coding: utf-8 -*-
 # real_tcp_server.py
-#
-# Multi-protocol TCP server with HELLO handshake and connection binding.
-# Supports: gmcp, hash_chain, authenticated_hash_chain, seq_mac, ticket_only
-#
-# Changes (formal-runner-resilience):
-#   - Added HELLO handshake with auth_tag verification
-#   - Added server env info in HELLO_ACK (git_commit, python_version, os, hostname, cpu)
-#   - Added ticket issue for ticket_only protocol
-#   - Added connection-level binding (protocol, session_id, sender_id, epoch)
-#   - Added multi-protocol state factories
 
 import json
 import socket
 import threading
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from gmcp.config import (
     SERVER_BIND_HOST,
@@ -27,40 +17,16 @@ from gmcp.config import (
 from gmcp.memory import initial_memory
 from gmcp.protocol import GMCPState, GMCPVerifier
 from gmcp.crypto_utils import verify_hmac
-from gmcp.experiment_transport import get_server_env_info
 from gmcp.ticket import build_memory_ticket
 
-# Multi-protocol imports
-from gmcp.baselines.hash_chain import (
-    HashChainState,
-    HashChainVerifier,
-    create_initial_state as hc_init_state,
-)
-from gmcp.baselines.seq_mac import (
-    SeqMACState,
-    SeqMACVerifier,
-    create_initial_state as sm_init_state,
-)
-from gmcp.baselines.ticket_only import (
-    TicketOnlyState,
-    TicketOnlyVerifier,
-    create_initial_state as to_init_state,
-    issue_ticket,
-)
-from gmcp.baselines.authenticated_hash_chain import (
-    AuthHashChainState,
-    AuthHashChainVerifier,
-    create_initial_state as ahc_init_state,
-)
 
 state_lock = threading.Lock()
 
-SUPPORTED_PROTOCOLS = ("gmcp", "hash_chain", "seq_mac", "ticket_only", "authenticated_hash_chain")
 
-
-def make_gmcp_state(session_id: str) -> GMCPState:
+def make_state(session_id: str) -> GMCPState:
     mem_seed = "demo-seed"
     m0 = initial_memory(session_id, CLIENT_ID, EPOCH, mem_seed)
+
     return GMCPState(
         session_id=session_id,
         sender_id=CLIENT_ID,
@@ -96,7 +62,6 @@ def verify_recovery_request(packet: Dict[str, Any]) -> bool:
 def handle_recovery_request(packet, states, verifiers, stats):
     recv_time = time.time()
     session_id = packet.get("session_id", "unknown-session")
-    protocol = packet.get("protocol", "gmcp")
 
     if not verify_recovery_request(packet):
         return {
@@ -108,115 +73,45 @@ def handle_recovery_request(packet, states, verifiers, stats):
 
     with state_lock:
         if session_id not in states:
-            _create_session(session_id, protocol, states, verifiers, stats)
+            states[session_id] = make_state(session_id)
+            verifiers[session_id] = GMCPVerifier(states[session_id])
+            stats[session_id] = {
+                "total": 0,
+                "accepted": 0,
+                "rejected": 0,
+            }
 
         state = states[session_id]
+        memory_ticket = build_memory_ticket(
+            session_id=session_id,
+            client_id=packet.get("client_id", CLIENT_ID),
+            epoch=EPOCH,
+            last_seq=state.last_seq,
+            last_mem=state.last_mem,
+            checkpoint_seq=state.last_seq,
+            checkpoint_mem=state.last_mem,
+        )
 
-        if protocol == "gmcp":
-            memory_ticket = build_memory_ticket(
-                session_id=session_id,
-                client_id=packet.get("client_id", CLIENT_ID),
-                epoch=EPOCH,
-                last_seq=state.last_seq,
-                last_mem=state.last_mem,
-                checkpoint_seq=state.last_seq,
-                checkpoint_mem=state.last_mem,
-            )
-            response = {
-                "ok": True,
-                "type": "RECOVERY_RESPONSE",
-                "reason": "ok",
-                "recovery_mode": "memory_ticket_checkpoint",
-                "session_id": session_id,
-                "server_last_seq": state.last_seq,
-                "server_last_mem": state.last_mem,
-                "checkpoint_seq": state.last_seq,
-                "checkpoint_mem": state.last_mem,
-                "memory_ticket": memory_ticket,
-                "server_time": recv_time,
-            }
-        elif protocol in ("hash_chain", "authenticated_hash_chain"):
-            response = {
-                "ok": True,
-                "type": "RECOVERY_RESPONSE",
-                "reason": "ok",
-                "recovery_mode": "full_chain_replay",
-                "session_id": session_id,
-                "server_last_seq": state.last_seq,
-                "last_hash": state.last_hash,
-                "server_time": recv_time,
-            }
-        elif protocol == "seq_mac":
-            response = {
-                "ok": True,
-                "type": "RECOVERY_RESPONSE",
-                "reason": "ok",
-                "recovery_mode": "stateless_resync",
-                "session_id": session_id,
-                "server_last_seq": state.last_seq,
-                "server_time": recv_time,
-            }
-        elif protocol == "ticket_only":
-            response = {
-                "ok": True,
-                "type": "RECOVERY_RESPONSE",
-                "reason": "ok",
-                "recovery_mode": "reissue_ticket",
-                "session_id": session_id,
-                "server_last_seq": state.last_seq,
-                "ticket": state.ticket,
-                "server_time": recv_time,
-            }
-        else:
-            response = {
-                "ok": False,
-                "type": "RECOVERY_RESPONSE",
-                "reason": f"unsupported protocol: {protocol}",
-                "server_time": recv_time,
-            }
+        response = {
+            "ok": True,
+            "type": "RECOVERY_RESPONSE",
+            "reason": "ok",
+            "recovery_mode": "memory_ticket_checkpoint",
+            "session_id": session_id,
+            "server_last_seq": state.last_seq,
+            "server_last_mem": state.last_mem,
+            "checkpoint_seq": state.last_seq,
+            "checkpoint_mem": state.last_mem,
+            "memory_ticket": memory_ticket,
+            "server_time": recv_time,
+        }
 
     return response
-
-
-def _create_session(session_id: str, protocol: str, states, verifiers, stats):
-    """Create initial state and verifier for a given protocol session."""
-    if protocol == "gmcp":
-        state = make_gmcp_state(session_id)
-        verifier = GMCPVerifier(state)
-    elif protocol == "hash_chain":
-        state = hc_init_state(session_id, CLIENT_ID, EPOCH)
-        verifier = HashChainVerifier(state)
-    elif protocol == "authenticated_hash_chain":
-        state = ahc_init_state(session_id, CLIENT_ID, EPOCH)
-        verifier = AuthHashChainVerifier(state)
-    elif protocol == "seq_mac":
-        state = sm_init_state(session_id, CLIENT_ID, EPOCH)
-        verifier = SeqMACVerifier(state)
-    elif protocol == "ticket_only":
-        state = to_init_state(session_id, CLIENT_ID, EPOCH)
-        verifier = TicketOnlyVerifier(state)
-    else:
-        raise ValueError(f"unsupported protocol: {protocol}")
-
-    states[session_id] = state
-    verifiers[session_id] = verifier
-    stats[session_id] = {
-        "total": 0,
-        "accepted": 0,
-        "rejected": 0,
-    }
 
 
 def handle_client(conn, addr, states, verifiers, stats):
     enable_tcp_nodelay(conn)
     print(f"[REAL_TCP_SERVER] connected from {addr}", flush=True)
-
-    # Connection-level binding
-    bound_protocol = None
-    bound_session_id = None
-    bound_sender_id = None
-    bound_epoch = None
-    hello_done = False
 
     file_obj = None
 
@@ -248,7 +143,6 @@ def handle_client(conn, addr, states, verifiers, stats):
 
             packet_type = packet.get("type")
 
-            # PING
             if packet_type == "PING":
                 send_json_line(conn, {
                     "ok": True,
@@ -257,153 +151,22 @@ def handle_client(conn, addr, states, verifiers, stats):
                 })
                 continue
 
-            # HELLO handshake
-            if packet_type == "HELLO":
-                hello_protocol = packet.get("protocol", "gmcp")
-                hello_session_id = packet.get("session_id", "unknown-session")
-                hello_sender_id = packet.get("sender_id", "unknown-sender")
-                hello_epoch = packet.get("epoch", 0)
-
-                # Verify auth_tag on HELLO
-                hello_tag = packet.get("auth_tag", "")
-                hello_data = dict(packet)
-                hello_data.pop("auth_tag", None)
-                if not verify_hmac(DATA_AUTH_KEY, hello_data, hello_tag):
-                    send_json_line(conn, {
-                        "ok": False,
-                        "type": "HELLO_ACK",
-                        "reason": "HELLO auth_tag invalid",
-                        "server_time": recv_time,
-                    })
-                    continue
-
-                # Validate protocol
-                if hello_protocol not in SUPPORTED_PROTOCOLS:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "type": "HELLO_ACK",
-                        "reason": f"unsupported protocol: {hello_protocol}",
-                        "server_time": recv_time,
-                    })
-                    continue
-
-                # Bind connection
-                bound_protocol = hello_protocol
-                bound_session_id = hello_session_id
-                bound_sender_id = hello_sender_id
-                bound_epoch = hello_epoch
-                hello_done = True
-
-                # Create session state
-                with state_lock:
-                    if hello_session_id not in states:
-                        _create_session(hello_session_id, hello_protocol, states, verifiers, stats)
-                        print(f"[REAL_TCP_SERVER] new session: {hello_session_id} (protocol={hello_protocol})", flush=True)
-
-                # Build HELLO_ACK
-                hello_ack = {
-                    "ok": True,
-                    "type": "HELLO_ACK",
-                    "reason": "ok",
-                    "protocol": bound_protocol,
-                    "session_id": bound_session_id,
-                    "server_time": recv_time,
-                }
-
-                # Include server env info
-                hello_ack.update(get_server_env_info())
-
-                # For ticket_only, issue and include ticket
-                if bound_protocol == "ticket_only":
-                    ticket = issue_ticket(bound_session_id, bound_epoch)
-                    hello_ack["ticket"] = ticket
-
-                send_json_line(conn, hello_ack)
-                continue
-
-            # RECOVERY_REQUEST
             if packet_type == "RECOVERY_REQUEST":
-                if not hello_done:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "type": "RECOVERY_RESPONSE",
-                        "reason": "connection not bound: HELLO required",
-                        "server_time": recv_time,
-                    })
-                    continue
-
-                rec_session_id = packet.get("session_id", "unknown-session")
-                rec_protocol = packet.get("protocol", "gmcp")
-
-                # Connection binding check
-                if rec_protocol != bound_protocol:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "type": "RECOVERY_RESPONSE",
-                        "reason": f"connection protocol mismatch: bound={bound_protocol}, got={rec_protocol}",
-                        "server_time": recv_time,
-                    })
-                    continue
-                if rec_session_id != bound_session_id:
-                    send_json_line(conn, {
-                        "ok": False,
-                        "type": "RECOVERY_RESPONSE",
-                        "reason": f"connection session mismatch: bound={bound_session_id}, got={rec_session_id}",
-                        "server_time": recv_time,
-                    })
-                    continue
-
                 response = handle_recovery_request(packet, states, verifiers, stats)
                 send_json_line(conn, response)
                 continue
 
-            # DATA packet — require HELLO first
-            if not hello_done:
-                send_json_line(conn, {
-                    "ok": False,
-                    "reason": "connection not bound: HELLO required",
-                    "server_time": recv_time,
-                })
-                continue
-
-            protocol = packet.get("protocol", "gmcp")
             session_id = packet.get("session_id", "unknown-session")
-            sender_id = packet.get("sender_id", "unknown-sender")
-            epoch = packet.get("epoch", 0)
-
-            # Connection binding checks
-            if protocol != bound_protocol:
-                send_json_line(conn, {
-                    "ok": False,
-                    "reason": f"connection protocol mismatch: bound={bound_protocol}, got={protocol}",
-                    "server_time": recv_time,
-                })
-                continue
-            if session_id != bound_session_id:
-                send_json_line(conn, {
-                    "ok": False,
-                    "reason": f"connection session mismatch: bound={bound_session_id}, got={session_id}",
-                    "server_time": recv_time,
-                })
-                continue
-            if sender_id != bound_sender_id:
-                send_json_line(conn, {
-                    "ok": False,
-                    "reason": f"connection sender mismatch: bound={bound_sender_id}, got={sender_id}",
-                    "server_time": recv_time,
-                })
-                continue
-            if epoch != bound_epoch:
-                send_json_line(conn, {
-                    "ok": False,
-                    "reason": f"connection epoch mismatch: bound={bound_epoch}, got={epoch}",
-                    "server_time": recv_time,
-                })
-                continue
 
             with state_lock:
                 if session_id not in states:
-                    _create_session(session_id, protocol, states, verifiers, stats)
+                    states[session_id] = make_state(session_id)
+                    verifiers[session_id] = GMCPVerifier(states[session_id])
+                    stats[session_id] = {
+                        "total": 0,
+                        "accepted": 0,
+                        "rejected": 0,
+                    }
                     print(f"[REAL_TCP_SERVER] new session: {session_id}", flush=True)
 
                 state = states[session_id]
@@ -416,7 +179,7 @@ def handle_client(conn, addr, states, verifiers, stats):
                 if ok:
                     stats[session_id]["accepted"] += 1
 
-                    if stats[session_id]["accepted"] % 500 == 0:
+                    if state.last_seq % 500 == 0:
                         print(
                             f"[REAL_TCP_SERVER] session={session_id}, "
                             f"accepted={stats[session_id]['accepted']}, "
@@ -431,25 +194,16 @@ def handle_client(conn, addr, states, verifiers, stats):
                         flush=True,
                     )
 
-                # Build response with protocol-appropriate state
-                response: Dict[str, Any] = {
+                response = {
                     "ok": ok,
                     "reason": reason,
                     "session_id": session_id,
+                    "last_seq": state.last_seq,
+                    "last_mem": state.last_mem,
                     "server_time": recv_time,
                     "accepted": stats[session_id]["accepted"],
                     "rejected": stats[session_id]["rejected"],
                 }
-
-                # Include protocol-appropriate state fields
-                if protocol == "gmcp":
-                    response["last_seq"] = state.last_seq
-                    response["last_mem"] = state.last_mem
-                elif protocol in ("hash_chain", "authenticated_hash_chain"):
-                    response["last_seq"] = state.last_seq
-                    response["last_hash"] = state.last_hash
-                elif protocol in ("seq_mac", "ticket_only"):
-                    response["last_seq"] = state.last_seq
 
             send_json_line(conn, response)
 
@@ -472,8 +226,8 @@ def handle_client(conn, addr, states, verifiers, stats):
 
 
 def main():
-    states: Dict[str, Any] = {}
-    verifiers: Dict[str, Any] = {}
+    states: Dict[str, GMCPState] = {}
+    verifiers: Dict[str, GMCPVerifier] = {}
     stats: Dict[str, Dict[str, int]] = {}
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

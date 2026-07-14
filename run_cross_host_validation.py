@@ -253,6 +253,9 @@ def run_one_experiment(
     # Protocol adapter (initialized before try so it's always bound)
     adapter: Optional[ProtocolAdapter] = None
 
+    # Structured failure classification
+    failure_type = ""  # connection_error | hello_error | socket_timeout | recv_error | exception
+
     start_time = time.time()
     sock = None
     file_obj = None
@@ -262,7 +265,11 @@ def run_one_experiment(
 
         # --- HELLO handshake ---
         # send_hello uses wire protocol names and validates the response
-        ack = send_hello(sock, file_obj, protocol, session_id, CLIENT_ID, EPOCH)
+        try:
+            ack = send_hello(sock, file_obj, protocol, session_id, CLIENT_ID, EPOCH)
+        except Exception as he:
+            failure_type = "hello_error"
+            raise
 
         # Extract server environment info from HELLO_ACK
         server_env = {
@@ -308,14 +315,34 @@ def run_one_experiment(
 
             except socket.timeout:
                 timeout_count += 1
+                failure_type = "socket_timeout"
                 failure_reason = "socket_timeout"
                 break  # Stop this run, don't continue with next seq
+            except UnicodeDecodeError as ude:
+                error_count += 1
+                failure_type = "recv_error"
+                failure_reason = f"UnicodeDecodeError: {ude}"
+                break
             except Exception as e:
                 error_count += 1
+                failure_type = failure_type or "recv_error"
                 failure_reason = str(e)
                 break  # Stop this run, don't continue with next seq
 
+    except socket.timeout:
+        failure_type = failure_type or "connection_error"
+        failure_reason = failure_reason or "connection_timeout"
+        error_count = max(error_count, 1)
+    except ConnectionRefusedError:
+        failure_type = "connection_error"
+        failure_reason = failure_reason or "connection_refused"
+        error_count = max(error_count, 1)
+    except OSError as oe:
+        failure_type = "connection_error"
+        failure_reason = failure_reason or f"OSError: {oe}"
+        error_count = max(error_count, 1)
     except Exception as e:
+        failure_type = failure_type or "exception"
         print(f"  [ERROR] {protocol} r{repeat_id}: {e}")
         failure_reason = failure_reason or str(e)
         error_count = max(error_count, 1)
@@ -399,6 +426,7 @@ def run_one_experiment(
         "timeout_count": timeout_count,
         "error_count": error_count,
         "failure_reason": failure_reason,
+        "failure_type": failure_type,
         "unrecovered": unrecovered,
         # State audit fields (from ProtocolAdapter)
         "client_final_seq": state_fields["client_final_seq"],
@@ -411,6 +439,7 @@ def run_one_experiment(
         "server_final_hash": state_fields["server_final_hash"],
         "hash_match": hash_match,
         "state_match": state_match,
+        "state_auditable": adapter is not None,
         "run_valid": run_valid,
         "success_rate": round(success_rate, 2),
         "throughput_msg_per_sec": round(throughput, 2),
@@ -845,12 +874,12 @@ def main():
         "server_host", "server_port", "tcp_connect_latency_ms",
         "message_count", "payload_size", "repeat_id",
         "sent_count", "accepted_count", "rejected_count",
-        "timeout_count", "error_count", "failure_reason",
+        "timeout_count", "error_count", "failure_reason", "failure_type",
         "unrecovered",
         "client_final_seq", "server_final_seq", "sequence_match",
         "client_final_mem", "server_final_mem", "memory_match",
         "client_final_hash", "server_final_hash", "hash_match",
-        "state_match", "run_valid",
+        "state_match", "state_auditable", "run_valid",
         "success_rate", "throughput_msg_per_sec", "elapsed_seconds",
         "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
         "timestamp",
@@ -858,6 +887,7 @@ def main():
         "client_python_version", "client_os_info", "client_cpu_model",
         "server_git_commit", "server_python_version", "server_os_info",
         "server_hostname", "server_git_dirty", "server_cpu_model",
+        "attempt_number",
         "command_line",
     ]
 
@@ -881,6 +911,21 @@ def main():
     journal_path = (os.path.join(args.run_dir, "attempts.jsonl") if args.run_dir else output_csv + ".journal")
     journal_entries = []
 
+    # --- Attempt number: count prior run_start entries in journal ---
+    _attempt_id = 1
+    if os.path.exists(journal_path):
+        try:
+            with open(journal_path, "r", encoding="utf-8") as jf:
+                for line in jf:
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("event") == "run_start":
+                            _attempt_id += 1
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        except Exception:
+            pass  # fresh start
+
     def write_journal(event: str, **extra):
         """Append a timestamped event to the journal file."""
         entry = {
@@ -898,7 +943,7 @@ def main():
             print(f"[JOURNAL] FATAL: failed to write journal: {je}")
             sys.exit(1)
 
-    write_journal("run_start", total=total, mode=mode_label, output=output_csv)
+    write_journal("run_start", total=total, mode=mode_label, output=output_csv, attempt_number=_attempt_id)
 
     # Batch mode: write to .tmp incrementally, flush after each experiment
     tmp_csv = output_csv + ".tmp"
@@ -911,7 +956,9 @@ def main():
         for protocol in PROTOCOLS:
             for msg_count in MESSAGE_COUNTS:
                 for payload_size in PAYLOAD_SIZES:
-                    for repeat_id in range(1, repeats + 1):
+                    # Batch mode: single repeat_id from CLI; normal mode: range
+                    repeat_range = [args.repeat_id] if args.formal_batch else range(1, repeats + 1)
+                    for repeat_id in repeat_range:
                         idx = completed + failed + 1
                         result = run_one_experiment(
                             protocol=protocol,
@@ -927,8 +974,9 @@ def main():
                             git_meta=git_meta,
                         )
 
-                        # Inject command_line into each result
+                        # Inject metadata into each result
                         result["command_line"] = command_line
+                        result["attempt_number"] = _attempt_id
 
                         # Always write to CSV (failed rows preserved with run_valid=False)
                         writer.writerow(result)
@@ -942,6 +990,8 @@ def main():
                                 msg_count=msg_count,
                                 payload_size=payload_size,
                                 repeat_id=repeat_id,
+                                attempt_number=_attempt_id,
+                                failure_type=result.get("failure_type", ""),
                                 failure_reason=result.get("failure_reason", ""),
                             )
                         else:
@@ -957,7 +1007,7 @@ def main():
                             f"rtt={result['avg_rtt_ms']:.1f}ms [{valid_mark}]"
                         )
 
-    write_journal("run_end", completed=completed, failed=failed, total=total)
+    write_journal("run_end", completed=completed, failed=failed, total=total, attempt_number=_attempt_id)
 
     # Validate tmp file before atomic replace
     # NEVER delete tmp — on failure, rename to .failed.csv for forensics
