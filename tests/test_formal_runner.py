@@ -13,6 +13,7 @@ import csv
 import json
 import os
 import socket
+import sys
 import tempfile
 import time
 import unittest
@@ -350,10 +351,11 @@ def _make_row(repeat_id=1, protocol="gmcp_r", message_count=500, payload_size=12
               git_commit="a" * 40, git_dirty="false", server_git_dirty="false",
               session_id=None, memory_match="True", hash_match="",
               state_match="True", sequence_match="True",
+              final_state_complete="True",
               server_hostname="ser5181800568", server_python_version="3.9.16",
               server_os_info="CentOS 7.6", server_cpu_model="x86_64",
               server_git_commit="a" * 40, network_path_type="wan",
-              client_host_id="VM-0-14-ubuntu", failure_reason="",
+              client_host_id="VM-0-14-ubuntu", failure_reason="", failure_type="",
               unrecovered=0, schema_version="2"):
     """Build a single result dict matching the expected CSV schema."""
     if accepted is None:
@@ -386,9 +388,11 @@ def _make_row(repeat_id=1, protocol="gmcp_r", message_count=500, payload_size=12
         "network_path_type": network_path_type,
         "client_host_id": client_host_id,
         "failure_reason": failure_reason,
+        "failure_type": failure_type,
         "unrecovered": str(unrecovered),
         "sent_count": str(accepted + rejected + timeout + error),
         "schema_version": schema_version,
+        "final_state_complete": final_state_complete,
     }
 
 
@@ -1585,6 +1589,358 @@ class TestAggregatorV21FailureReason(unittest.TestCase):
         errors, _, _ = validate_all(batch_dir)
         self.assertTrue(any("failure_reason" in e for e in errors),
                         f"Expected failure_reason error, got: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# 41. Formal batch: attempt-number is mandatory and bounded
+# ---------------------------------------------------------------------------
+
+class TestFormalBatchAttemptNumber(unittest.TestCase):
+    """formal-batch requires explicit --attempt-number in {1,2,3}."""
+
+    def _parse(self, *extra):
+        import run_cross_host_validation as runner
+        parser = runner.build_arg_parser()
+        args = parser.parse_args([
+            "--formal-batch",
+            "--repeat-id", "1",
+            "--run-dir", tempfile.mkdtemp(),
+            *extra,
+        ])
+        runner.normalize_and_validate_args(parser, args)
+        return args
+
+    def test_missing_attempt_number_fails(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._parse()
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_attempt_number_zero_fails(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._parse("--attempt-number", "0")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_attempt_number_four_fails(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._parse("--attempt-number", "4")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_attempt_numbers_one_two_three_pass(self):
+        for n in (1, 2, 3):
+            with self.subTest(n=n):
+                args = self._parse("--attempt-number", str(n))
+                self.assertEqual(args.attempt_number_arg, n)
+
+
+# ---------------------------------------------------------------------------
+# 42. Formal batch startup guards: no overwrite and no stale tmp truncation
+# ---------------------------------------------------------------------------
+
+class TestFormalBatchStartupGuards(unittest.TestCase):
+    """formal-batch rejects existing output and existing tmp before writing."""
+
+    def _formal_args(self):
+        import run_cross_host_validation as runner
+        parser = runner.build_arg_parser()
+        run_dir = tempfile.mkdtemp()
+        args = parser.parse_args([
+            "--formal-batch", "--repeat-id", "1",
+            "--run-dir", run_dir, "--attempt-number", "1",
+        ])
+        runner.normalize_and_validate_args(parser, args)
+        return args
+
+    def test_existing_success_batch_rejected_without_no_overwrite(self):
+        import run_cross_host_validation as runner
+        args = self._formal_args()
+        output = Path(args.run_dir) / "cross_host_batch_r01.csv"
+        output.write_text("old-success\n", encoding="utf-8")
+
+        with self.assertRaises(SystemExit) as ctx:
+            runner.enforce_startup_output_guards(args, str(output))
+
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(output.read_text(encoding="utf-8"), "old-success\n")
+
+    def test_existing_tmp_rejected_and_not_truncated(self):
+        import run_cross_host_validation as runner
+        args = self._formal_args()
+        output = Path(args.run_dir) / "cross_host_batch_r01.csv"
+        tmp = Path(str(output) + ".tmp")
+        tmp.write_text("old tmp contents\n", encoding="utf-8")
+
+        with self.assertRaises(SystemExit) as ctx:
+            runner.enforce_startup_output_guards(args, str(output))
+
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(tmp.read_text(encoding="utf-8"), "old tmp contents\n")
+
+
+# ---------------------------------------------------------------------------
+# 43. Failed artifact preservation
+# ---------------------------------------------------------------------------
+
+class TestPreserveFailedArtifact(unittest.TestCase):
+    """Failed artifacts are never replaced by a later failed tmp."""
+
+    def test_existing_failed_artifact_not_overwritten(self):
+        import run_cross_host_validation as runner
+        tmpdir = Path(tempfile.mkdtemp())
+        tmp = tmpdir / "batch.csv.tmp"
+        failed = tmpdir / "batch_attempt01.failed.csv"
+        tmp.write_text("new failure\n", encoding="utf-8")
+        failed.write_text("old failure\n", encoding="utf-8")
+
+        preserved = runner.preserve_failed_artifact(str(tmp), str(failed))
+
+        self.assertEqual(failed.read_text(encoding="utf-8"), "old failure\n")
+        self.assertNotEqual(Path(preserved), failed)
+        self.assertTrue(Path(preserved).exists())
+        self.assertEqual(Path(preserved).read_text(encoding="utf-8"), "new failure\n")
+
+
+# ---------------------------------------------------------------------------
+# 44. Runner state audit semantics
+# ---------------------------------------------------------------------------
+
+class TestRunnerStateAuditSemantics(unittest.TestCase):
+    """partial_state_auditable and final_state_complete have distinct meanings."""
+
+    def _run_with_responses(self, responses, message_count=3):
+        import run_cross_host_validation as runner
+
+        mock_sock = MagicMock()
+        mock_file = MagicMock()
+        with patch.object(runner, "open_tcp", return_value=(mock_sock, mock_file)):
+            with patch("run_cross_host_validation.send_hello", return_value={
+                "ok": True, "type": "HELLO_ACK", "protocol": "seq_mac",
+                "session_id": "test-session", "server_git_commit": "a" * 40,
+                "server_python_version": "3.11", "server_os_info": "test",
+                "server_hostname": "server-a", "server_git_dirty": "false",
+                "server_cpu_model": "test",
+            }):
+                with patch("run_cross_host_validation.recv_json_line", side_effect=responses):
+                    with patch("run_cross_host_validation.send_json_line"):
+                        return runner.run_one_experiment(
+                            protocol="seq_mac",
+                            message_count=message_count,
+                            payload_size=64,
+                            repeat_id=1,
+                            server_host="10.0.0.2",
+                            server_port=9001,
+                            client_host_id="client-a",
+                            server_host_id="server-a",
+                            network_path_type="lan",
+                            baseline_rtt_ms=1.0,
+                            git_meta={"git_commit": "a" * 40, "git_branch": "main", "git_dirty": "false", "client_cpu_model": "test"},
+                        )
+
+    def test_zero_accepted_is_not_partially_auditable(self):
+        result = self._run_with_responses([{"ok": False, "reason": "reject"}], message_count=3)
+        self.assertFalse(result["partial_state_auditable"])
+        self.assertFalse(result["state_auditable"])
+        self.assertFalse(result["final_state_complete"])
+
+    def test_partial_acceptance_is_partial_not_final(self):
+        result = self._run_with_responses([
+            {"ok": True, "last_seq": 1},
+            {"ok": False, "reason": "reject"},
+        ], message_count=3)
+        self.assertTrue(result["partial_state_auditable"])
+        self.assertTrue(result["state_auditable"])
+        self.assertFalse(result["final_state_complete"])
+
+    def test_complete_success_is_final_state_complete(self):
+        result = self._run_with_responses([
+            {"ok": True, "last_seq": 1},
+            {"ok": True, "last_seq": 2},
+            {"ok": True, "last_seq": 3},
+        ], message_count=3)
+        self.assertTrue(result["partial_state_auditable"])
+        self.assertTrue(result["state_auditable"])
+        self.assertTrue(result["final_state_complete"])
+
+
+# ---------------------------------------------------------------------------
+# 45. Formal batch journal fields
+# ---------------------------------------------------------------------------
+
+class TestFormalBatchJournalFields(unittest.TestCase):
+    """A successful formal batch writes run_start, 20 result events, run_end."""
+
+    def test_experiment_result_journal_fields_are_complete(self):
+        import run_cross_host_validation as runner
+
+        run_dir = tempfile.mkdtemp()
+
+        def fake_result(protocol, message_count, payload_size, repeat_id, **kwargs):
+            row = _make_row(
+                repeat_id=repeat_id,
+                protocol=protocol,
+                message_count=message_count,
+                payload_size=payload_size,
+                accepted=message_count,
+                memory_match="True" if protocol == "gmcp_r" else "",
+                hash_match="True" if protocol in ("hash_chain", "authenticated_hash_chain") else "",
+                client_host_id="client-a",
+                server_hostname="server-a",
+            )
+            row.update({
+                "experiment_type": "cross_host",
+                "server_host_id": "10.0.0.2",
+                "server_host": "10.0.0.2",
+                "server_port": 9001,
+                "tcp_connect_latency_ms": 1.0,
+                "client_final_seq": message_count,
+                "server_final_seq": message_count,
+                "state_auditable": True,
+                "partial_state_auditable": True,
+                "final_state_complete": True,
+                "success_rate": 100.0,
+                "throughput_msg_per_sec": 1000.0,
+                "elapsed_seconds": 0.1,
+                "avg_rtt_ms": 1.0,
+                "p50_rtt_ms": 1.0,
+                "p95_rtt_ms": 1.0,
+                "p99_rtt_ms": 1.0,
+                "timestamp": "2026-07-14T00:00:00+00:00",
+                "git_commit": "a" * 40,
+                "git_branch": "fix/formal-runner-resilience",
+                "git_dirty": "false",
+                "client_python_version": "3.11",
+                "client_os_info": "test",
+                "client_cpu_model": "test",
+                "server_git_commit": "a" * 40,
+                "server_python_version": "3.11",
+                "server_os_info": "test",
+                "server_git_dirty": "false",
+                "server_cpu_model": "test",
+                "failure_type": "",
+                "failure_reason": "",
+                "unrecovered": 0,
+                "sent_count": message_count,
+            })
+            return row
+
+        argv = [
+            "run_cross_host_validation.py",
+            "--formal-batch",
+            "--repeat-id", "1",
+            "--run-dir", run_dir,
+            "--attempt-number", "1",
+            "--no-spawn-server",
+            "--host", "10.0.0.2",
+        ]
+        with patch.object(sys, "argv", argv):
+            with patch.object(runner, "ping_server", return_value=True):
+                with patch.object(runner, "measure_baseline_rtt", return_value=1.0):
+                    with patch.object(runner, "get_host_id", return_value="client-a"):
+                        with patch.object(runner, "get_git_metadata", return_value={
+                            "git_commit": "a" * 40,
+                            "git_branch": "fix/formal-runner-resilience",
+                            "git_dirty": "false",
+                        }):
+                            with patch.object(runner, "get_cpu_model", return_value="test"):
+                                with patch.object(runner, "run_one_experiment", side_effect=fake_result):
+                                    runner.main()
+
+        journal = Path(run_dir) / "attempts.jsonl"
+        events = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+        result_events = [e for e in events if e["event"] == "experiment_result"]
+        self.assertEqual(events[0]["event"], "run_start")
+        self.assertEqual(events[-1]["event"], "run_end")
+        self.assertEqual(len(result_events), 20)
+        required = {
+            "matrix_index", "total", "sent_count", "client_git_commit",
+            "server_git_commit", "client_host_id", "server_hostname", "schema_version",
+        }
+        for event in result_events:
+            self.assertTrue(required.issubset(event.keys()), f"Missing {required - event.keys()}")
+
+
+# ---------------------------------------------------------------------------
+# 46. Aggregator publish and final-state guards
+# ---------------------------------------------------------------------------
+
+class TestAggregatorFormalPublishGuards(unittest.TestCase):
+    """Aggregator refuses existing output and incomplete final state."""
+
+    def test_existing_output_rejected(self):
+        import subprocess
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+        output = Path(tmpdir) / "cross_host_results.csv"
+        output.write_text("existing formal result\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, "aggregate_cross_host_batches.py",
+             "--batch-dir", str(batch_dir),
+             "--output", str(output)],
+            capture_output=True, text=True,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))) or ".",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(output.read_text(encoding="utf-8"), "existing formal result\n")
+
+    def test_validate_all_rejects_final_state_complete_false(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 1:
+                rows = []
+                for proto in ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=1, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                final_state_complete="False",
+                                session_id=f"fsc-{proto}-{mc}-{ps}",
+                            ))
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+
+        errors, _, _ = validate_all(batch_dir)
+
+        self.assertTrue(any("final_state_complete=False" in e for e in errors),
+                        f"Expected final_state_complete error, got: {errors}")
+
+    def test_validate_all_rejects_success_row_failure_type(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 1:
+                rows = []
+                for proto in ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=1, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                failure_type="exception",
+                                session_id=f"ft-{proto}-{mc}-{ps}",
+                            ))
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+
+        errors, _, _ = validate_all(batch_dir)
+
+        self.assertTrue(any("failure_type" in e for e in errors),
+                        f"Expected failure_type error, got: {errors}")
 
 
 if __name__ == "__main__":

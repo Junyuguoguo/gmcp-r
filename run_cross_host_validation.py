@@ -37,7 +37,9 @@ import sys
 import time
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 # ---------------------------------------------------------------------------
 # GMCP-R imports
@@ -150,6 +152,164 @@ def classify_network_path(host: str) -> str:
 
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def _find_enclosing_git_root(path: Path) -> Optional[Path]:
+    """Return the nearest enclosing Git root for path, using filesystem markers."""
+    resolved = path.resolve()
+    for candidate in (resolved, *resolved.parents):
+        marker = candidate / ".git"
+        if marker.exists():
+            return candidate
+    return None
+
+
+def ensure_formal_batch_run_dir(parser: argparse.ArgumentParser, run_dir: str) -> Path:
+    """Create and validate a formal batch run directory before any output is opened."""
+    path = Path(run_dir)
+    if not path.is_absolute():
+        parser.error("--formal-batch requires --run-dir to be an absolute path")
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        parser.error(f"--run-dir could not be created: {exc}")
+
+    git_root = _find_enclosing_git_root(path)
+    if git_root is not None:
+        parser.error(f"--run-dir must not be inside a Git repository: {git_root}")
+
+    probe = path / f".write-test-{uuid4().hex}"
+    try:
+        with probe.open("x", encoding="utf-8") as f:
+            f.write("ok\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as exc:
+        parser.error(f"--run-dir is not writable: {exc}")
+    finally:
+        try:
+            probe.unlink()
+        except FileNotFoundError:
+            pass
+    return path
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="GMCP-R cross-host experiment validation framework"
+    )
+    parser.add_argument("--host", default=None, help="Server host to connect to (client mode)")
+    parser.add_argument("--port", type=int, default=9001, help="Server port (default: 9001)")
+    parser.add_argument("--bind-host", default="127.0.0.1", help="Bind address for server mode")
+    parser.add_argument(
+        "--no-spawn-server",
+        action="store_true",
+        help="Do NOT spawn an embedded server; connect to an external server at --host:--port",
+    )
+    parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat only, output to smoke CSV")
+    parser.add_argument("--formal", action="store_true", help="Formal mode: full run with strict guards")
+    parser.add_argument("--formal-batch", action="store_true",
+        help="Formal batch mode: like --formal but skips TTY confirmation prompts for CI/automation")
+    parser.add_argument("--repeat-id", type=int, default=None,
+        help="For --formal-batch: specific repeat_id (1-20) to run")
+    parser.add_argument("--run-dir", type=str, default=None,
+        help="Absolute path for journal and batch output files")
+    parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
+    parser.add_argument("--attempt-number", type=int, default=None, dest="attempt_number_arg",
+        help="For --formal-batch: required explicit attempt number (1, 2, or 3)")
+    parser.add_argument("--no-overwrite", action="store_true",
+        help="Development mode only: refuse to overwrite existing output CSV")
+    parser.add_argument("--allow-mixed-commits", action="store_true",
+        help="Allow client and server to run different git commits (formal mode)")
+    parser.add_argument(
+        "--server-only",
+        action="store_true",
+        help="Run as server only (listen for connections, do not run client experiments)",
+    )
+    return parser
+
+
+def normalize_and_validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Apply mode implications and fail-fast CLI validation."""
+    effective_formal = args.formal or args.formal_batch
+    if args.formal_batch:
+        args.formal = True
+    if args.quick and effective_formal:
+        parser.error("--quick and --formal/--formal-batch are mutually exclusive")
+
+    if effective_formal:
+        if args.allow_mixed_commits:
+            print("[FORMAL] --allow-mixed-commits: skipping commit consistency check")
+        if args.formal_batch:
+            if args.repeat_id is None:
+                parser.error("--formal-batch requires --repeat-id (1-20)")
+            if not (1 <= args.repeat_id <= 20):
+                parser.error("--repeat-id must be 1-20")
+            if args.run_dir is None:
+                parser.error("--formal-batch requires --run-dir (absolute path)")
+            ensure_formal_batch_run_dir(parser, args.run_dir)
+            if args.attempt_number_arg is None:
+                parser.error("--formal-batch requires --attempt-number N (N must be 1, 2, or 3)")
+            if args.attempt_number_arg not in (1, 2, 3):
+                parser.error("--attempt-number must be 1, 2, or 3")
+            args.repeats = 1
+        else:
+            if args.repeats is not None and args.repeats != 20:
+                parser.error("--formal requires exactly 20 repeats (or omit for default 20)")
+
+
+def resolve_output_csv(args: argparse.Namespace) -> str:
+    if args.formal_batch and args.run_dir and args.repeat_id:
+        return os.path.join(args.run_dir, f"cross_host_batch_r{args.repeat_id:02d}.csv")
+    if args.quick:
+        return os.path.join(OUTPUT_DIR, "cross_host_smoke.csv")
+    if args.formal_batch:
+        return os.path.join(OUTPUT_DIR, "cross_host_formal_batch.csv")
+    if args.formal:
+        return os.path.join(OUTPUT_DIR, "cross_host_results.csv")
+    return os.path.join(OUTPUT_DIR, "cross_host_dev.csv")
+
+
+def enforce_startup_output_guards(args: argparse.Namespace, output_csv: str) -> None:
+    """Refuse stale success/tmp artifacts before any CSV is opened."""
+    if args.formal_batch and os.path.exists(output_csv):
+        print(f"[FATAL] formal-batch output already exists: {output_csv}")
+        print("        Formal batch results are immutable; choose a clean run directory.")
+        sys.exit(1)
+    if getattr(args, "no_overwrite", False) and os.path.exists(output_csv):
+        print(f"[FATAL] --no-overwrite: output file already exists: {output_csv}")
+        print("        Remove it first or choose a different output path.")
+        sys.exit(1)
+    tmp_csv = output_csv + ".tmp"
+    if os.path.exists(tmp_csv):
+        print(f"[FATAL] stale tmp file already exists: {tmp_csv}")
+        print("        Preserve or inspect it before starting a new run.")
+        sys.exit(1)
+
+
+def preserve_failed_artifact(tmp_path: str, failed_path: str) -> str:
+    """Move tmp to a failed artifact without ever replacing an existing artifact."""
+    tmp = Path(tmp_path)
+    failed = Path(failed_path)
+    if not tmp.exists():
+        return str(failed)
+    if not failed.exists():
+        tmp.rename(failed)
+        return str(failed)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    conflict = failed.with_name(f"{failed.stem}.conflict-{stamp}-{uuid4().hex[:8]}{failed.suffix}")
+    tmp.rename(conflict)
+    return str(conflict)
+
+
+def publish_tmp_csv(tmp_csv: str, output_csv: str, no_overwrite: bool) -> None:
+    """Publish tmp CSV, using no-overwrite semantics for formal outputs."""
+    if no_overwrite:
+        os.link(tmp_csv, output_csv)
+        os.unlink(tmp_csv)
+    else:
+        os.replace(tmp_csv, output_csv)
 
 
 def make_payload(seq: int, payload_size: int) -> str:
@@ -407,6 +567,16 @@ def run_one_experiment(
                 state_fields["client_final_hash"] == state_fields["server_final_hash"]
             ) and state_fields["client_final_hash"] != ""
 
+    partial_state_auditable = adapter is not None and accepted_count > 0
+    final_state_complete = (
+        run_valid
+        and sent_count == message_count
+        and accepted_count == message_count
+        and unrecovered == 0
+        and sequence_match
+        and state_match
+    )
+
     result = {
         "session_id": session_id,
         "experiment_type": "cross_host",
@@ -439,9 +609,9 @@ def run_one_experiment(
         "server_final_hash": state_fields["server_final_hash"],
         "hash_match": hash_match,
         "state_match": state_match,
-        "state_auditable": adapter is not None,
-        "partial_state_auditable": (state_fields.get("server_final_seq", "") != "" and adapter is not None),
-        "final_state_complete": (adapter is not None and state_match and state_fields.get("server_final_seq", "") != ""),
+        "state_auditable": partial_state_auditable,
+        "partial_state_auditable": partial_state_auditable,
+        "final_state_complete": final_state_complete,
         "run_valid": run_valid,
         "success_rate": round(success_rate, 2),
         "throughput_msg_per_sec": round(throughput, 2),
@@ -716,62 +886,9 @@ class EmbeddedTCPServer:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="GMCP-R cross-host experiment validation framework"
-    )
-    parser.add_argument("--host", default=None, help="Server host to connect to (client mode)")
-    parser.add_argument("--port", type=int, default=9001, help="Server port (default: 9001)")
-    parser.add_argument("--bind-host", default="127.0.0.1", help="Bind address for server mode")
-    parser.add_argument(
-        "--no-spawn-server",
-        action="store_true",
-        help="Do NOT spawn an embedded server; connect to an external server at --host:--port",
-    )
-    parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat only, output to smoke CSV")
-    parser.add_argument("--formal", action="store_true", help="Formal mode: full run with strict guards")
-    parser.add_argument("--formal-batch", action="store_true",
-        help="Formal batch mode: like --formal but skips TTY confirmation prompts for CI/automation")
-    parser.add_argument("--repeat-id", type=int, default=None,
-        help="For --formal-batch: specific repeat_id (1-20) to run")
-    parser.add_argument("--run-dir", type=str, default=None,
-        help="Absolute path for journal and batch output files")
-    parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
-    parser.add_argument("--attempt-number", type=int, default=None, dest="attempt_number_arg",
-        help="Override auto-detected attempt number (default: auto from journal)")
-    parser.add_argument("--no-overwrite", action="store_true",
-        help="Refuse to overwrite existing output CSV; abort if it already exists")
-    parser.add_argument("--allow-mixed-commits", action="store_true",
-        help="Allow client and server to run different git commits (formal mode)")
-    parser.add_argument(
-        "--server-only",
-        action="store_true",
-        help="Run as server only (listen for connections, do not run client experiments)",
-    )
+    parser = build_arg_parser()
     args = parser.parse_args()
-
-    # --- Mutual exclusion: --quick and --formal / --formal-batch ---
-    effective_formal = args.formal or args.formal_batch
-    if args.formal_batch:
-        args.formal = True  # --formal-batch implies --formal
-    if args.quick and effective_formal:
-        print("[ERROR] --quick and --formal/--formal-batch are mutually exclusive.")
-        sys.exit(1)
-
-    # --- Formal mode: force repeats=20 ---
-    if effective_formal:
-        if args.allow_mixed_commits:
-            print("[FORMAL] --allow-mixed-commits: skipping commit consistency check")
-        if args.formal_batch:
-            if args.repeat_id is None:
-                parser.error('--formal-batch requires --repeat-id (1-20)')
-            if not (1 <= args.repeat_id <= 20):
-                parser.error('--repeat-id must be 1-20')
-            if args.run_dir is None:
-                parser.error('--formal-batch requires --run-dir (absolute path)')
-            args.repeats = 1  # single batch, 1 repeat
-        else:
-            if args.repeats is not None and args.repeats != 20:
-                parser.error('--formal requires exactly 20 repeats (or omit for default 20)')
+    normalize_and_validate_args(parser, args)
 
     repeats = 1 if args.quick else (args.repeats or REPEAT_COUNT)
 
@@ -797,6 +914,12 @@ def main():
         srv.stop()
         print("[SERVER-ONLY] Server stopped.")
         sys.exit(0)
+
+    output_csv = resolve_output_csv(args)
+    output_parent = os.path.dirname(output_csv)
+    if output_parent:
+        os.makedirs(output_parent, exist_ok=True)
+    enforce_startup_output_guards(args, output_csv)
 
     # Determine mode
     if args.no_spawn_server:
@@ -839,18 +962,6 @@ def main():
         if client_hid == server_host:
             print("[ERROR] --formal requires client_host_id != server_host.")
             sys.exit(1)
-
-    # Determine output CSV based on mode
-    if args.formal_batch and args.run_dir and args.repeat_id:
-        output_csv = os.path.join(args.run_dir, f"cross_host_batch_r{args.repeat_id:02d}.csv")
-    elif args.quick:
-        output_csv = os.path.join(OUTPUT_DIR, "cross_host_smoke.csv")
-    elif args.formal_batch:
-        output_csv = os.path.join(OUTPUT_DIR, "cross_host_formal_batch.csv")
-    elif args.formal:
-        output_csv = os.path.join(OUTPUT_DIR, "cross_host_results.csv")
-    else:
-        output_csv = os.path.join(OUTPUT_DIR, "cross_host_dev.csv")
 
     # Measure baseline RTT
     print("[INFO] Measuring baseline RTT ...")
@@ -914,34 +1025,33 @@ def main():
         print("[FATAL] Server not reachable at experiment start. Aborting.")
         sys.exit(1)
 
-    # --- No-overwrite guard ---
-    if args.no_overwrite and os.path.exists(output_csv):
-        print(f"[FATAL] --no-overwrite: output file already exists: {output_csv}")
-        print("        Remove it first or choose a different output path.")
-        sys.exit(1)
-
     # --- Journal for crash recovery ---
     journal_path = (os.path.join(args.run_dir, "attempts.jsonl") if args.run_dir else output_csv + ".journal")
     journal_entries = []
 
-    # --- Attempt number: count prior run_start entries in journal ---
-    _attempt_id = 1
-    if os.path.exists(journal_path):
-        try:
-            with open(journal_path, "r", encoding="utf-8") as jf:
-                for line in jf:
-                    try:
-                        entry = json.loads(line)
-                        if entry.get("event") == "run_start":
-                            _attempt_id += 1
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-        except Exception:
-            pass  # fresh start
-
-    # CLI override for attempt number
-    if args.attempt_number_arg is not None:
+    # --- Attempt number ---
+    if args.formal_batch:
         _attempt_id = args.attempt_number_arg
+    else:
+        # Non-formal development modes may continue auto-detecting from journal.
+        _attempt_id = 1
+        if os.path.exists(journal_path):
+            try:
+                with open(journal_path, "r", encoding="utf-8") as jf:
+                    for line in jf:
+                        try:
+                            entry = json.loads(line)
+                            if entry.get("event") == "run_start":
+                                _attempt_id += 1
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+            except Exception:
+                pass  # fresh start
+        if args.attempt_number_arg is not None:
+            _attempt_id = args.attempt_number_arg
+
+    if (args.formal_batch or args.attempt_number_arg is not None) and _attempt_id not in (1, 2, 3):
+        parser.error("--attempt-number must be 1, 2, or 3")
 
     def write_journal(event: str, **extra):
         """Append a timestamped event to the journal file."""
@@ -966,7 +1076,7 @@ def main():
     tmp_csv = output_csv + ".tmp"
     completed = 0
     failed = 0
-    with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
+    with open(tmp_csv, "x", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
@@ -1007,11 +1117,19 @@ def main():
                             completed += 1
                         write_journal(
                             "experiment_result",
+                            matrix_index=idx,
+                            total=total,
                             protocol=protocol,
                             msg_count=msg_count,
                             payload_size=payload_size,
                             repeat_id=repeat_id,
+                            sent_count=result["sent_count"],
                             attempt_number=_attempt_id,
+                            client_git_commit=result.get("git_commit", ""),
+                            server_git_commit=result.get("server_git_commit", ""),
+                            client_host_id=result.get("client_host_id", ""),
+                            server_hostname=result.get("server_hostname", ""),
+                            schema_version=result.get("schema_version", ""),
                             run_valid=result["run_valid"],
                             accepted_count=result["accepted_count"],
                             rejected_count=result["rejected_count"],
@@ -1046,18 +1164,22 @@ def main():
     # Validate tmp file before atomic replace
     # NEVER delete tmp — on failure, rename to .failed.csv for forensics
     print(f"\n[VALIDATE] Checking {tmp_csv} ...")
+    def fail_validation(message: str) -> None:
+        failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+        preserved_csv = preserve_failed_artifact(tmp_csv, failed_csv)
+        print(message)
+        print(f"[VALIDATE] Failed artifact: {preserved_csv}")
+        if os.path.exists(preserved_csv):
+            sha = hashlib.sha256(open(preserved_csv, "rb").read()).hexdigest()
+            print(f"[VALIDATE] SHA-256: {sha}")
+        sys.exit(1)
+
     try:
         with open(tmp_csv, "r", newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         expected_total = len(PROTOCOLS) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * repeats
         if len(rows) != expected_total:
-            failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
-            os.rename(tmp_csv, failed_csv)
-            sha = hashlib.sha256(open(failed_csv, "rb").read()).hexdigest()
-            print(f"[VALIDATE] FAIL: expected {expected_total} rows, got {len(rows)}")
-            print(f"[VALIDATE] Failed artifact: {failed_csv}")
-            print(f"[VALIDATE] SHA-256: {sha}")
-            sys.exit(1)
+            fail_validation(f"[VALIDATE] FAIL: expected {expected_total} rows, got {len(rows)}")
 
         # Count valid vs invalid
         invalid_count = sum(1 for r in rows if r.get("run_valid") not in ("True", "true", True))
@@ -1065,23 +1187,11 @@ def main():
 
         # Fail-closed: any invalid row blocks formal publish
         if invalid_count > 0:
-            failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
-            os.rename(tmp_csv, failed_csv)
-            sha = hashlib.sha256(open(failed_csv, "rb").read()).hexdigest()
-            print(f"[VALIDATE] FAIL: {invalid_count}/{len(rows)} rows have run_valid=False")
-            print(f"[VALIDATE] Failed artifact: {failed_csv}")
-            print(f"[VALIDATE] SHA-256: {sha}")
-            sys.exit(1)
+            fail_validation(f"[VALIDATE] FAIL: {invalid_count}/{len(rows)} rows have run_valid=False")
 
         all_clean = all(r.get("git_dirty") in ("false", "False", False) for r in rows)
         if not all_clean:
-            failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
-            os.rename(tmp_csv, failed_csv)
-            sha = hashlib.sha256(open(failed_csv, "rb").read()).hexdigest()
-            print("[VALIDATE] FAIL: git_dirty is not false for all rows")
-            print(f"[VALIDATE] Failed artifact: {failed_csv}")
-            print(f"[VALIDATE] SHA-256: {sha}")
-            sys.exit(1)
+            fail_validation("[VALIDATE] FAIL: git_dirty is not false for all rows")
         # Formal mode: also check server_git_dirty and cross-host authenticity
         if args.formal:
             for i, r in enumerate(rows):
@@ -1091,63 +1201,36 @@ def main():
                 # server_git_dirty strict check (no empty string allowed)
                 server_dirty = r.get('server_git_dirty', '')
                 if server_dirty not in ('false', 'False', False):
-                    failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
-                    os.rename(tmp_csv, failed_csv)
-                    print(f"[VALIDATE] FAIL row {i+1}: server_git_dirty={server_dirty}")
-                    print(f"[VALIDATE] Failed artifact: {failed_csv}")
-                    sys.exit(1)
+                    fail_validation(f"[VALIDATE] FAIL row {i+1}: server_git_dirty={server_dirty}")
                 # server_git_commit must be 40-char hex
                 serv_commit = r.get('server_git_commit', '')
                 if len(serv_commit) != 40:
-                    failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
-                    os.rename(tmp_csv, failed_csv)
-                    print(f"[VALIDATE] FAIL row {i+1}: server_git_commit length {len(serv_commit)} != 40")
-                    print(f"[VALIDATE] Failed artifact: {failed_csv}")
-                    sys.exit(1)
+                    fail_validation(f"[VALIDATE] FAIL row {i+1}: server_git_commit length {len(serv_commit)} != 40")
                 # Real cross-host: server_hostname must differ from client_host_id
                 if r.get('server_hostname') == r.get('client_host_id'):
-                    failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
-                    os.rename(tmp_csv, failed_csv)
-                    print(f"[VALIDATE] FAIL row {i+1}: client and server on same host")
-                    print(f"[VALIDATE] Failed artifact: {failed_csv}")
-                    sys.exit(1)
+                    fail_validation(f"[VALIDATE] FAIL row {i+1}: client and server on same host")
                 # Real cross-host: no loopback in formal data
                 if r.get('network_path_type') == 'loopback':
-                    failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
-                    os.rename(tmp_csv, failed_csv)
-                    print(f"[VALIDATE] FAIL row {i+1}: formal data cannot use loopback")
-                    print(f"[VALIDATE] Failed artifact: {failed_csv}")
-                    sys.exit(1)
+                    fail_validation(f"[VALIDATE] FAIL row {i+1}: formal data cannot use loopback")
                 # Commit consistency
                 client_commit = r.get('git_commit', '')
                 server_commit = r.get('server_git_commit', '')
                 if not args.allow_mixed_commits and client_commit != server_commit:
-                    failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
-                    os.rename(tmp_csv, failed_csv)
-                    print(f"[VALIDATE] FAIL row {i+1}: client commit {client_commit[:8]} != server commit {server_commit[:8]}")
-                    print(f"[VALIDATE] Failed artifact: {failed_csv}")
-                    sys.exit(1)
+                    fail_validation(f"[VALIDATE] FAIL row {i+1}: client commit {client_commit[:8]} != server commit {server_commit[:8]}")
             client_dirty = any(
                 r.get("git_dirty") not in ("false", "False", False)
                 for r in rows
             )
             if client_dirty:
-                failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
-                os.rename(tmp_csv, failed_csv)
-                print("[VALIDATE] FAIL: client git_dirty is not false for all rows")
-                print(f"[VALIDATE] Failed artifact: {failed_csv}")
-                sys.exit(1)
+                fail_validation("[VALIDATE] FAIL: client git_dirty is not false for all rows")
         print(f"[VALIDATE] OK: {len(rows)} rows ({valid_count} valid, {invalid_count} failed), git_dirty=false")
     except Exception as e:
-        print(f"[VALIDATE] FAIL: {e}")
         if os.path.exists(tmp_csv):
-            failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
-            os.rename(tmp_csv, failed_csv)
-            print(f"[VALIDATE] Failed artifact: {failed_csv}")
+            fail_validation(f"[VALIDATE] FAIL: {e}")
+        print(f"[VALIDATE] FAIL: {e}")
         sys.exit(1)
 
-    # Atomic replace
-    os.replace(tmp_csv, output_csv)
+    publish_tmp_csv(tmp_csv, output_csv, no_overwrite=args.formal_batch or args.no_overwrite)
     print(f"\n[DONE] Results atomically written to {output_csv}")
     print(f"[DONE] {completed} experiments completed, {failed} failed.")
     if failed > 0:

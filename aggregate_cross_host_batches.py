@@ -34,6 +34,9 @@ the final cross_host_results.csv via atomic publish.
   V26  client commit == server commit across all rows
   V27  Consistent client/server identity across batches
   V28  Each configuration appears exactly 20 times
+  V29  schema_version == 2
+  V32  final_state_complete == True
+  V33  Successful rows have empty failure_type and failure_reason
 
 Usage:
     python3 aggregate_cross_host_batches.py \\
@@ -134,6 +137,10 @@ def validate_batch(rows: list[dict], repeat_id: int, batch_path: Path) -> list[s
         if r.get("failure_reason", "").strip():
             errors.append(f"{ctx}: failure_reason={r.get('failure_reason')}")
 
+        # V33: successful formal rows must not carry a failure_type
+        if r.get("failure_type", "").strip():
+            errors.append(f"{ctx}: failure_type={r.get('failure_type')}")
+
         # V22: network_path_type != loopback
         if r.get("network_path_type", "").lower() == "loopback":
             errors.append(f"{ctx}: network_path_type=loopback")
@@ -156,6 +163,10 @@ def validate_batch(rows: list[dict], repeat_id: int, batch_path: Path) -> list[s
         sv = r.get("schema_version", "")
         if sv != "2":
             errors.append(f"{ctx}: schema_version={sv!r}, expected '2'")
+
+        # V32: final state must be complete for publishable formal data
+        if r.get("final_state_complete") not in ("True", "true", True):
+            errors.append(f"{ctx}: final_state_complete={r.get('final_state_complete')}")
 
     # --- Per-batch aggregated checks ---
 
@@ -296,6 +307,16 @@ def main():
 
     batch_dir = Path(args.batch_dir)
     output_path = Path(args.output)
+    tmp_path = Path(str(output_path) + ".tmp")
+
+    if output_path.exists():
+        print(f"[AGGREGATE] FAIL: output already exists: {output_path}")
+        print("  Formal aggregate results are immutable; choose a clean output path.")
+        sys.exit(1)
+    if tmp_path.exists():
+        print(f"[AGGREGATE] FAIL: tmp output already exists: {tmp_path}")
+        print("  Preserve or inspect it before starting aggregation.")
+        sys.exit(1)
 
     errors, all_rows, _ = validate_all(batch_dir)
 
@@ -316,19 +337,19 @@ def main():
             sys.exit(1)
 
     # Atomic publish
-    tmp_path = str(output_path) + ".tmp"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fieldnames = list(all_rows[0].keys())
 
-    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+    with tmp_path.open("x", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_rows)
         f.flush()
         os.fsync(f.fileno())
 
-    os.replace(tmp_path, str(output_path))
+    os.link(tmp_path, output_path)
+    tmp_path.unlink()
 
     sha = hashlib.sha256(open(str(output_path), "rb").read()).hexdigest()
     commits = set(r.get("git_commit", "") for r in all_rows)
