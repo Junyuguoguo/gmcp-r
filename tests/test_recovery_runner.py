@@ -9,11 +9,15 @@
 
 import csv
 import inspect
+import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
+import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +25,9 @@ from unittest.mock import MagicMock, patch
 _project_root = str(Path(__file__).resolve().parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
+
+from gmcp.config import CLIENT_ID, DATA_AUTH_KEY, EPOCH
+from gmcp.crypto_utils import verify_tagged_hmac, with_hmac
 
 import run_recovery_validation as runner
 
@@ -30,6 +37,15 @@ import run_recovery_validation as runner
 
 _FULL_SHA = "a" * 40
 
+_SERVER_ENV = {
+    "server_git_commit": _FULL_SHA,
+    "server_python_version": "test-python",
+    "server_os_info": "test-os",
+    "server_hostname": "loopback-server",
+    "server_git_dirty": "false",
+    "server_cpu_model": "test-cpu",
+}
+
 
 def _make_tmp_dir():
     """Create a temporary directory outside any git repo."""
@@ -37,11 +53,75 @@ def _make_tmp_dir():
     return d
 
 
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _clean_git_meta():
+    return {
+        "git_commit": _FULL_SHA,
+        "git_branch": "test",
+        "git_dirty": "false",
+    }
+
+
+@contextmanager
+def _running_loopback_server():
+    port = _free_port()
+    server = runner.EmbeddedTCPServer("127.0.0.1", port)
+    with patch.object(runner, "get_server_env_info", return_value=dict(_SERVER_ENV)):
+        server.start()
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not runner.ping_server("127.0.0.1", port):
+            time.sleep(0.01)
+        try:
+            yield server, port
+        finally:
+            server.stop()
+
+
+def _assert_port_released(testcase, port):
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.05):
+                time.sleep(0.01)
+        except OSError:
+            return
+    testcase.fail(f"port {port} still accepts connections after server.stop()")
+
+
+def _run_real_experiment(protocol, disconnect_type, message_count=6, disconnect_point=3):
+    with _running_loopback_server() as (_, port):
+        with patch.object(runner, "RECONNECT_DELAY_MS", 0):
+            result = runner.run_one_recovery_experiment(
+                protocol=protocol,
+                message_count=message_count,
+                payload_size=32,
+                disconnect_point=disconnect_point,
+                disconnect_type=disconnect_type,
+                repeat_id=1,
+                server_host="127.0.0.1",
+                server_port=port,
+                git_meta=_clean_git_meta(),
+            )
+    _assert_port_released(unittest.TestCase(), port)
+    return result
+
+
 def _fake_result(protocol="gmcp_r", disconnect_point=50,
                  disconnect_type="client_close", repeat_id=1):
     """Return a fake recovery experiment result for testing."""
+    session_id = f"s-{protocol}-d{disconnect_point}-{disconnect_type}-{repeat_id}"
     return {
-        "session_id": f"s-{protocol}-d{disconnect_point}-{repeat_id}",
+        "session_id": session_id,
+        "reconnect_session_id": session_id,
+        "same_session_resume": True,
+        "server_resume_seq": disconnect_point,
+        "resume_state_match": True,
+        "resumed_from_existing_state": True,
         "experiment_type": "recovery_validation",
         "protocol": protocol,
         "message_count": 500,
@@ -59,6 +139,12 @@ def _fake_result(protocol="gmcp_r", disconnect_point=50,
         "total_timeout": 0,
         "duplicate_count": 0,
         "unrecovered_count": 0,
+        "server_total_received": 500,
+        "server_unique_accepted": 500,
+        "server_duplicate_count": 0,
+        "server_rejected_count": 0,
+        "missing_seq_count": 0,
+        "client_server_count_match": True,
         "reconnect_success": True,
         "reconnect_latency_ms": 5.0,
         "final_state_match": True,
@@ -67,6 +153,13 @@ def _fake_result(protocol="gmcp_r", disconnect_point=50,
         "final_server_seq": 500,
         "memory_match": True if protocol == "gmcp_r" else "",
         "hash_match": True if protocol == "authenticated_hash_chain" else "",
+        "disconnect_armed": True,
+        "disconnect_triggered": True,
+        "disconnect_initiator": "server" if disconnect_type == "server_close" else "client",
+        "disconnect_observed": True,
+        "disconnect_observed_seq": disconnect_point,
+        "disconnect_boundary": "after_ack",
+        "post_reconnect_first_seq": disconnect_point + 1,
         "execution_valid": True,
         "result_success": True,
         "run_valid": True,
@@ -86,6 +179,28 @@ def _fake_result(protocol="gmcp_r", disconnect_point=50,
         "timestamp": "2026-01-01T00:00:00+00:00",
         "elapsed_seconds": 1.0,
     }
+
+
+def _fake_matrix_result(**kwargs):
+    result = _fake_result(
+        protocol=kwargs["protocol"],
+        disconnect_point=kwargs["disconnect_point"],
+        disconnect_type=kwargs["disconnect_type"],
+        repeat_id=kwargs["repeat_id"],
+    )
+    result["message_count"] = kwargs["message_count"]
+    result["payload_size"] = kwargs["payload_size"]
+    result["pre_disconnect_sent"] = kwargs["disconnect_point"]
+    result["pre_disconnect_accepted"] = kwargs["disconnect_point"]
+    result["post_disconnect_sent"] = kwargs["message_count"] - kwargs["disconnect_point"]
+    result["post_disconnect_accepted"] = kwargs["message_count"] - kwargs["disconnect_point"]
+    result["total_sent"] = kwargs["message_count"]
+    result["total_accepted"] = kwargs["message_count"]
+    result["server_total_received"] = kwargs["message_count"]
+    result["server_unique_accepted"] = kwargs["message_count"]
+    result["final_client_seq"] = kwargs["message_count"]
+    result["final_server_seq"] = kwargs["message_count"]
+    return result
 
 
 # ===========================================================================
@@ -504,6 +619,336 @@ class TestValidateRunDirRejectsGit(unittest.TestCase):
             mock_parser = MagicMock()
             result = runner.validate_run_dir(mock_parser, run_dir)
             self.assertEqual(str(result), run_dir)
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+
+class TestRealLoopbackSessionResume(unittest.TestCase):
+    """Core recovery semantics are verified over real loopback TCP sockets."""
+
+    def assert_same_session_resume(self, result, protocol, disconnect_type):
+        self.assertTrue(result["run_valid"], result.get("failure_reason"))
+        self.assertEqual(result["reconnect_session_id"], result["session_id"])
+        self.assertTrue(result["same_session_resume"])
+        self.assertEqual(result["server_resume_seq"], 3)
+        self.assertTrue(result["resume_state_match"])
+        self.assertTrue(result["resumed_from_existing_state"])
+        self.assertEqual(result["post_reconnect_first_seq"], 4)
+        self.assertEqual(result["server_unique_accepted"], 6)
+        self.assertEqual(result["server_duplicate_count"], 0)
+        self.assertEqual(result["missing_seq_count"], 0)
+        self.assertTrue(result["client_server_count_match"])
+        self.assertEqual(result["disconnect_initiator"],
+                         "server" if disconnect_type == "server_close" else "client")
+        if protocol == "gmcp_r":
+            self.assertTrue(result["memory_match"])
+        if protocol == "authenticated_hash_chain":
+            self.assertTrue(result["hash_match"])
+
+    def test_gmcp_client_close_resumes_same_session(self):
+        self.assert_same_session_resume(
+            _run_real_experiment("gmcp_r", "client_close"),
+            "gmcp_r", "client_close",
+        )
+
+    def test_seq_mac_client_close_resumes_same_session(self):
+        self.assert_same_session_resume(
+            _run_real_experiment("seq_mac", "client_close"),
+            "seq_mac", "client_close",
+        )
+
+    def test_ahc_client_close_resumes_same_session(self):
+        self.assert_same_session_resume(
+            _run_real_experiment("authenticated_hash_chain", "client_close"),
+            "authenticated_hash_chain", "client_close",
+        )
+
+    def test_gmcp_server_close_is_server_triggered_after_ack(self):
+        result = _run_real_experiment("gmcp_r", "server_close")
+        self.assert_same_session_resume(result, "gmcp_r", "server_close")
+        self.assertTrue(result["disconnect_armed"])
+        self.assertTrue(result["disconnect_triggered"])
+        self.assertTrue(result["disconnect_observed"])
+        self.assertEqual(result["disconnect_observed_seq"], 3)
+        self.assertEqual(result["disconnect_boundary"], "after_ack")
+
+    def test_seq_mac_server_close_is_server_triggered_after_ack(self):
+        result = _run_real_experiment("seq_mac", "server_close")
+        self.assert_same_session_resume(result, "seq_mac", "server_close")
+        self.assertEqual(result["disconnect_initiator"], "server")
+        self.assertTrue(result["disconnect_observed"])
+
+    def test_ahc_server_close_is_server_triggered_after_ack(self):
+        result = _run_real_experiment("authenticated_hash_chain", "server_close")
+        self.assert_same_session_resume(result, "authenticated_hash_chain", "server_close")
+        self.assertEqual(result["disconnect_initiator"], "server")
+        self.assertTrue(result["disconnect_observed"])
+
+
+class TestAuthenticatedServerCounts(unittest.TestCase):
+    def _open_session(self, protocol="seq_mac"):
+        context = _running_loopback_server()
+        server, port = context.__enter__()
+        sock, file_obj = runner.open_tcp("127.0.0.1", port)
+        session_id = f"count-{protocol}-{time.time_ns()}"
+        runner.send_hello(sock, file_obj, protocol, session_id, CLIENT_ID, EPOCH)
+        adapter = runner.ProtocolAdapter(protocol, session_id, CLIENT_ID, EPOCH)
+        return context, port, sock, file_obj, session_id, adapter
+
+    def test_duplicate_seq_increments_server_duplicate_count_once(self):
+        context, port, sock, file_obj, session_id, adapter = self._open_session()
+        try:
+            packet = adapter.build_packet(1, "payload")
+            runner.send_json_line(sock, packet)
+            accepted = runner.recv_json_line(file_obj)
+            self.assertTrue(accepted["ok"])
+            adapter.update_after_accept(packet, accepted)
+
+            runner.send_json_line(sock, packet)
+            duplicate = runner.recv_json_line(file_obj)
+            self.assertFalse(duplicate["ok"])
+
+            final = runner.request_final_state(sock, file_obj, session_id, 1)
+            self.assertEqual(final["server_total_received"], 2)
+            self.assertEqual(final["server_unique_accepted"], 1)
+            self.assertEqual(final["server_duplicate_count"], 1)
+            self.assertEqual(final["server_rejected_count"], 1)
+            self.assertEqual(final["missing_seq_count"], 0)
+            self.assertTrue(verify_tagged_hmac(DATA_AUTH_KEY, final))
+        finally:
+            runner.close_tcp(sock, file_obj)
+            context.__exit__(None, None, None)
+            _assert_port_released(self, port)
+
+    def test_missing_seq_count_comes_from_server_final_state(self):
+        context, port, sock, file_obj, session_id, adapter = self._open_session()
+        try:
+            packet = adapter.build_packet(1, "payload")
+            runner.send_json_line(sock, packet)
+            accepted = runner.recv_json_line(file_obj)
+            self.assertTrue(accepted["ok"])
+            adapter.update_after_accept(packet, accepted)
+
+            final = runner.request_final_state(sock, file_obj, session_id, 2)
+            self.assertEqual(final["server_unique_accepted"], 1)
+            self.assertEqual(final["missing_seq_count"], 1)
+        finally:
+            runner.close_tcp(sock, file_obj)
+            context.__exit__(None, None, None)
+            _assert_port_released(self, port)
+
+
+class TestRecoveryModeLocking(unittest.TestCase):
+    def test_quick_and_formal_are_mutually_exclusive(self):
+        parser = runner.build_arg_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--quick", "--formal"])
+
+    def test_formal_overrides_are_rejected_before_server_start(self):
+        overrides = [
+            ["--protocols", "gmcp_r"],
+            ["--disconnect-points", "50"],
+            ["--disconnect-types", "client_close"],
+            ["--repeats", "1"],
+            ["--message-count", "499"],
+            ["--payload-size", "127"],
+        ]
+        for extra in overrides:
+            with self.subTest(extra=extra):
+                run_dir = _make_tmp_dir()
+                try:
+                    argv = ["run_recovery_validation.py", "--formal", "--run-dir", run_dir, *extra]
+                    with patch.object(sys, "argv", argv), \
+                            patch.object(runner, "get_git_metadata", return_value=_clean_git_meta()), \
+                            patch.object(runner.EmbeddedTCPServer, "start",
+                                         side_effect=AssertionError("server must not start")) as start_mock:
+                        with self.assertRaises(SystemExit):
+                            runner.main()
+                        start_mock.assert_not_called()
+                finally:
+                    shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_quick_message_shape_overrides_are_rejected_before_server_start(self):
+        for extra in (["--message-count", "499"], ["--payload-size", "127"]):
+            with self.subTest(extra=extra):
+                run_dir = _make_tmp_dir()
+                try:
+                    argv = ["run_recovery_validation.py", "--quick", "--run-dir", run_dir, *extra]
+                    with patch.object(sys, "argv", argv), \
+                            patch.object(runner, "get_git_metadata", return_value=_clean_git_meta()), \
+                            patch.object(runner.EmbeddedTCPServer, "start",
+                                         side_effect=AssertionError("server must not start")) as start_mock:
+                        with self.assertRaises(SystemExit):
+                            runner.main()
+                        start_mock.assert_not_called()
+                finally:
+                    shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_existing_quick_output_is_rejected_without_no_overwrite(self):
+        run_dir = _make_tmp_dir()
+        try:
+            output = os.path.join(run_dir, "recovery_smoke.csv")
+            with open(output, "w", encoding="utf-8") as f:
+                f.write("existing\n")
+            argv = ["run_recovery_validation.py", "--quick", "--run-dir", run_dir]
+            with patch.object(sys, "argv", argv), \
+                    patch.object(runner.EmbeddedTCPServer, "start",
+                                 side_effect=AssertionError("server must not start")) as start_mock:
+                with self.assertRaises(SystemExit):
+                    runner.main()
+                start_mock.assert_not_called()
+            with open(output, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "existing\n")
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_existing_formal_output_is_rejected_without_no_overwrite(self):
+        run_dir = _make_tmp_dir()
+        try:
+            output = os.path.join(run_dir, "recovery_validation_results.csv")
+            with open(output, "w", encoding="utf-8") as f:
+                f.write("existing formal\n")
+            argv = ["run_recovery_validation.py", "--formal", "--run-dir", run_dir]
+            with patch.object(sys, "argv", argv), \
+                    patch.object(runner.EmbeddedTCPServer, "start",
+                                 side_effect=AssertionError("server must not start")) as start_mock:
+                with self.assertRaises(SystemExit):
+                    runner.main()
+                start_mock.assert_not_called()
+            with open(output, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "existing formal\n")
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_existing_tmp_is_rejected_without_truncation(self):
+        run_dir = _make_tmp_dir()
+        try:
+            tmp_output = os.path.join(run_dir, "recovery_smoke.csv.tmp")
+            with open(tmp_output, "w", encoding="utf-8") as f:
+                f.write("old tmp evidence\n")
+            argv = ["run_recovery_validation.py", "--quick", "--run-dir", run_dir]
+            with patch.object(sys, "argv", argv), \
+                    patch.object(runner.EmbeddedTCPServer, "start",
+                                 side_effect=AssertionError("server must not start")) as start_mock:
+                with self.assertRaises(SystemExit):
+                    runner.main()
+                start_mock.assert_not_called()
+            with open(tmp_output, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "old tmp evidence\n")
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+
+class TestRecoveryProvenanceStrict(unittest.TestCase):
+    def test_non_hex_forty_character_commit_is_rejected(self):
+        self.assertFalse(
+            runner.provenance_is_valid("g" * 40, "g" * 40, "false", "false")
+        )
+
+    def test_matching_clean_forty_character_hex_commits_are_valid(self):
+        self.assertTrue(
+            runner.provenance_is_valid(_FULL_SHA, _FULL_SHA, "false", "false")
+        )
+
+
+class TestRecoveryPublishGate(unittest.TestCase):
+    def _run_invalid_quick(self, mutate):
+        run_dir = _make_tmp_dir()
+
+        def fake_run(**kwargs):
+            result = _fake_matrix_result(**kwargs)
+            mutate(result)
+            return result
+
+        argv = ["run_recovery_validation.py", "--quick", "--run-dir", run_dir]
+        patches = (
+            patch.object(sys, "argv", argv),
+            patch.object(runner, "get_git_metadata", return_value=_clean_git_meta()),
+            patch.object(runner, "run_one_recovery_experiment", side_effect=fake_run),
+            patch.object(runner.EmbeddedTCPServer, "start"),
+            patch.object(runner.EmbeddedTCPServer, "stop"),
+        )
+        try:
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                with self.assertRaises(SystemExit) as ctx:
+                    runner.main()
+                self.assertNotEqual(ctx.exception.code, 0)
+            self.assertFalse(os.path.exists(os.path.join(run_dir, "recovery_smoke.csv")))
+            self.assertTrue(list(Path(run_dir).glob("*.failed.csv")))
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_run_valid_false_blocks_final_csv_publish(self):
+        def mutate(result):
+            if result["protocol"] == "gmcp_r" and result["disconnect_point"] == 50:
+                result["run_valid"] = False
+                result["failure_type"] = "validation_error"
+                result["failure_reason"] = "forced invalid row"
+
+        self._run_invalid_quick(mutate)
+
+    def test_server_commit_mismatch_blocks_publish(self):
+        self._run_invalid_quick(
+            lambda result: result.__setitem__("server_git_commit", "b" * 40)
+        )
+
+    def test_server_dirty_blocks_publish(self):
+        self._run_invalid_quick(
+            lambda result: result.__setitem__("server_git_dirty", "true")
+        )
+
+
+class TestRecoveryCleanupAndEndToEnd(unittest.TestCase):
+    def test_exception_stops_server_releases_port_and_preserves_evidence(self):
+        run_dir = _make_tmp_dir()
+        port = _free_port()
+        argv = [
+            "run_recovery_validation.py", "--quick", "--run-dir", run_dir,
+            "--port", str(port), "--message-count", "6",
+        ]
+        try:
+            with patch.object(sys, "argv", argv), \
+                    patch.object(runner, "DISCONNECT_POINTS", [2, 4]), \
+                    patch.object(runner, "FIXED_MESSAGE_COUNT", 6), \
+                    patch.object(runner, "get_git_metadata", return_value=_clean_git_meta()), \
+                    patch.object(runner, "get_server_env_info", return_value=dict(_SERVER_ENV)), \
+                    patch.object(runner, "run_one_recovery_experiment",
+                                 side_effect=RuntimeError("forced runner failure")):
+                with self.assertRaises(SystemExit) as ctx:
+                    runner.main()
+                self.assertNotEqual(ctx.exception.code, 0)
+            _assert_port_released(self, port)
+            self.assertFalse(os.path.exists(os.path.join(run_dir, "recovery_smoke.csv")))
+            self.assertTrue(list(Path(run_dir).glob("*.failed.csv")))
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_quick_real_loopback_produces_twelve_valid_unique_rows(self):
+        run_dir = _make_tmp_dir()
+        port = _free_port()
+        argv = [
+            "run_recovery_validation.py", "--quick", "--run-dir", run_dir,
+            "--port", str(port), "--message-count", "6", "--payload-size", "32",
+        ]
+        try:
+            with patch.object(sys, "argv", argv), \
+                    patch.object(runner, "DISCONNECT_POINTS", [2, 4]), \
+                    patch.object(runner, "FIXED_MESSAGE_COUNT", 6), \
+                    patch.object(runner, "FIXED_PAYLOAD_SIZE", 32), \
+                    patch.object(runner, "RECONNECT_DELAY_MS", 0), \
+                    patch.object(runner, "get_git_metadata", return_value=_clean_git_meta()), \
+                    patch.object(runner, "get_server_env_info", return_value=dict(_SERVER_ENV)):
+                runner.main()
+
+            output = os.path.join(run_dir, "recovery_smoke.csv")
+            self.assertTrue(os.path.exists(output))
+            with open(output, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 12)
+            self.assertEqual(len({row["session_id"] for row in rows}), 12)
+            self.assertTrue(all(row["run_valid"] == "True" for row in rows))
+            self.assertTrue(all(row["same_session_resume"] == "True" for row in rows))
+            _assert_port_released(self, port)
         finally:
             shutil.rmtree(run_dir, ignore_errors=True)
 
