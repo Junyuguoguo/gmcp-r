@@ -76,10 +76,11 @@ from gmcp.experiment_transport import (
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-OUTPUT_DIR = "results/netem_validation"
-FORMAL_CSV = os.path.join(OUTPUT_DIR, "netem_validation_results.csv")
-SMOKE_CSV = os.path.join(OUTPUT_DIR, "netem_smoke.csv")
-DEV_CSV = os.path.join(OUTPUT_DIR, "netem_dev.csv")
+# OUTPUT_DIR is set dynamically from --run-dir argument
+OUTPUT_DIR: str = ""
+FORMAL_CSV: str = ""
+SMOKE_CSV: str = ""
+DEV_CSV: str = ""
 
 PROTOCOLS = ["gmcp_r", "seq_mac", "authenticated_hash_chain"]
 REPEAT_COUNT = 10
@@ -135,7 +136,13 @@ def is_linux() -> bool:
     return sys.platform.startswith("linux")
 
 
-def ensure_output_dir():
+def ensure_output_dir(run_dir: str) -> None:
+    """Set OUTPUT_DIR and derived paths from run_dir (must be absolute)."""
+    global OUTPUT_DIR, FORMAL_CSV, SMOKE_CSV, DEV_CSV
+    OUTPUT_DIR = run_dir
+    FORMAL_CSV = os.path.join(OUTPUT_DIR, "netem_validation_results.csv")
+    SMOKE_CSV = os.path.join(OUTPUT_DIR, "netem_smoke.csv")
+    DEV_CSV = os.path.join(OUTPUT_DIR, "netem_dev.csv")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
@@ -830,10 +837,22 @@ def main():
     parser.add_argument("--no-spawn-server", action="store_true",
         help="Do NOT spawn embedded server; connect to --host:--port directly")
     parser.add_argument("--conditions", default=None, help="Comma-separated condition names to run")
+    parser.add_argument("--run-dir", required=True,
+        help="Absolute path for output directory (must not be inside a git repo)")
     args = parser.parse_args()
 
     if args.quick and args.formal:
         parser.error("--quick and --formal are mutually exclusive")
+
+    # ---- Validate --run-dir ----
+    if not os.path.isabs(args.run_dir):
+        parser.error(f"--run-dir must be an absolute path, got: {args.run_dir}")
+    # Reject if inside a git repo (protect repo cleanliness)
+    check_path = os.path.abspath(args.run_dir)
+    while check_path and check_path != "/":
+        if os.path.isdir(os.path.join(check_path, ".git")):
+            parser.error(f"--run-dir must NOT be inside a git repository ({check_path}/.git)")
+        check_path = os.path.dirname(check_path)
 
     repeats = 1 if args.quick else (args.repeats or REPEAT_COUNT)
 
@@ -898,7 +917,7 @@ def main():
         time.sleep(0.3)
 
 
-    ensure_output_dir()
+    ensure_output_dir(args.run_dir)
 
     fieldnames = [
         "session_id", "experiment_type", "protocol",
@@ -931,7 +950,7 @@ def main():
     total = len(PROTOCOLS) * len(conditions) * repeats
 
     # Collect metadata once (client-side)
-    git_commit = get_git_commit()
+    git_commit = _transport_get_git_commit()
     git_dirty = _transport_get_git_dirty()  # fail-closed: returns True on error
     python_version = get_python_version()
     os_info = get_os_info()
@@ -942,6 +961,10 @@ def main():
     if args.formal and git_dirty:
         print("[ERROR] Formal mode requires a clean client worktree. Commit or stash changes first.")
         sys.exit(1)
+    # Formal mode requires full 40-char commit
+    if args.formal and (not git_commit or len(git_commit) != 40):
+        print(f"[ERROR] Formal mode requires full 40-char git commit, got length={len(git_commit)}")
+        sys.exit(1)
     server_env_from_ack: Dict[str, str] = {}  # populated from first HELLO_ACK in remote mode
 
     print(f"[INFO] Total experiments: {total}")
@@ -950,14 +973,39 @@ def main():
     print(f"[INFO] Repeats: {repeats}")
     print(f"[INFO] Interface: {interface}")
     output_csv = SMOKE_CSV if args.quick else (FORMAL_CSV if args.formal else DEV_CSV)
+    # Guard: refuse to overwrite existing final CSV
+    if os.path.exists(output_csv):
+        print(f"[ERROR] Final CSV already exists: {output_csv}")
+        print(f"        Move or remove it before re-running.")
+        clear_tc_netem(interface)
+        if srv:
+            srv.stop()
+        sys.exit(1)
     print(f"[INFO] Output: {output_csv}")
     print()
 
     # ---- Atomic publish: write to tmp first ----
     tmp_csv = output_csv + ".tmp"
+    # Guard: refuse if tmp already exists (previous crash left residue)
+    if os.path.exists(tmp_csv):
+        print(f"[ERROR] Stale tmp file exists: {tmp_csv}")
+        print(f"        Remove it before re-running (previous run may have crashed).")
+        clear_tc_netem(interface)
+        if srv:
+            srv.stop()
+        sys.exit(1)
     completed = 0
     any_execution_failure = False
-    with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
+    # Exclusive creation: fail if file already exists (race-safe)
+    try:
+        f = open(tmp_csv, "x", newline="", encoding="utf-8")
+    except FileExistsError:
+        print(f"[ERROR] Cannot create tmp file (exists): {tmp_csv}")
+        clear_tc_netem(interface)
+        if srv:
+            srv.stop()
+        sys.exit(1)
+    try:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for cond_name, cond_desc, loss, delay, jitter, reorder in conditions:
@@ -1074,6 +1122,14 @@ def main():
                             f"rtt={result['avg_rtt_ms']:.1f}ms "
                             f"exec={'OK' if exec_valid else 'FAIL'}"
                         )
+    except BaseException:
+        # On any exception during writing, clean up tc and close file
+        f.close()
+        clear_tc_netem(interface)
+        if srv:
+            srv.stop()
+        raise
+    f.close()
 
     # ---- Validate matrix completeness ----
     expected_rows = len(PROTOCOLS) * len(conditions) * repeats
@@ -1122,6 +1178,9 @@ def main():
                 actual_qdisc = row.get("actual_qdisc_config", "")
                 if "netem" in actual_qdisc:
                     issues.append(f"row {i}: control condition has netem in actual_qdisc_config")
+            # Formal mode: client and server commits must match
+            if args.formal and gc and cgc and gc != cgc:
+                issues.append(f"row {i}: commit mismatch client={cgc[:12]}... server={gc[:12]}...")
 
     all_critical = issues + sane_issues + exec_issues + tc_issues
     if all_critical:
