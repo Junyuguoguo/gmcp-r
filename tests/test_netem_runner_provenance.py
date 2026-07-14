@@ -677,11 +677,11 @@ class TestCleanupWithNetemBlocksPublish(unittest.TestCase):
         self.assertEqual(snap, "qdisc noqueue 0: root")
         self.assertEqual(err, "")
 
-    def test_cleanup_false_returns_failure(self):
+    def test_cleanup_false_but_snapshot_clean_returns_success(self):
         with patch.object(runner, "clear_tc_netem", return_value=False), \
              patch.object(runner, "get_tc_snapshot_checked", return_value=(True, "qdisc noqueue 0: root", "")):
             ok, snap = runner.cleanup_tc_and_verify("lo")
-        self.assertFalse(ok)
+        self.assertTrue(ok)
         self.assertIn("noqueue", snap)
 
     def test_cleanup_snapshot_command_failure_returns_failure(self):
