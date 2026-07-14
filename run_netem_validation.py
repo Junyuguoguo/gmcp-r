@@ -20,12 +20,13 @@ tc/netem 弱网实验验证框架
   - 使用 trap 确保实验结束后清理 tc 规则（通过 context manager）
   - 6 个代表性条件覆盖从正常到极端恶劣的网络场景
   - 本机模式强制 --interface lo，跨主机模式校验 ip route
-  - 原子发布：tmp → 矩阵验证 → tc快照 → execution_valid → os.replace()
+  - 原子发布：tmp → 矩阵验证 → tc清理验证 → no-clobber link publish
 """
 
 import csv
 import json
 import os
+import re as _re
 import socket
 import subprocess
 import sys
@@ -107,6 +108,9 @@ NETEM_CONDITIONS: List[Tuple[str, str, int, int, int, int]] = [
 # Helpers
 # ---------------------------------------------------------------------------
 
+FULL_HEX_COMMIT_RE = _re.compile(r"^[0-9a-fA-F]{40}$")
+
+
 def check_sudo_available() -> bool:
     """Check if we have passwordless sudo access."""
     try:
@@ -144,6 +148,61 @@ def ensure_output_dir(run_dir: str) -> None:
     SMOKE_CSV = os.path.join(OUTPUT_DIR, "netem_smoke.csv")
     DEV_CSV = os.path.join(OUTPUT_DIR, "netem_dev.csv")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def is_full_hex_commit(commit: str) -> bool:
+    """Return True only for a full 40-character hexadecimal Git commit."""
+    return bool(FULL_HEX_COMMIT_RE.fullmatch(commit or ""))
+
+
+def validate_run_dir(parser: Any, run_dir: str) -> None:
+    """Validate --run-dir is absolute and outside any Git repository/worktree."""
+    if not os.path.isabs(run_dir):
+        parser.error(f"--run-dir must be an absolute path, got: {run_dir}")
+
+    abs_run_dir = os.path.abspath(run_dir)
+    check_path = abs_run_dir
+    while check_path and check_path != "/":
+        git_marker = os.path.join(check_path, ".git")
+        if os.path.exists(git_marker):
+            parser.error(f"--run-dir must NOT be inside a git repository ({git_marker})")
+        check_path = os.path.dirname(check_path)
+
+    probe_path = abs_run_dir
+    while not os.path.exists(probe_path):
+        parent = os.path.dirname(probe_path)
+        if parent == probe_path:
+            break
+        probe_path = parent
+    try:
+        result = subprocess.run(
+            ["git", "-C", probe_path, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return
+    if result.returncode == 0:
+        top = result.stdout.strip()
+        parser.error(f"--run-dir must NOT be inside a git repository ({top})")
+
+
+def publish_tmp_no_clobber(tmp_path: str, final_path: str) -> None:
+    """Atomically publish tmp to final without overwriting an existing final file."""
+    os.link(tmp_path, final_path)
+    os.unlink(tmp_path)
+
+
+def cleanup_tc_and_verify(interface: str) -> Tuple[bool, str]:
+    """Clear tc rules and verify the final qdisc snapshot has no netem residue."""
+    try:
+        clear_ok = clear_tc_netem(interface)
+    except BaseException:
+        clear_ok = False
+    try:
+        snapshot = get_tc_snapshot(interface)
+    except BaseException as exc:
+        snapshot = f"<tc snapshot failed: {exc}>"
+    return bool(clear_ok) and "netem" not in snapshot, snapshot
 
 
 def make_payload(seq: int, payload_size: int) -> str:
@@ -193,7 +252,6 @@ def close_tcp(sock, file_obj):
 
 # ---------------------------------------------------------------------------
 # tc/netem management
-import re as _re
 
 
 def parse_tc_snapshot(snap: str) -> Dict[str, float]:
@@ -845,14 +903,7 @@ def main():
         parser.error("--quick and --formal are mutually exclusive")
 
     # ---- Validate --run-dir ----
-    if not os.path.isabs(args.run_dir):
-        parser.error(f"--run-dir must be an absolute path, got: {args.run_dir}")
-    # Reject if inside a git repo (protect repo cleanliness)
-    check_path = os.path.abspath(args.run_dir)
-    while check_path and check_path != "/":
-        if os.path.isdir(os.path.join(check_path, ".git")):
-            parser.error(f"--run-dir must NOT be inside a git repository ({check_path}/.git)")
-        check_path = os.path.dirname(check_path)
+    validate_run_dir(parser, args.run_dir)
 
     repeats = 1 if args.quick else (args.repeats or REPEAT_COUNT)
 
@@ -896,10 +947,22 @@ def main():
     server_host = "127.0.0.1"
     server_port = args.port
     interface = args.interface
+    srv = None
+
+    def stop_server() -> None:
+        if srv:
+            srv.stop()
+
+    def cleanup_or_report(context: str) -> bool:
+        cleanup_ok, final_snapshot = cleanup_tc_and_verify(interface)
+        if not cleanup_ok:
+            print(f"[FATAL] tc cleanup verification failed during {context}")
+            print(f"[FATAL] Final qdisc snapshot: {final_snapshot}")
+        return cleanup_ok
+
     # ---- Interface validation ----
     validate_interface_for_mode(interface, args.host)
 
-    srv = None
     if args.no_spawn_server:
         # Remote mode: connect to --host:--port, no local server
         if not args.host:
@@ -961,9 +1024,9 @@ def main():
     if args.formal and git_dirty:
         print("[ERROR] Formal mode requires a clean client worktree. Commit or stash changes first.")
         sys.exit(1)
-    # Formal mode requires full 40-char commit
-    if args.formal and (not git_commit or len(git_commit) != 40):
-        print(f"[ERROR] Formal mode requires full 40-char git commit, got length={len(git_commit)}")
+    # Formal mode requires full 40-char hexadecimal commit
+    if args.formal and not is_full_hex_commit(git_commit):
+        print(f"[ERROR] Formal mode requires full 40-char hexadecimal git commit, got: {git_commit!r}")
         sys.exit(1)
     server_env_from_ack: Dict[str, str] = {}  # populated from first HELLO_ACK in remote mode
 
@@ -977,9 +1040,8 @@ def main():
     if os.path.exists(output_csv):
         print(f"[ERROR] Final CSV already exists: {output_csv}")
         print(f"        Move or remove it before re-running.")
-        clear_tc_netem(interface)
-        if srv:
-            srv.stop()
+        cleanup_or_report("startup final-output guard")
+        stop_server()
         sys.exit(1)
     print(f"[INFO] Output: {output_csv}")
     print()
@@ -990,9 +1052,8 @@ def main():
     if os.path.exists(tmp_csv):
         print(f"[ERROR] Stale tmp file exists: {tmp_csv}")
         print(f"        Remove it before re-running (previous run may have crashed).")
-        clear_tc_netem(interface)
-        if srv:
-            srv.stop()
+        cleanup_or_report("startup tmp guard")
+        stop_server()
         sys.exit(1)
     completed = 0
     any_execution_failure = False
@@ -1001,9 +1062,8 @@ def main():
         f = open(tmp_csv, "x", newline="", encoding="utf-8")
     except FileExistsError:
         print(f"[ERROR] Cannot create tmp file (exists): {tmp_csv}")
-        clear_tc_netem(interface)
-        if srv:
-            srv.stop()
+        cleanup_or_report("tmp creation failure")
+        stop_server()
         sys.exit(1)
     try:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1123,12 +1183,13 @@ def main():
                             f"exec={'OK' if exec_valid else 'FAIL'}"
                         )
     except BaseException:
-        # On any exception during writing, clean up tc and close file
+        # On any exception during writing, clean up tc, verify, and keep tmp.
         f.close()
-        clear_tc_netem(interface)
-        if srv:
-            srv.stop()
+        cleanup_or_report("exception path")
+        stop_server()
         raise
+    f.flush()
+    os.fsync(f.fileno())
     f.close()
 
     # ---- Validate matrix completeness ----
@@ -1157,18 +1218,17 @@ def main():
             sr = float(row.get("success_rate", 0))
             if sr < 0 or sr > 100:
                 sane_issues.append(f"row {i}: success_rate={sr} out of range")
-            # Git commit length must be 40
+            # Git commits must be full 40-character hex SHAs
             gc = row.get("server_git_commit", "")
-            if not gc or len(gc) != 40:
-                issues.append(f"row {i}: server_git_commit length={len(gc)} (expected 40)")
+            if not is_full_hex_commit(gc):
+                issues.append(f"row {i}: server_git_commit is not a full 40-char hex SHA")
             # Git dirty must be false
             gd = row.get("server_git_dirty", "")
             if str(gd).lower() != "false":
                 issues.append(f"row {i}: server_git_dirty={gd} (expected false)")
-            # Client git commit length must be 40
             cgc = row.get("client_git_commit", "")
-            if not cgc or len(cgc) != 40:
-                issues.append(f"row {i}: client_git_commit length={len(cgc)} (expected 40)")
+            if not is_full_hex_commit(cgc):
+                issues.append(f"row {i}: client_git_commit is not a full 40-char hex SHA")
             # Client git dirty must be false
             cgd = row.get("client_git_dirty", "")
             if str(cgd).lower() != "false":
@@ -1189,27 +1249,36 @@ def main():
             print(f"  - {iss}")
         if len(all_critical) > 20:
             print(f"  ... and {len(all_critical) - 20} more")
-        clear_tc_netem(interface)
-        if srv:
-            srv.stop()
+        cleanup_or_report("validation failure")
+        stop_server()
         sys.exit(1)
 
     # ---- Atomic replace: tmp → final ----
     if any_execution_failure:
         print(f"[ERROR] Execution failures detected. Keeping tmp file: {tmp_csv}")
         print(f"        Final CSV NOT published.")
-        clear_tc_netem(interface)
-        if srv:
-            srv.stop()
+        cleanup_or_report("execution failure")
+        stop_server()
         sys.exit(1)
-    else:
-        os.replace(tmp_csv, output_csv)
-        print(f"[OK] All {completed} experiments passed execution_valid")
+    cleanup_ok, final_snapshot = cleanup_tc_and_verify(interface)
+    if not cleanup_ok:
+        print(f"[FATAL] tc cleanup verification failed before publish")
+        print(f"[FATAL] Final qdisc snapshot: {final_snapshot}")
+        print(f"[FATAL] Keeping tmp file: {tmp_csv}")
+        print(f"        Final CSV NOT published.")
+        stop_server()
+        sys.exit(1)
+    try:
+        publish_tmp_no_clobber(tmp_csv, output_csv)
+    except BaseException as e:
+        cleanup_or_report("publish failure")
+        print(f"[FATAL] Failed to publish final CSV without clobbering: {e}")
+        print(f"[FATAL] Keeping tmp file: {tmp_csv}")
+        stop_server()
+        sys.exit(1)
+    print(f"[OK] All {completed} experiments passed execution_valid")
 
-    # Final cleanup (safety net)
-    clear_tc_netem(interface)
-    if srv:
-        srv.stop()
+    stop_server()
 
     print(f"\n[DONE] Results written to {output_csv}")
     print(f"[DONE] {completed} experiments completed.")

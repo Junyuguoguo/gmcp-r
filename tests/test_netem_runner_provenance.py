@@ -10,10 +10,12 @@
 import csv
 import inspect
 import os
+import shutil
 import socket
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -56,6 +58,71 @@ def _make_tmp_dir():
     """Create a temporary directory outside any git repo."""
     d = tempfile.mkdtemp(prefix="netem_test_")
     return d
+
+
+def _fake_result(protocol="gmcp_r", condition_name="control", repeat_id=1):
+    return {
+        "session_id": f"s-{protocol}-{condition_name}-{repeat_id}",
+        "experiment_type": "netem_validation",
+        "protocol": protocol,
+        "condition_name": condition_name,
+        "loss_rate_pct": 0,
+        "delay_ms": 0,
+        "jitter_ms": 0,
+        "reorder_pct": 0,
+        "server_host": "127.0.0.1",
+        "server_port": 9002,
+        "message_count": 500,
+        "payload_size": 128,
+        "repeat_id": repeat_id,
+        "sent_count": 500,
+        "accepted_count": 500,
+        "rejected_count": 0,
+        "timeout_count": 0,
+        "error_count": 0,
+        "success_rate": 100.0,
+        "throughput_msg_per_sec": 1000.0,
+        "elapsed_seconds": 0.5,
+        "avg_rtt_ms": 1.0,
+        "p50_rtt_ms": 1.0,
+        "p95_rtt_ms": 1.0,
+        "p99_rtt_ms": 1.0,
+        "run_valid": True,
+        "failure_reason": "",
+        "state_match": True,
+        "client_final_seq": 500,
+        "server_final_seq": 500,
+        "client_final_mem": "",
+        "server_final_mem": "",
+        "client_final_hash": "",
+        "server_final_hash": "",
+    }
+
+
+@contextmanager
+def _fake_tc_condition(*args, **kwargs):
+    yield "qdisc noqueue 0: root"
+
+
+def _run_main_with_fake_experiment(run_dir, cleanup_result=(True, "qdisc noqueue 0: root"), publish_side_effect=None):
+    publish_mock = MagicMock(side_effect=publish_side_effect)
+    with patch.object(runner, "is_linux", return_value=True), \
+         patch.object(runner, "check_tc_available", return_value=True), \
+         patch.object(runner, "check_sudo_available", return_value=True), \
+         patch.object(runner, "validate_interface_for_mode"), \
+         patch.object(runner, "_transport_get_git_commit", return_value=_FULL_SHA), \
+         patch.object(runner, "_transport_get_git_dirty", return_value=False), \
+         patch.object(runner, "tc_condition", side_effect=_fake_tc_condition), \
+         patch.object(runner, "run_one_experiment", side_effect=lambda protocol, condition_name, repeat_id, **kwargs: _fake_result(protocol, condition_name, repeat_id)), \
+         patch.object(runner, "cleanup_tc_and_verify", return_value=cleanup_result), \
+         patch.object(runner, "publish_tmp_no_clobber", publish_mock):
+        exit_obj = _invoke_main([
+            "--interface", "lo",
+            "--conditions", "control",
+            "--repeats", "1",
+            "--run-dir", str(run_dir),
+        ])
+    return exit_obj, publish_mock
 
 
 # ===========================================================================
@@ -236,6 +303,17 @@ class TestFormalRejectsClientDirty(unittest.TestCase):
             shutil.rmtree(run_dir, ignore_errors=True)
 
 
+class TestCommitHexValidation(unittest.TestCase):
+    """Formal commit checks require exactly 40 hexadecimal characters."""
+
+    def test_non_hex_40_char_commit_rejected(self):
+        self.assertFalse(runner.is_full_hex_commit("g" * 40))
+
+    def test_valid_40_char_hex_commit_passes(self):
+        self.assertTrue(runner.is_full_hex_commit("a" * 40))
+        self.assertTrue(runner.is_full_hex_commit("A1" * 20))
+
+
 # ===========================================================================
 # 7. Formal rejects server dirty=true
 # ===========================================================================
@@ -343,6 +421,20 @@ class TestGitRepoInsideRunDirFails(unittest.TestCase):
             import shutil
             shutil.rmtree(run_dir, ignore_errors=True)
 
+    def test_run_dir_inside_git_worktree_file_rejected(self):
+        run_dir = _make_tmp_dir()
+        try:
+            git_file = os.path.join(run_dir, ".git")
+            with open(git_file, "w", encoding="utf-8") as f:
+                f.write("gitdir: /tmp/example-worktree-git-dir\n")
+            with patch.object(sys, "argv", ["run_netem_validation.py", "--quick", "--run-dir", run_dir]):
+                with self.assertRaises(SystemExit) as ctx:
+                    runner.main()
+                self.assertNotEqual(ctx.exception.code, 0)
+        finally:
+            import shutil
+            shutil.rmtree(run_dir, ignore_errors=True)
+
 
 # ===========================================================================
 # 12. Existing final CSV refuses
@@ -422,14 +514,58 @@ class TestTmpExclusiveCreation(unittest.TestCase):
 # ===========================================================================
 
 class TestFormalPublishNoOverwrite(unittest.TestCase):
-    """Test 15: os.replace is guarded — won't overwrite existing final CSV."""
+    """Test 15: final publish uses atomic no-clobber semantics."""
 
-    def test_final_csv_existence_checked_before_replace(self):
-        source = inspect.getsource(runner.main)
-        self.assertIn('os.path.exists(output_csv)', source)
-        exists_pos = source.index('os.path.exists(output_csv)')
-        replace_pos = source.index('os.replace(tmp_csv, output_csv)')
-        self.assertLess(exists_pos, replace_pos)
+    def test_runner_source_does_not_use_os_replace(self):
+        source = inspect.getsource(runner)
+        self.assertNotIn("os.replace", source)
+
+    def test_publish_refuses_existing_final_and_preserves_final(self):
+        run_dir = Path(_make_tmp_dir())
+        try:
+            tmp = run_dir / "netem.csv.tmp"
+            final = run_dir / "netem.csv"
+            tmp.write_text("new\n", encoding="utf-8")
+            final.write_text("old\n", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                runner.publish_tmp_no_clobber(str(tmp), str(final))
+
+            self.assertEqual(final.read_text(encoding="utf-8"), "old\n")
+            self.assertEqual(tmp.read_text(encoding="utf-8"), "new\n")
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_publish_refuses_race_created_final_and_preserves_final(self):
+        run_dir = Path(_make_tmp_dir())
+        try:
+            tmp = run_dir / "netem.csv.tmp"
+            final = run_dir / "netem.csv"
+            tmp.write_text("new\n", encoding="utf-8")
+            self.assertFalse(final.exists())
+            final.write_text("raced\n", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                runner.publish_tmp_no_clobber(str(tmp), str(final))
+
+            self.assertEqual(final.read_text(encoding="utf-8"), "raced\n")
+            self.assertTrue(tmp.exists())
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_publish_success_creates_final_and_removes_tmp(self):
+        run_dir = Path(_make_tmp_dir())
+        try:
+            tmp = run_dir / "netem.csv.tmp"
+            final = run_dir / "netem.csv"
+            tmp.write_text("new\n", encoding="utf-8")
+
+            runner.publish_tmp_no_clobber(str(tmp), str(final))
+
+            self.assertEqual(final.read_text(encoding="utf-8"), "new\n")
+            self.assertFalse(tmp.exists())
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
 
 
 # ===========================================================================
@@ -480,14 +616,14 @@ class TestFormalMatrix180Rows(unittest.TestCase):
 # ===========================================================================
 
 class TestExceptionPathCallsTcCleanup(unittest.TestCase):
-    """Test 19: The try/except around writing ensures tc cleanup on exception."""
+    """Test 19: The try/except around writing verifies tc cleanup on exception."""
 
-    def test_except_block_clears_tc(self):
+    def test_except_block_verifies_tc_cleanup(self):
         source = inspect.getsource(runner.main)
         self.assertIn('except BaseException', source)
         except_pos = source.index('except BaseException')
         after_except = source[except_pos:]
-        self.assertIn('clear_tc_netem(interface)', after_except)
+        self.assertIn('cleanup_tc_and_verify(interface)', after_except)
 
     def test_finally_closes_file(self):
         source = inspect.getsource(runner.main)
@@ -499,12 +635,161 @@ class TestExceptionPathCallsTcCleanup(unittest.TestCase):
 # ===========================================================================
 
 class TestCleanupWithNetemBlocksPublish(unittest.TestCase):
-    """Test 20: tc_condition context manager verifies no netem residue after cleanup."""
+    """Test 20: tc cleanup must be verified before publish."""
 
-    def test_tc_condition_raises_on_netem_residue(self):
-        source = inspect.getsource(runner.tc_condition)
-        self.assertIn('netem residue after cleanup', source)
-        self.assertIn('raise RuntimeError', source)
+    def test_cleanup_false_returns_failure(self):
+        with patch.object(runner, "clear_tc_netem", return_value=False), \
+             patch.object(runner, "get_tc_snapshot", return_value="qdisc noqueue 0: root"):
+            ok, snap = runner.cleanup_tc_and_verify("lo")
+        self.assertFalse(ok)
+        self.assertIn("noqueue", snap)
+
+    def test_cleanup_netem_residue_returns_failure(self):
+        with patch.object(runner, "clear_tc_netem", return_value=True), \
+             patch.object(runner, "get_tc_snapshot", return_value="qdisc netem 8001: root"):
+            ok, snap = runner.cleanup_tc_and_verify("lo")
+        self.assertFalse(ok)
+        self.assertIn("netem", snap)
+
+    def test_cleanup_success_returns_snapshot(self):
+        with patch.object(runner, "clear_tc_netem", return_value=True), \
+             patch.object(runner, "get_tc_snapshot", return_value="qdisc noqueue 0: root"):
+            ok, snap = runner.cleanup_tc_and_verify("lo")
+        self.assertTrue(ok)
+        self.assertNotIn("netem", snap)
+
+    def test_main_cleans_before_publish(self):
+        source = inspect.getsource(runner.main)
+        cleanup_pos = source.index("cleanup_tc_and_verify(interface)")
+        publish_pos = source.index("publish_tmp_no_clobber(tmp_csv, output_csv)")
+        self.assertLess(cleanup_pos, publish_pos)
+
+    def test_clear_tc_false_blocks_publish_and_keeps_tmp(self):
+        run_dir = Path(_make_tmp_dir())
+        try:
+            exit_obj, publish_mock = _run_main_with_fake_experiment(
+                run_dir,
+                cleanup_result=(False, "qdisc noqueue 0: root"),
+            )
+            self.assertIsNotNone(exit_obj)
+            self.assertNotEqual(exit_obj.code, 0)
+            publish_mock.assert_not_called()
+            self.assertTrue((run_dir / "netem_dev.csv.tmp").exists())
+            self.assertFalse((run_dir / "netem_dev.csv").exists())
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_cleanup_netem_residue_blocks_publish_and_keeps_tmp(self):
+        run_dir = Path(_make_tmp_dir())
+        try:
+            exit_obj, publish_mock = _run_main_with_fake_experiment(
+                run_dir,
+                cleanup_result=(False, "qdisc netem 8001: root"),
+            )
+            self.assertIsNotNone(exit_obj)
+            self.assertNotEqual(exit_obj.code, 0)
+            publish_mock.assert_not_called()
+            self.assertTrue((run_dir / "netem_dev.csv.tmp").exists())
+            self.assertFalse((run_dir / "netem_dev.csv").exists())
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_cleanup_success_allows_publish(self):
+        run_dir = Path(_make_tmp_dir())
+        try:
+            exit_obj, publish_mock = _run_main_with_fake_experiment(
+                run_dir,
+                cleanup_result=(True, "qdisc noqueue 0: root"),
+            )
+            self.assertIsNone(exit_obj)
+            publish_mock.assert_called_once()
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_cleanup_verify_called_before_publish(self):
+        run_dir = Path(_make_tmp_dir())
+        calls = []
+
+        def cleanup_side_effect(interface):
+            calls.append("cleanup")
+            return True, "qdisc noqueue 0: root"
+
+        def publish_side_effect(tmp_path, final_path):
+            calls.append("publish")
+
+        try:
+            with patch.object(runner, "is_linux", return_value=True), \
+                 patch.object(runner, "check_tc_available", return_value=True), \
+                 patch.object(runner, "check_sudo_available", return_value=True), \
+                 patch.object(runner, "validate_interface_for_mode"), \
+                 patch.object(runner, "_transport_get_git_commit", return_value=_FULL_SHA), \
+                 patch.object(runner, "_transport_get_git_dirty", return_value=False), \
+                 patch.object(runner, "tc_condition", side_effect=_fake_tc_condition), \
+                 patch.object(runner, "run_one_experiment", side_effect=lambda protocol, condition_name, repeat_id, **kwargs: _fake_result(protocol, condition_name, repeat_id)), \
+                 patch.object(runner, "cleanup_tc_and_verify", side_effect=cleanup_side_effect), \
+                 patch.object(runner, "publish_tmp_no_clobber", side_effect=publish_side_effect):
+                _invoke_main([
+                    "--interface", "lo",
+                    "--conditions", "control",
+                    "--repeats", "1",
+                    "--run-dir", str(run_dir),
+                ])
+            self.assertEqual(calls[-2:], ["cleanup", "publish"])
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_keyboard_interrupt_path_executes_cleanup_verify_and_keeps_tmp(self):
+        run_dir = Path(_make_tmp_dir())
+        with patch.object(runner, "is_linux", return_value=True), \
+             patch.object(runner, "check_tc_available", return_value=True), \
+             patch.object(runner, "check_sudo_available", return_value=True), \
+             patch.object(runner, "validate_interface_for_mode"), \
+             patch.object(runner, "_transport_get_git_commit", return_value=_FULL_SHA), \
+             patch.object(runner, "_transport_get_git_dirty", return_value=False), \
+             patch.object(runner, "tc_condition", side_effect=KeyboardInterrupt()), \
+             patch.object(runner, "cleanup_tc_and_verify", return_value=(True, "qdisc noqueue 0: root")) as cleanup_mock, \
+             patch.object(runner, "publish_tmp_no_clobber") as publish_mock:
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    _invoke_main([
+                        "--interface", "lo",
+                        "--conditions", "control",
+                        "--repeats", "1",
+                        "--run-dir", str(run_dir),
+                    ])
+                cleanup_mock.assert_called()
+                publish_mock.assert_not_called()
+                self.assertTrue((run_dir / "netem_dev.csv.tmp").exists())
+            finally:
+                shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_base_exception_path_executes_cleanup_verify_and_keeps_tmp(self):
+        class SentinelBaseException(BaseException):
+            pass
+
+        run_dir = Path(_make_tmp_dir())
+        with patch.object(runner, "is_linux", return_value=True), \
+             patch.object(runner, "check_tc_available", return_value=True), \
+             patch.object(runner, "check_sudo_available", return_value=True), \
+             patch.object(runner, "validate_interface_for_mode"), \
+             patch.object(runner, "_transport_get_git_commit", return_value=_FULL_SHA), \
+             patch.object(runner, "_transport_get_git_dirty", return_value=False), \
+             patch.object(runner, "tc_condition", side_effect=SentinelBaseException()), \
+             patch.object(runner, "cleanup_tc_and_verify", return_value=(False, "qdisc netem 8001: root")) as cleanup_mock, \
+             patch.object(runner, "publish_tmp_no_clobber") as publish_mock:
+            try:
+                with self.assertRaises(SentinelBaseException):
+                    _invoke_main([
+                        "--interface", "lo",
+                        "--conditions", "control",
+                        "--repeats", "1",
+                        "--run-dir", str(run_dir),
+                    ])
+                cleanup_mock.assert_called()
+                publish_mock.assert_not_called()
+                self.assertTrue((run_dir / "netem_dev.csv.tmp").exists())
+            finally:
+                shutil.rmtree(run_dir, ignore_errors=True)
 
 
 # ===========================================================================
