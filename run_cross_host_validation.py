@@ -26,6 +26,7 @@
 """
 
 import argparse
+import hashlib
 import csv
 import json
 import os
@@ -363,16 +364,21 @@ def run_one_experiment(
         }
 
     # Real memory/hash match from independent comparison
-    memory_match = True
-    hash_match = True
-    if protocol == "gmcp_r":
-        memory_match = (
-            state_fields["client_final_mem"] == state_fields["server_final_mem"]
-        )
-    elif protocol in ("hash_chain", "authenticated_hash_chain"):
-        hash_match = (
-            state_fields["client_final_hash"] == state_fields["server_final_hash"]
-        )
+    # Failed rows (adapter=None) get empty state_fields → match must be "" not True
+    if adapter is None:
+        memory_match = ""
+        hash_match = ""
+    else:
+        memory_match = True
+        hash_match = True
+        if protocol == "gmcp_r":
+            memory_match = (
+                state_fields["client_final_mem"] == state_fields["server_final_mem"]
+            ) and state_fields["client_final_mem"] != ""
+        elif protocol in ("hash_chain", "authenticated_hash_chain"):
+            hash_match = (
+                state_fields["client_final_hash"] == state_fields["server_final_hash"]
+            ) and state_fields["client_final_hash"] != ""
 
     result = {
         "session_id": session_id,
@@ -512,6 +518,8 @@ class EmbeddedTCPServer:
                     self._handle_data(conn, packet)
                 else:
                     self._send(conn, {"ok": False, "reason": f"unknown type: {ptype}"})
+        except UnicodeDecodeError as ude:
+            print(f"[SERVER] UnicodeDecodeError from {addr}: {type(ude).__name__}: {ude}", flush=True)
         except (ConnectionError, socket.timeout, OSError):
             pass
         finally:
@@ -690,6 +698,12 @@ def main():
     )
     parser.add_argument("--quick", action="store_true", help="Quick mode: 1 repeat only, output to smoke CSV")
     parser.add_argument("--formal", action="store_true", help="Formal mode: full run with strict guards")
+    parser.add_argument("--formal-batch", action="store_true",
+        help="Formal batch mode: like --formal but skips TTY confirmation prompts for CI/automation")
+    parser.add_argument("--repeat-id", type=int, default=None,
+        help="For --formal-batch: specific repeat_id (1-20) to run")
+    parser.add_argument("--run-dir", type=str, default=None,
+        help="Absolute path for journal and batch output files")
     parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
     parser.add_argument("--allow-mixed-commits", action="store_true",
         help="Allow client and server to run different git commits (formal mode)")
@@ -700,17 +714,29 @@ def main():
     )
     args = parser.parse_args()
 
+    # --- Mutual exclusion: --quick and --formal / --formal-batch ---
+    effective_formal = args.formal or args.formal_batch
+    if args.formal_batch:
+        args.formal = True  # --formal-batch implies --formal
+    if args.quick and effective_formal:
+        print("[ERROR] --quick and --formal/--formal-batch are mutually exclusive.")
+        sys.exit(1)
+
     # --- Formal mode: force repeats=20 ---
-    if args.formal:
+    if effective_formal:
         if args.allow_mixed_commits:
             print("[FORMAL] --allow-mixed-commits: skipping commit consistency check")
-        if args.repeats is not None and args.repeats != 20:
-            parser.error('--formal requires exactly 20 repeats (or omit for default 20)')
-
-    # --- Mutual exclusion: --quick and --formal ---
-    if args.quick and args.formal:
-        print("[ERROR] --quick and --formal are mutually exclusive.")
-        sys.exit(1)
+        if args.formal_batch:
+            if args.repeat_id is None:
+                parser.error('--formal-batch requires --repeat-id (1-20)')
+            if not (1 <= args.repeat_id <= 20):
+                parser.error('--repeat-id must be 1-20')
+            if args.run_dir is None:
+                parser.error('--formal-batch requires --run-dir (absolute path)')
+            args.repeats = 1  # single batch, 1 repeat
+        else:
+            if args.repeats is not None and args.repeats != 20:
+                parser.error('--formal requires exactly 20 repeats (or omit for default 20)')
 
     repeats = 1 if args.quick else (args.repeats or REPEAT_COUNT)
 
@@ -780,8 +806,12 @@ def main():
             sys.exit(1)
 
     # Determine output CSV based on mode
-    if args.quick:
+    if args.formal_batch and args.run_dir and args.repeat_id:
+        output_csv = os.path.join(args.run_dir, f"cross_host_batch_r{args.repeat_id:02d}.csv")
+    elif args.quick:
         output_csv = os.path.join(OUTPUT_DIR, "cross_host_smoke.csv")
+    elif args.formal_batch:
+        output_csv = os.path.join(OUTPUT_DIR, "cross_host_formal_batch.csv")
     elif args.formal:
         output_csv = os.path.join(OUTPUT_DIR, "cross_host_results.csv")
     else:
@@ -832,7 +862,7 @@ def main():
     ]
 
     total = len(PROTOCOLS) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * repeats
-    mode_label = "formal" if args.formal else ("smoke" if args.quick else "default")
+    mode_label = "formal-batch" if args.formal_batch else ("formal" if args.formal else ("smoke" if args.quick else "default"))
     print(f"[INFO] Mode: {mode_label}")
     print(f"[INFO] Total experiments: {total}")
     print(f"[INFO] Protocols: {PROTOCOLS}")
@@ -848,7 +878,7 @@ def main():
         sys.exit(1)
 
     # --- Journal for crash recovery ---
-    journal_path = output_csv + ".journal"
+    journal_path = (os.path.join(args.run_dir, "attempts.jsonl") if args.run_dir else output_csv + ".journal")
     journal_entries = []
 
     def write_journal(event: str, **extra):
@@ -863,8 +893,10 @@ def main():
             with open(journal_path, "a", encoding="utf-8") as jf:
                 jf.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 jf.flush()
-        except Exception:
-            pass
+                os.fsync(jf.fileno())
+        except Exception as je:
+            print(f"[JOURNAL] FATAL: failed to write journal: {je}")
+            sys.exit(1)
 
     write_journal("run_start", total=total, mode=mode_label, output=output_csv)
 
@@ -928,27 +960,43 @@ def main():
     write_journal("run_end", completed=completed, failed=failed, total=total)
 
     # Validate tmp file before atomic replace
-    # (relaxed: allow failed rows — only check structural integrity)
+    # NEVER delete tmp — on failure, rename to .failed.csv for forensics
     print(f"\n[VALIDATE] Checking {tmp_csv} ...")
     try:
         with open(tmp_csv, "r", newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         expected_total = len(PROTOCOLS) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * repeats
         if len(rows) != expected_total:
+            failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+            os.rename(tmp_csv, failed_csv)
+            sha = hashlib.sha256(open(failed_csv, "rb").read()).hexdigest()
             print(f"[VALIDATE] FAIL: expected {expected_total} rows, got {len(rows)}")
-            os.remove(tmp_csv)
+            print(f"[VALIDATE] Failed artifact: {failed_csv}")
+            print(f"[VALIDATE] SHA-256: {sha}")
             sys.exit(1)
 
         # Count valid vs invalid
         invalid_count = sum(1 for r in rows if r.get("run_valid") not in ("True", "true", True))
         valid_count = len(rows) - invalid_count
+
+        # Fail-closed: any invalid row blocks formal publish
         if invalid_count > 0:
-            print(f"[VALIDATE] WARN: {invalid_count} rows have run_valid=False (preserved in output)")
+            failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+            os.rename(tmp_csv, failed_csv)
+            sha = hashlib.sha256(open(failed_csv, "rb").read()).hexdigest()
+            print(f"[VALIDATE] FAIL: {invalid_count}/{len(rows)} rows have run_valid=False")
+            print(f"[VALIDATE] Failed artifact: {failed_csv}")
+            print(f"[VALIDATE] SHA-256: {sha}")
+            sys.exit(1)
 
         all_clean = all(r.get("git_dirty") in ("false", "False", False) for r in rows)
         if not all_clean:
+            failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+            os.rename(tmp_csv, failed_csv)
+            sha = hashlib.sha256(open(failed_csv, "rb").read()).hexdigest()
             print("[VALIDATE] FAIL: git_dirty is not false for all rows")
-            os.remove(tmp_csv)
+            print(f"[VALIDATE] Failed artifact: {failed_csv}")
+            print(f"[VALIDATE] SHA-256: {sha}")
             sys.exit(1)
         # Formal mode: also check server_git_dirty and cross-host authenticity
         if args.formal:
@@ -959,45 +1007,59 @@ def main():
                 # server_git_dirty strict check (no empty string allowed)
                 server_dirty = r.get('server_git_dirty', '')
                 if server_dirty not in ('false', 'False', False):
+                    failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+                    os.rename(tmp_csv, failed_csv)
                     print(f"[VALIDATE] FAIL row {i+1}: server_git_dirty={server_dirty}")
-                    os.remove(tmp_csv)
+                    print(f"[VALIDATE] Failed artifact: {failed_csv}")
                     sys.exit(1)
                 # server_git_commit must be 40-char hex
                 serv_commit = r.get('server_git_commit', '')
                 if len(serv_commit) != 40:
+                    failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+                    os.rename(tmp_csv, failed_csv)
                     print(f"[VALIDATE] FAIL row {i+1}: server_git_commit length {len(serv_commit)} != 40")
-                    os.remove(tmp_csv)
+                    print(f"[VALIDATE] Failed artifact: {failed_csv}")
                     sys.exit(1)
                 # Real cross-host: server_hostname must differ from client_host_id
                 if r.get('server_hostname') == r.get('client_host_id'):
+                    failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+                    os.rename(tmp_csv, failed_csv)
                     print(f"[VALIDATE] FAIL row {i+1}: client and server on same host")
-                    os.remove(tmp_csv)
+                    print(f"[VALIDATE] Failed artifact: {failed_csv}")
                     sys.exit(1)
                 # Real cross-host: no loopback in formal data
                 if r.get('network_path_type') == 'loopback':
+                    failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+                    os.rename(tmp_csv, failed_csv)
                     print(f"[VALIDATE] FAIL row {i+1}: formal data cannot use loopback")
-                    os.remove(tmp_csv)
+                    print(f"[VALIDATE] Failed artifact: {failed_csv}")
                     sys.exit(1)
                 # Commit consistency
                 client_commit = r.get('git_commit', '')
                 server_commit = r.get('server_git_commit', '')
                 if not args.allow_mixed_commits and client_commit != server_commit:
+                    failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+                    os.rename(tmp_csv, failed_csv)
                     print(f"[VALIDATE] FAIL row {i+1}: client commit {client_commit[:8]} != server commit {server_commit[:8]}")
-                    os.remove(tmp_csv)
+                    print(f"[VALIDATE] Failed artifact: {failed_csv}")
                     sys.exit(1)
             client_dirty = any(
                 r.get("git_dirty") not in ("false", "False", False)
                 for r in rows
             )
             if client_dirty:
+                failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+                os.rename(tmp_csv, failed_csv)
                 print("[VALIDATE] FAIL: client git_dirty is not false for all rows")
-                os.remove(tmp_csv)
+                print(f"[VALIDATE] Failed artifact: {failed_csv}")
                 sys.exit(1)
         print(f"[VALIDATE] OK: {len(rows)} rows ({valid_count} valid, {invalid_count} failed), git_dirty=false")
     except Exception as e:
         print(f"[VALIDATE] FAIL: {e}")
         if os.path.exists(tmp_csv):
-            os.remove(tmp_csv)
+            failed_csv = tmp_csv.replace(".tmp", f"_attempt{_attempt_id:02d}.failed.csv")
+            os.rename(tmp_csv, failed_csv)
+            print(f"[VALIDATE] Failed artifact: {failed_csv}")
         sys.exit(1)
 
     # Atomic replace
@@ -1007,6 +1069,79 @@ def main():
     if failed > 0:
         print(f"[WARN] {failed} experiments had errors and were preserved with run_valid=False.")
     print(f"[JOURNAL] Crash-recovery journal: {journal_path}")
+
+    # --- Aggregator: print summary statistics ---
+    aggregate_results(output_csv)
+
+
+def aggregate_results(csv_path: str):
+    """Read the output CSV and print per-protocol summary statistics.
+
+    Called at the end of a run to provide a quick overview without
+    requiring manual CSV inspection.
+    """
+    import csv as _csv
+    from collections import defaultdict
+
+    if not os.path.exists(csv_path):
+        print("[AGGREGATE] No results file found — skipping summary.")
+        return
+
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        rows = list(_csv.DictReader(f))
+
+    if not rows:
+        print("[AGGREGATE] Empty results file — skipping summary.")
+        return
+
+    total = len(rows)
+    valid = sum(1 for r in rows if r.get("run_valid") in ("True", "true", True))
+    failed = total - valid
+
+    print(f"\n{'='*72}")
+    print(f"AGGREGATE RESULTS — {csv_path}")
+    print(f"{'='*72}")
+    print(f"Total rows: {total}   Valid: {valid}   Failed: {failed}")
+    print()
+
+    # Group by protocol
+    by_protocol: Dict[str, list] = defaultdict(list)
+    for r in rows:
+        by_protocol[r.get("protocol", "unknown")].append(r)
+
+    header = f"{'Protocol':<22} {'N':>4} {'Valid':>5} {'Acc%':>7} {'RTT p50':>8} {'RTT p99':>8} {'TPut':>10}"
+    print(header)
+    print("-" * len(header))
+
+    for proto in sorted(by_protocol.keys()):
+        proto_rows = by_protocol[proto]
+        n = len(proto_rows)
+        n_valid = sum(1 for r in proto_rows if r.get("run_valid") in ("True", "true", True))
+
+        acc_rates = []
+        p50s = []
+        p99s = []
+        tputs = []
+        for r in proto_rows:
+            try:
+                acc_rates.append(float(r.get("success_rate", 0)))
+                p50s.append(float(r.get("p50_rtt_ms", 0)))
+                p99s.append(float(r.get("p99_rtt_ms", 0)))
+                tputs.append(float(r.get("throughput_msg_per_sec", 0)))
+            except (ValueError, TypeError):
+                pass
+
+        avg_acc = sum(acc_rates) / len(acc_rates) if acc_rates else 0
+        med_p50 = sorted(p50s)[len(p50s) // 2] if p50s else 0
+        med_p99 = sorted(p99s)[len(p99s) // 2] if p99s else 0
+        avg_tput = sum(tputs) / len(tputs) if tputs else 0
+
+        print(
+            f"{proto:<22} {n:>4} {n_valid:>5} {avg_acc:>6.1f}% "
+            f"{med_p50:>7.1f} {med_p99:>7.1f} {avg_tput:>9.1f}"
+        )
+
+    print(f"{'='*72}\n")
 
 
 if __name__ == "__main__":

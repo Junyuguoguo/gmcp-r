@@ -807,9 +807,6 @@ def run_one_baseline_experiment(
 def run_all_experiments():
     ensure_output_dir()
     
-    # 创建实验跟踪器
-    tracker = ExperimentTracker("real_baseline_comparison")
-    
     fieldnames = [
         "session_id", "protocol", "attack_type", "attack_category",
         "attack_applicable",
@@ -828,53 +825,100 @@ def run_all_experiments():
     ]
     
     total_experiments = len(PROTOCOLS) * len(ATTACK_TYPES) * len(MESSAGE_COUNTS) * len(PAYLOAD_SIZES) * len(REPEATS)
+
+    # --- Journal for crash recovery ---
+    journal_path = OUTPUT_CSV + ".journal"
+    _journal_entries = []
+
+    def write_journal(event: str, **extra):
+        """Append a timestamped event to the journal file."""
+        from datetime import datetime, timezone
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            **extra,
+        }
+        _journal_entries.append(entry)
+        try:
+            with open(journal_path, "a", encoding="utf-8") as jf:
+                jf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                jf.flush()
+        except Exception:
+            pass
+
+    write_journal("run_start", total=total_experiments, output=OUTPUT_CSV)
+
+    # --- Batch mode: write to .tmp incrementally, flush after each experiment ---
+    tmp_csv = OUTPUT_CSV + ".tmp"
     completed = 0
-    
-    for protocol in PROTOCOLS:
-        for attack_type in ATTACK_TYPES:
-            for message_count in MESSAGE_COUNTS:
-                for payload_size in PAYLOAD_SIZES:
-                    for repeat_id in REPEATS:
-                        completed += 1
-                        category = attack_category(attack_type)
-                        applicable = attack_applicable_to_protocol(attack_type, protocol)
-                        print(f"\n[{completed}/{total_experiments}] "
-                              f"protocol={protocol}, attack={attack_type} "
-                              f"[{category}]{'(N/A)' if not applicable else ''}, "
-                              f"msg={message_count}, payload={payload_size}, "
-                              f"repeat={repeat_id}")
-                        
-                        result = run_one_baseline_experiment(
-                            protocol=protocol,
-                            attack_type=attack_type,
-                            message_count=message_count,
-                            payload_size=payload_size,
-                            repeat_id=repeat_id,
-                        )
-                        
-                        # 添加到跟踪器
-                        tracker.add_result(result)
-                        
-                        # 采样性能
-                        tracker.sample_performance()
-                        
-                        # 打印结果摘要
-                        status = "✅" if result["success_rate"] > 50 else "❌"
-                        print(f"  {status} success_rate={result['success_rate']}%, "
-                              f"rtt={result['rtt_mean_ms']}ms, "
-                              f"throughput={result['throughput_msg_per_sec']} msg/s")
-    
-    # 保存结果
-    tracker.save_results_to_csv(OUTPUT_CSV, fieldnames)
-    
-    # 获取最终统计
-    final_stats = tracker.finish()
-    print(f"\n{'='*60}")
-    print(f"[COMPLETE] Results saved to {OUTPUT_CSV}")
-    print(f"[STATS] Total results: {final_stats['total_results']}")
-    print(f"[STATS] Elapsed time: {final_stats['elapsed_seconds']}s")
-    
-    return tracker.results
+    failed = 0
+    all_results = []
+
+    with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
+        import csv as _csv
+        writer = _csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for protocol in PROTOCOLS:
+            for attack_type in ATTACK_TYPES:
+                for message_count in MESSAGE_COUNTS:
+                    for payload_size in PAYLOAD_SIZES:
+                        for repeat_id in REPEATS:
+                            idx = completed + failed + 1
+                            category = attack_category(attack_type)
+                            applicable = attack_applicable_to_protocol(attack_type, protocol)
+                            print(f"\n[{idx}/{total_experiments}] "
+                                  f"protocol={protocol}, attack={attack_type} "
+                                  f"[{category}]{'(N/A)' if not applicable else ''}, "
+                                  f"msg={message_count}, payload={payload_size}, "
+                                  f"repeat={repeat_id}")
+                            
+                            result = run_one_baseline_experiment(
+                                protocol=protocol,
+                                attack_type=attack_type,
+                                message_count=message_count,
+                                payload_size=payload_size,
+                                repeat_id=repeat_id,
+                            )
+
+                            all_results.append(result)
+
+                            # Always write to CSV (failed rows preserved with run_valid=False)
+                            writer.writerow(result)
+                            f.flush()
+
+                            if not result.get("run_valid", True):
+                                failed += 1
+                                write_journal(
+                                    "experiment_failed",
+                                    protocol=protocol,
+                                    attack_type=attack_type,
+                                    msg_count=message_count,
+                                    payload_size=payload_size,
+                                    repeat_id=repeat_id,
+                                    failure_reason=result.get("failure_reason", ""),
+                                )
+                            else:
+                                completed += 1
+
+                            # 打印结果摘要
+                            status = "✅" if result["success_rate"] > 50 else "❌"
+                            print(f"  {status} success_rate={result['success_rate']}%, "
+                                  f"rtt={result['rtt_mean_ms']}ms, "
+                                  f"throughput={result['throughput_msg_per_sec']} msg/s")
+
+    write_journal("run_end", completed=completed, failed=failed, total=total_experiments)
+
+    # Atomic replace
+    import os
+    os.replace(tmp_csv, OUTPUT_CSV)
+    print(f"\n[DONE] Results atomically written to {OUTPUT_CSV}")
+    print(f"[DONE] {completed} experiments completed, {failed} failed.")
+    if failed > 0:
+        print(f"[WARN] {failed} experiments had errors and were preserved with run_valid=False.")
+    print(f"[JOURNAL] Crash-recovery journal: {journal_path}")
+
+    return all_results
 
 
 def print_attack_matrix(results: list):
@@ -969,6 +1013,8 @@ def baseline_results_valid(results: List[Dict[str, Any]]) -> Tuple[bool, List[st
 def main():
     parser = argparse.ArgumentParser(description="Run real baseline comparison experiments")
     parser.add_argument("--spawn-server", action="store_true", help="Start real_baseline_server.py for this run")
+    parser.add_argument("--formal-batch", action="store_true",
+        help="Formal batch mode: non-interactive mode for CI/automation")
     args = parser.parse_args()
 
     server_proc = None
