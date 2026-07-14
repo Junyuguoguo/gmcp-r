@@ -198,11 +198,14 @@ def cleanup_tc_and_verify(interface: str) -> Tuple[bool, str]:
         clear_ok = clear_tc_netem(interface)
     except BaseException:
         clear_ok = False
-    try:
-        snapshot = get_tc_snapshot(interface)
-    except BaseException as exc:
-        snapshot = f"<tc snapshot failed: {exc}>"
-    return bool(clear_ok) and "netem" not in snapshot, snapshot
+    snapshot_ok, snapshot, snapshot_error = get_tc_snapshot_checked(interface)
+    if not snapshot_ok:
+        return False, f"tc snapshot failure after cleanup: {snapshot_error}"
+    if not clear_ok:
+        return False, f"clear_tc_netem failed; final snapshot: {snapshot}"
+    if "netem" in snapshot:
+        return False, snapshot
+    return True, snapshot
 
 
 def make_payload(seq: int, payload_size: int) -> str:
@@ -408,16 +411,36 @@ def clear_tc_netem(interface: str) -> bool:
         return False
 
 
-def get_tc_snapshot(interface: str) -> str:
-    """Get current tc qdisc configuration for the interface."""
+def get_tc_snapshot_checked(interface: str) -> Tuple[bool, str, str]:
+    """Strictly read tc qdisc state for interface.
+
+    Returns (ok, snapshot, error). A clean snapshot must come from a
+    successful command and must be non-empty.
+    """
     try:
         result = subprocess.run(
             ["sudo", "tc", "qdisc", "show", "dev", interface],
             capture_output=True, text=True, timeout=10,
         )
-        return result.stdout.strip()
-    except Exception:
-        return ""
+    except subprocess.TimeoutExpired as exc:
+        return False, "", f"tc qdisc show timed out after {exc.timeout}s"
+    except Exception as exc:
+        return False, "", f"tc qdisc show failed: {exc}"
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        detail = stderr or stdout or f"returncode={result.returncode}"
+        return False, "", f"tc qdisc show failed with returncode={result.returncode}: {detail}"
+    if not stdout:
+        return False, "", "empty tc qdisc snapshot"
+    return True, stdout, ""
+
+
+def get_tc_snapshot(interface: str) -> str:
+    """Compatibility wrapper for callers that only need display text."""
+    ok, snapshot, _ = get_tc_snapshot_checked(interface)
+    return snapshot if ok else ""
 
 
 def validate_interface_for_mode(interface: str, host: Optional[str]) -> None:
@@ -470,22 +493,25 @@ def tc_condition(interface: str, loss: int, delay_ms: int, jitter_ms: int, reord
     """
     condition_desc = f"loss={loss}% delay={delay_ms}ms jitter={jitter_ms}ms reorder={reorder}%"
     print(f"[TC] Applying: {condition_desc}")
-    ok = setup_tc_netem(interface, loss, delay_ms, jitter_ms, reorder)
-    if not ok:
-        raise RuntimeError(f"[TC] Failed to apply condition: {condition_desc}")
-    snapshot = get_tc_snapshot(interface)
-    print(f"[TC] Snapshot: {snapshot[:120]}...")
+    applied = False
     try:
+        ok = setup_tc_netem(interface, loss, delay_ms, jitter_ms, reorder)
+        if not ok:
+            raise RuntimeError(f"[TC] Failed to apply condition: {condition_desc}")
+        applied = True
+        snapshot_ok, snapshot, snapshot_error = get_tc_snapshot_checked(interface)
+        if not snapshot_ok:
+            raise RuntimeError(f"[TC] Failed to read qdisc snapshot after apply: {snapshot_error}")
+        print(f"[TC] Snapshot: {snapshot[:120]}...")
         yield snapshot
     finally:
-        print("[TC] Cleaning up ...")
-        clear_tc_netem(interface)
-        # Post-cleanup verification
-        snap_after = get_tc_snapshot(interface)
-        if "netem" in snap_after:
-            raise RuntimeError(
-                f"[TC] netem residue after cleanup on {interface}: {snap_after[:200]}"
-            )
+        if applied:
+            print("[TC] Cleaning up ...")
+            cleanup_ok, snap_after = cleanup_tc_and_verify(interface)
+            if not cleanup_ok:
+                raise RuntimeError(
+                    f"[TC] cleanup verification failed on {interface}: {snap_after[:200]}"
+                )
 
 
 

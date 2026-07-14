@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # tests/test_netem_runner_provenance.py
 #
-# 22 tests for run_netem_validation.py provenance, output protection,
+# Direct tests for run_netem_validation.py provenance, output protection,
 # tc cleanup, and --run-dir argument validation.
 #
 # All tests target run_netem_validation.py directly (test 22).
@@ -12,6 +12,7 @@ import inspect
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -637,23 +638,77 @@ class TestExceptionPathCallsTcCleanup(unittest.TestCase):
 class TestCleanupWithNetemBlocksPublish(unittest.TestCase):
     """Test 20: tc cleanup must be verified before publish."""
 
+    def test_checked_snapshot_fails_on_nonzero_returncode(self):
+        result = MagicMock(returncode=2, stdout="", stderr="Cannot find device")
+        with patch.object(runner.subprocess, "run", return_value=result):
+            ok, snap, err = runner.get_tc_snapshot_checked("lo")
+        self.assertFalse(ok)
+        self.assertEqual(snap, "")
+        self.assertIn("Cannot find device", err)
+
+    def test_checked_snapshot_fails_on_exception(self):
+        with patch.object(runner.subprocess, "run", side_effect=OSError("boom")):
+            ok, snap, err = runner.get_tc_snapshot_checked("lo")
+        self.assertFalse(ok)
+        self.assertEqual(snap, "")
+        self.assertIn("boom", err)
+
+    def test_checked_snapshot_fails_on_timeout(self):
+        timeout = subprocess.TimeoutExpired(["sudo", "tc"], timeout=10)
+        with patch.object(runner.subprocess, "run", side_effect=timeout):
+            ok, snap, err = runner.get_tc_snapshot_checked("lo")
+        self.assertFalse(ok)
+        self.assertEqual(snap, "")
+        self.assertIn("timed out", err.lower())
+
+    def test_checked_snapshot_fails_on_empty_stdout(self):
+        result = MagicMock(returncode=0, stdout="  \n", stderr="")
+        with patch.object(runner.subprocess, "run", return_value=result):
+            ok, snap, err = runner.get_tc_snapshot_checked("lo")
+        self.assertFalse(ok)
+        self.assertEqual(snap, "")
+        self.assertIn("empty", err.lower())
+
+    def test_checked_snapshot_succeeds_on_nonempty_stdout(self):
+        result = MagicMock(returncode=0, stdout="qdisc noqueue 0: root\n", stderr="")
+        with patch.object(runner.subprocess, "run", return_value=result):
+            ok, snap, err = runner.get_tc_snapshot_checked("lo")
+        self.assertTrue(ok)
+        self.assertEqual(snap, "qdisc noqueue 0: root")
+        self.assertEqual(err, "")
+
     def test_cleanup_false_returns_failure(self):
         with patch.object(runner, "clear_tc_netem", return_value=False), \
-             patch.object(runner, "get_tc_snapshot", return_value="qdisc noqueue 0: root"):
+             patch.object(runner, "get_tc_snapshot_checked", return_value=(True, "qdisc noqueue 0: root", "")):
             ok, snap = runner.cleanup_tc_and_verify("lo")
         self.assertFalse(ok)
         self.assertIn("noqueue", snap)
 
+    def test_cleanup_snapshot_command_failure_returns_failure(self):
+        with patch.object(runner, "clear_tc_netem", return_value=True), \
+             patch.object(runner, "get_tc_snapshot_checked", return_value=(False, "", "tc failed: bad iface")):
+            ok, snap = runner.cleanup_tc_and_verify("lo")
+        self.assertFalse(ok)
+        self.assertIn("snapshot failure", snap)
+        self.assertIn("bad iface", snap)
+
+    def test_cleanup_empty_snapshot_returns_failure(self):
+        with patch.object(runner, "clear_tc_netem", return_value=True), \
+             patch.object(runner, "get_tc_snapshot_checked", return_value=(False, "", "empty tc qdisc snapshot")):
+            ok, snap = runner.cleanup_tc_and_verify("lo")
+        self.assertFalse(ok)
+        self.assertIn("empty", snap)
+
     def test_cleanup_netem_residue_returns_failure(self):
         with patch.object(runner, "clear_tc_netem", return_value=True), \
-             patch.object(runner, "get_tc_snapshot", return_value="qdisc netem 8001: root"):
+             patch.object(runner, "get_tc_snapshot_checked", return_value=(True, "qdisc netem 8001: root", "")):
             ok, snap = runner.cleanup_tc_and_verify("lo")
         self.assertFalse(ok)
         self.assertIn("netem", snap)
 
     def test_cleanup_success_returns_snapshot(self):
         with patch.object(runner, "clear_tc_netem", return_value=True), \
-             patch.object(runner, "get_tc_snapshot", return_value="qdisc noqueue 0: root"):
+             patch.object(runner, "get_tc_snapshot_checked", return_value=(True, "qdisc noqueue 0: root", "")):
             ok, snap = runner.cleanup_tc_and_verify("lo")
         self.assertTrue(ok)
         self.assertNotIn("netem", snap)
@@ -663,6 +718,31 @@ class TestCleanupWithNetemBlocksPublish(unittest.TestCase):
         cleanup_pos = source.index("cleanup_tc_and_verify(interface)")
         publish_pos = source.index("publish_tmp_no_clobber(tmp_csv, output_csv)")
         self.assertLess(cleanup_pos, publish_pos)
+
+    def test_tc_condition_apply_snapshot_failure_still_cleans(self):
+        with patch.object(runner, "setup_tc_netem", return_value=True), \
+             patch.object(runner, "get_tc_snapshot_checked", return_value=(False, "", "tc show failed")), \
+             patch.object(runner, "cleanup_tc_and_verify", return_value=(True, "qdisc noqueue 0: root")) as cleanup_mock:
+            with self.assertRaises(RuntimeError):
+                with runner.tc_condition("lo", 1, 30, 10, 0):
+                    pass
+        cleanup_mock.assert_called_once_with("lo")
+
+    def test_control_condition_snapshot_failure_does_not_pass(self):
+        with patch.object(runner, "setup_tc_netem", return_value=True), \
+             patch.object(runner, "get_tc_snapshot_checked", return_value=(False, "", "empty tc qdisc snapshot")), \
+             patch.object(runner, "cleanup_tc_and_verify", return_value=(True, "qdisc noqueue 0: root")):
+            with self.assertRaises(RuntimeError):
+                with runner.tc_condition("lo", 0, 0, 0, 0):
+                    pass
+
+    def test_tc_condition_cleanup_snapshot_failure_raises(self):
+        with patch.object(runner, "setup_tc_netem", return_value=True), \
+             patch.object(runner, "get_tc_snapshot_checked", return_value=(True, "qdisc noqueue 0: root", "")), \
+             patch.object(runner, "cleanup_tc_and_verify", return_value=(False, "tc snapshot failure: timeout")):
+            with self.assertRaises(RuntimeError):
+                with runner.tc_condition("lo", 0, 0, 0, 0):
+                    pass
 
     def test_clear_tc_false_blocks_publish_and_keeps_tmp(self):
         run_dir = Path(_make_tmp_dir())
@@ -693,6 +773,64 @@ class TestCleanupWithNetemBlocksPublish(unittest.TestCase):
             self.assertFalse((run_dir / "netem_dev.csv").exists())
         finally:
             shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_apply_snapshot_failure_blocks_publish_and_keeps_tmp(self):
+        run_dir = Path(_make_tmp_dir())
+        with patch.object(runner, "is_linux", return_value=True), \
+             patch.object(runner, "check_tc_available", return_value=True), \
+             patch.object(runner, "check_sudo_available", return_value=True), \
+             patch.object(runner, "validate_interface_for_mode"), \
+             patch.object(runner, "_transport_get_git_commit", return_value=_FULL_SHA), \
+             patch.object(runner, "_transport_get_git_dirty", return_value=False), \
+             patch.object(runner, "setup_tc_netem", return_value=True), \
+             patch.object(runner, "get_tc_snapshot_checked", return_value=(False, "", "tc show failed")), \
+             patch.object(runner, "cleanup_tc_and_verify", return_value=(True, "qdisc noqueue 0: root")), \
+             patch.object(runner, "run_one_experiment", side_effect=lambda protocol, condition_name, repeat_id, **kwargs: _fake_result(protocol, condition_name, repeat_id)) as run_mock, \
+             patch.object(runner, "publish_tmp_no_clobber") as publish_mock:
+            try:
+                with self.assertRaises(RuntimeError):
+                    _invoke_main([
+                        "--interface", "lo",
+                        "--conditions", "control",
+                        "--repeats", "1",
+                        "--run-dir", str(run_dir),
+                    ])
+                run_mock.assert_not_called()
+                publish_mock.assert_not_called()
+                self.assertTrue((run_dir / "netem_dev.csv.tmp").exists())
+                self.assertFalse((run_dir / "netem_dev.csv").exists())
+            finally:
+                shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_cleanup_snapshot_failure_after_condition_blocks_publish_and_keeps_tmp(self):
+        run_dir = Path(_make_tmp_dir())
+        with patch.object(runner, "is_linux", return_value=True), \
+             patch.object(runner, "check_tc_available", return_value=True), \
+             patch.object(runner, "check_sudo_available", return_value=True), \
+             patch.object(runner, "validate_interface_for_mode"), \
+             patch.object(runner, "_transport_get_git_commit", return_value=_FULL_SHA), \
+             patch.object(runner, "_transport_get_git_dirty", return_value=False), \
+             patch.object(runner, "setup_tc_netem", return_value=True), \
+             patch.object(runner, "get_tc_snapshot_checked", return_value=(True, "qdisc noqueue 0: root", "")), \
+             patch.object(runner, "cleanup_tc_and_verify", side_effect=[
+                 (False, "tc snapshot failure: timeout"),
+                 (False, "tc snapshot failure: timeout"),
+             ]), \
+             patch.object(runner, "run_one_experiment", side_effect=lambda protocol, condition_name, repeat_id, **kwargs: _fake_result(protocol, condition_name, repeat_id)), \
+             patch.object(runner, "publish_tmp_no_clobber") as publish_mock:
+            try:
+                with self.assertRaises(RuntimeError):
+                    _invoke_main([
+                        "--interface", "lo",
+                        "--conditions", "control",
+                        "--repeats", "1",
+                        "--run-dir", str(run_dir),
+                    ])
+                publish_mock.assert_not_called()
+                self.assertTrue((run_dir / "netem_dev.csv.tmp").exists())
+                self.assertFalse((run_dir / "netem_dev.csv").exists())
+            finally:
+                shutil.rmtree(run_dir, ignore_errors=True)
 
     def test_cleanup_success_allows_publish(self):
         run_dir = Path(_make_tmp_dir())
