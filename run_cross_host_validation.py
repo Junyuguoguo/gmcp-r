@@ -223,11 +223,12 @@ def run_one_experiment(
     network_path_type: str,
     baseline_rtt_ms: float,
     git_meta: Dict[str, str],
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
     Run a single cross-host experiment and return a result dict.
 
-    Returns None if the run failed (exception during connection/HELLO).
+    Always returns a result dict (never None). On exception, returns
+    a dict with run_valid=False and failure details.
     Uses ProtocolAdapter for protocol-agnostic state tracking and
     independent state comparison.
     """
@@ -247,6 +248,9 @@ def run_one_experiment(
 
     # Server environment info (populated from HELLO_ACK)
     server_env: Dict[str, str] = {}
+
+    # Protocol adapter (initialized before try so it's always bound)
+    adapter: Optional[ProtocolAdapter] = None
 
     start_time = time.time()
     sock = None
@@ -312,7 +316,8 @@ def run_one_experiment(
 
     except Exception as e:
         print(f"  [ERROR] {protocol} r{repeat_id}: {e}")
-        return None
+        failure_reason = failure_reason or str(e)
+        error_count = max(error_count, 1)
     finally:
         close_tcp(sock, file_obj)
 
@@ -337,16 +342,25 @@ def run_one_experiment(
 
     # --- run_valid computation ---
     unrecovered = rejected_count + timeout_count + error_count
-    sequence_match = (adapter.last_seq == message_count)
 
-    # Independent state comparison via ProtocolAdapter
-    # Uses internally saved server_state from update_after_accept()
-    state_match = adapter.check_state_match() and sequence_match
-
-    run_valid = (accepted_count == message_count) and (unrecovered == 0) and state_match
-
-    # Get state audit fields from adapter
-    state_fields = adapter.get_final_state_for_csv()
+    if adapter is not None:
+        sequence_match = (adapter.last_seq == message_count)
+        state_match = adapter.check_state_match() and sequence_match
+        run_valid = (accepted_count == message_count) and (unrecovered == 0) and state_match
+        state_fields = adapter.get_final_state_for_csv()
+    else:
+        # Adapter was never created (connection/HELLO failed)
+        sequence_match = False
+        state_match = False
+        run_valid = False
+        state_fields = {
+            "client_final_seq": 0,
+            "server_final_seq": 0,
+            "client_final_mem": "",
+            "server_final_mem": "",
+            "client_final_hash": "",
+            "server_final_hash": "",
+        }
 
     # Real memory/hash match from independent comparison
     memory_match = True
@@ -833,11 +847,31 @@ def main():
         print("[FATAL] Server not reachable at experiment start. Aborting.")
         sys.exit(1)
 
-    # Atomic publish: write to .tmp, validate, then replace
+    # --- Journal for crash recovery ---
+    journal_path = output_csv + ".journal"
+    journal_entries = []
+
+    def write_journal(event: str, **extra):
+        """Append a timestamped event to the journal file."""
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            **extra,
+        }
+        journal_entries.append(entry)
+        try:
+            with open(journal_path, "a", encoding="utf-8") as jf:
+                jf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                jf.flush()
+        except Exception:
+            pass
+
+    write_journal("run_start", total=total, mode=mode_label, output=output_csv)
+
+    # Batch mode: write to .tmp incrementally, flush after each experiment
     tmp_csv = output_csv + ".tmp"
     completed = 0
     failed = 0
-    skipped = 0
     with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -846,7 +880,7 @@ def main():
             for msg_count in MESSAGE_COUNTS:
                 for payload_size in PAYLOAD_SIZES:
                     for repeat_id in range(1, repeats + 1):
-                        idx = completed + failed + skipped + 1
+                        idx = completed + failed + 1
                         result = run_one_experiment(
                             protocol=protocol,
                             message_count=msg_count,
@@ -860,21 +894,27 @@ def main():
                             baseline_rtt_ms=baseline_rtt,
                             git_meta=git_meta,
                         )
-                        if result is None:
-                            # Run failed (exception) — skip CSV write
-                            failed += 1
-                            print(
-                                f"  [{idx}/{total}] {protocol} m={msg_count} "
-                                f"p={payload_size} r={repeat_id}: FAILED (skipped)"
-                            )
-                            continue
 
                         # Inject command_line into each result
                         result["command_line"] = command_line
 
+                        # Always write to CSV (failed rows preserved with run_valid=False)
                         writer.writerow(result)
                         f.flush()
-                        completed += 1
+
+                        if not result["run_valid"]:
+                            failed += 1
+                            write_journal(
+                                "experiment_failed",
+                                protocol=protocol,
+                                msg_count=msg_count,
+                                payload_size=payload_size,
+                                repeat_id=repeat_id,
+                                failure_reason=result.get("failure_reason", ""),
+                            )
+                        else:
+                            completed += 1
+
                         acc = result["accepted_count"]
                         rej = result["rejected_count"]
                         valid_mark = "OK" if result["run_valid"] else "INVALID"
@@ -885,7 +925,10 @@ def main():
                             f"rtt={result['avg_rtt_ms']:.1f}ms [{valid_mark}]"
                         )
 
+    write_journal("run_end", completed=completed, failed=failed, total=total)
+
     # Validate tmp file before atomic replace
+    # (relaxed: allow failed rows — only check structural integrity)
     print(f"\n[VALIDATE] Checking {tmp_csv} ...")
     try:
         with open(tmp_csv, "r", newline="", encoding="utf-8") as f:
@@ -895,12 +938,13 @@ def main():
             print(f"[VALIDATE] FAIL: expected {expected_total} rows, got {len(rows)}")
             os.remove(tmp_csv)
             sys.exit(1)
-        all_valid = all(r.get("run_valid") in ("True", "true", True) for r in rows)
-        if not all_valid:
-            invalid_count = sum(1 for r in rows if r.get("run_valid") not in ("True", "true", True))
-            print(f"[VALIDATE] FAIL: {invalid_count} rows have run_valid=False")
-            os.remove(tmp_csv)
-            sys.exit(1)
+
+        # Count valid vs invalid
+        invalid_count = sum(1 for r in rows if r.get("run_valid") not in ("True", "true", True))
+        valid_count = len(rows) - invalid_count
+        if invalid_count > 0:
+            print(f"[VALIDATE] WARN: {invalid_count} rows have run_valid=False (preserved in output)")
+
         all_clean = all(r.get("git_dirty") in ("false", "False", False) for r in rows)
         if not all_clean:
             print("[VALIDATE] FAIL: git_dirty is not false for all rows")
@@ -909,6 +953,9 @@ def main():
         # Formal mode: also check server_git_dirty and cross-host authenticity
         if args.formal:
             for i, r in enumerate(rows):
+                # Skip failed rows for strict server-side checks
+                if r.get("run_valid") not in ("True", "true", True):
+                    continue
                 # server_git_dirty strict check (no empty string allowed)
                 server_dirty = r.get('server_git_dirty', '')
                 if server_dirty not in ('false', 'False', False):
@@ -946,7 +993,7 @@ def main():
                 print("[VALIDATE] FAIL: client git_dirty is not false for all rows")
                 os.remove(tmp_csv)
                 sys.exit(1)
-        print(f"[VALIDATE] OK: {len(rows)} rows, all run_valid=True, git_dirty=false")
+        print(f"[VALIDATE] OK: {len(rows)} rows ({valid_count} valid, {invalid_count} failed), git_dirty=false")
     except Exception as e:
         print(f"[VALIDATE] FAIL: {e}")
         if os.path.exists(tmp_csv):
@@ -956,9 +1003,10 @@ def main():
     # Atomic replace
     os.replace(tmp_csv, output_csv)
     print(f"\n[DONE] Results atomically written to {output_csv}")
-    print(f"[DONE] {completed} experiments completed, {failed} failed, {skipped} skipped.")
+    print(f"[DONE] {completed} experiments completed, {failed} failed.")
     if failed > 0:
-        print(f"[WARN] {failed} experiments had errors and were excluded from results.")
+        print(f"[WARN] {failed} experiments had errors and were preserved with run_valid=False.")
+    print(f"[JOURNAL] Crash-recovery journal: {journal_path}")
 
 
 if __name__ == "__main__":
