@@ -354,7 +354,7 @@ def _make_row(repeat_id=1, protocol="gmcp_r", message_count=500, payload_size=12
               server_os_info="CentOS 7.6", server_cpu_model="x86_64",
               server_git_commit="a" * 40, network_path_type="wan",
               client_host_id="VM-0-14-ubuntu", failure_reason="",
-              unrecovered=0):
+              unrecovered=0, schema_version="2"):
     """Build a single result dict matching the expected CSV schema."""
     if accepted is None:
         accepted = message_count
@@ -388,6 +388,7 @@ def _make_row(repeat_id=1, protocol="gmcp_r", message_count=500, payload_size=12
         "failure_reason": failure_reason,
         "unrecovered": str(unrecovered),
         "sent_count": str(accepted + rejected + timeout + error),
+        "schema_version": schema_version,
     }
 
 
@@ -1283,6 +1284,307 @@ class TestRunnerServerGitCommitInResult(unittest.TestCase):
         self.assertTrue(result["run_valid"], result.get("failure_reason"))
         self.assertEqual(len(result.get("server_git_commit", "")), 40)
         self.assertNotEqual(result.get("server_hostname", ""), "")
+
+
+# ---------------------------------------------------------------------------
+# 33. Aggregator: schema_version missing or wrong (V29)
+# ---------------------------------------------------------------------------
+
+class TestAggregatorV29SchemaVersion(unittest.TestCase):
+    """V29: schema_version must be '2' for every row."""
+
+    def test_missing_schema_version_fails(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 1:
+                rows = []
+                for proto in ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=1, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                session_id=f"sv-{proto}-{mc}-{ps}",
+                                schema_version="",  # missing
+                            ))
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+        errors, _, _ = validate_all(batch_dir)
+        self.assertTrue(any("schema_version=" in e and "expected '2'" in e for e in errors),
+                        f"Expected V29 error, got: {errors}")
+
+    def test_wrong_schema_version_fails(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 1:
+                rows = []
+                for proto in ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=1, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                session_id=f"sv2-{proto}-{mc}-{ps}",
+                                schema_version="1",  # wrong version
+                            ))
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+        errors, _, _ = validate_all(batch_dir)
+        self.assertTrue(any("schema_version='1'" in e for e in errors),
+                        f"Expected schema_version error, got: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# 34. Aggregator: per-batch config set mismatch (V30)
+# ---------------------------------------------------------------------------
+
+class TestAggregatorV30BatchConfigMismatch(unittest.TestCase):
+    """V30: each batch's config set must equal EXPECTED_CONFIGS."""
+
+    def test_batch_with_wrong_protocol_fails_v30(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 7:
+                rows = []
+                # Replace gmcp_r with a fake protocol inside one batch
+                for proto in ["fake_proto", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=7, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                session_id=f"v30-{proto}-{mc}-{ps}",
+                            ))
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+        errors, _, _ = validate_all(batch_dir)
+        self.assertTrue(any("V30" in e for e in errors), f"Expected V30 error, got: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# 35. Aggregator: duplicate config within batch (V31)
+# ---------------------------------------------------------------------------
+
+class TestAggregatorV31DuplicateConfigInBatch(unittest.TestCase):
+    """V31: each config must appear exactly 1 time per batch."""
+
+    def test_duplicate_config_in_batch_fails(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 3:
+                rows = []
+                for proto in ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=3, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                session_id=f"v31-{proto}-{mc}-{ps}-{rid}-{id(rows)}",
+                            ))
+                # Remove last row and duplicate first row to keep 20 rows
+                rows.pop()
+                dup = dict(rows[0])
+                dup["session_id"] = "v31-dup-extra"
+                rows.append(dup)
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+        errors, _, _ = validate_all(batch_dir)
+        self.assertTrue(any("V31" in e for e in errors), f"Expected V31 error, got: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# 36. Aggregator: server_git_dirty=true detected (V11)
+# ---------------------------------------------------------------------------
+
+class TestAggregatorV11ServerGitDirty(unittest.TestCase):
+    """V11: server_git_dirty must be false for all rows."""
+
+    def test_server_dirty_git_fails(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 1:
+                rows = []
+                for proto in ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=1, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                server_git_dirty="true",  # invalid
+                                session_id=f"sdg-{proto}-{mc}-{ps}",
+                            ))
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+        errors, _, _ = validate_all(batch_dir)
+        self.assertTrue(any("server_git_dirty" in e and "true" in e for e in errors),
+                        f"Expected server_git_dirty error, got: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# 37. Aggregator: state_match=False detected (V18)
+# ---------------------------------------------------------------------------
+
+class TestAggregatorV18StateMatch(unittest.TestCase):
+    """V18: state_match must be True for all rows."""
+
+    def test_state_match_false_fails(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 1:
+                rows = []
+                for proto in ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=1, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                state_match="False",  # invalid
+                                session_id=f"sm-{proto}-{mc}-{ps}",
+                            ))
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+        errors, _, _ = validate_all(batch_dir)
+        self.assertTrue(any("state_match=False" in e for e in errors),
+                        f"Expected state_match error, got: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# 38. Aggregator: sequence_match=False detected (V19)
+# ---------------------------------------------------------------------------
+
+class TestAggregatorV19SequenceMatch(unittest.TestCase):
+    """V19: sequence_match must be True for all rows."""
+
+    def test_sequence_match_false_fails(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 1:
+                rows = []
+                for proto in ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=1, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                sequence_match="False",  # invalid
+                                session_id=f"sqm-{proto}-{mc}-{ps}",
+                            ))
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+        errors, _, _ = validate_all(batch_dir)
+        self.assertTrue(any("sequence_match=False" in e for e in errors),
+                        f"Expected sequence_match error, got: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# 39. Aggregator: client and server on same host (V23)
+# ---------------------------------------------------------------------------
+
+class TestAggregatorV23SameHost(unittest.TestCase):
+    """V23: client_host_id must differ from server_hostname."""
+
+    def test_same_host_fails(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 1:
+                rows = []
+                for proto in ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=1, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                client_host_id="same-host",
+                                server_hostname="same-host",  # same as client
+                                session_id=f"v23-{proto}-{mc}-{ps}",
+                            ))
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+        errors, _, _ = validate_all(batch_dir)
+        self.assertTrue(any("same host" in e for e in errors),
+                        f"Expected same host error, got: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# 40. Aggregator: failure_reason non-empty detected (V21)
+# ---------------------------------------------------------------------------
+
+class TestAggregatorV21FailureReason(unittest.TestCase):
+    """V21: failure_reason must be empty for all rows."""
+
+    def test_non_empty_failure_reason_fails(self):
+        from aggregate_cross_host_batches import validate_all
+        tmpdir = tempfile.mkdtemp()
+        batch_dir = Path(tmpdir) / "batches"
+        batch_dir.mkdir()
+        for rid in range(1, 21):
+            if rid == 1:
+                rows = []
+                for proto in ["gmcp_r", "hash_chain", "authenticated_hash_chain", "seq_mac", "ticket_only"]:
+                    for mc in [500, 1000]:
+                        for ps in [128, 512]:
+                            hm = "True" if proto in ("hash_chain", "authenticated_hash_chain") else ""
+                            mm = "True" if proto == "gmcp_r" else ""
+                            rows.append(_make_row(
+                                repeat_id=1, protocol=proto, message_count=mc,
+                                payload_size=ps, memory_match=mm, hash_match=hm,
+                                failure_reason="some error",  # non-empty
+                                session_id=f"v21-{proto}-{mc}-{ps}",
+                            ))
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid, rows)
+            else:
+                _make_batch_csv(batch_dir / f"cross_host_batch_r{rid:02d}.csv", rid)
+        errors, _, _ = validate_all(batch_dir)
+        self.assertTrue(any("failure_reason" in e for e in errors),
+                        f"Expected failure_reason error, got: {errors}")
 
 
 if __name__ == "__main__":

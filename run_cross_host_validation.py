@@ -440,6 +440,8 @@ def run_one_experiment(
         "hash_match": hash_match,
         "state_match": state_match,
         "state_auditable": adapter is not None,
+        "partial_state_auditable": (state_fields.get("server_final_seq", "") != "" and adapter is not None),
+        "final_state_complete": (adapter is not None and state_match and state_fields.get("server_final_seq", "") != ""),
         "run_valid": run_valid,
         "success_rate": round(success_rate, 2),
         "throughput_msg_per_sec": round(throughput, 2),
@@ -734,6 +736,10 @@ def main():
     parser.add_argument("--run-dir", type=str, default=None,
         help="Absolute path for journal and batch output files")
     parser.add_argument("--repeats", type=int, default=None, help="Override repeat count")
+    parser.add_argument("--attempt-number", type=int, default=None, dest="attempt_number_arg",
+        help="Override auto-detected attempt number (default: auto from journal)")
+    parser.add_argument("--no-overwrite", action="store_true",
+        help="Refuse to overwrite existing output CSV; abort if it already exists")
     parser.add_argument("--allow-mixed-commits", action="store_true",
         help="Allow client and server to run different git commits (formal mode)")
     parser.add_argument(
@@ -879,7 +885,7 @@ def main():
         "client_final_seq", "server_final_seq", "sequence_match",
         "client_final_mem", "server_final_mem", "memory_match",
         "client_final_hash", "server_final_hash", "hash_match",
-        "state_match", "state_auditable", "run_valid",
+        "state_match", "state_auditable", "partial_state_auditable", "final_state_complete", "run_valid",
         "success_rate", "throughput_msg_per_sec", "elapsed_seconds",
         "avg_rtt_ms", "p50_rtt_ms", "p95_rtt_ms", "p99_rtt_ms",
         "timestamp",
@@ -888,6 +894,7 @@ def main():
         "server_git_commit", "server_python_version", "server_os_info",
         "server_hostname", "server_git_dirty", "server_cpu_model",
         "attempt_number",
+        "schema_version",
         "command_line",
     ]
 
@@ -905,6 +912,12 @@ def main():
     # Check if server is truly reachable (hard guard)
     if not ping_server(server_host, server_port):
         print("[FATAL] Server not reachable at experiment start. Aborting.")
+        sys.exit(1)
+
+    # --- No-overwrite guard ---
+    if args.no_overwrite and os.path.exists(output_csv):
+        print(f"[FATAL] --no-overwrite: output file already exists: {output_csv}")
+        print("        Remove it first or choose a different output path.")
         sys.exit(1)
 
     # --- Journal for crash recovery ---
@@ -925,6 +938,10 @@ def main():
                         pass
         except Exception:
             pass  # fresh start
+
+    # CLI override for attempt number
+    if args.attempt_number_arg is not None:
+        _attempt_id = args.attempt_number_arg
 
     def write_journal(event: str, **extra):
         """Append a timestamped event to the journal file."""
@@ -977,25 +994,42 @@ def main():
                         # Inject metadata into each result
                         result["command_line"] = command_line
                         result["attempt_number"] = _attempt_id
+                        result["schema_version"] = "2"
 
                         # Always write to CSV (failed rows preserved with run_valid=False)
                         writer.writerow(result)
                         f.flush()
 
+                        # Journal: experiment_result for every experiment (success or fail)
                         if not result["run_valid"]:
                             failed += 1
-                            write_journal(
-                                "experiment_failed",
-                                protocol=protocol,
-                                msg_count=msg_count,
-                                payload_size=payload_size,
-                                repeat_id=repeat_id,
-                                attempt_number=_attempt_id,
-                                failure_type=result.get("failure_type", ""),
-                                failure_reason=result.get("failure_reason", ""),
-                            )
                         else:
                             completed += 1
+                        write_journal(
+                            "experiment_result",
+                            protocol=protocol,
+                            msg_count=msg_count,
+                            payload_size=payload_size,
+                            repeat_id=repeat_id,
+                            attempt_number=_attempt_id,
+                            run_valid=result["run_valid"],
+                            accepted_count=result["accepted_count"],
+                            rejected_count=result["rejected_count"],
+                            timeout_count=result["timeout_count"],
+                            error_count=result["error_count"],
+                            failure_type=result.get("failure_type", ""),
+                            failure_reason=result.get("failure_reason", ""),
+                            state_auditable=result.get("state_auditable", False),
+                            partial_state_auditable=result.get("partial_state_auditable", False),
+                            final_state_complete=result.get("final_state_complete", False),
+                            state_match=result.get("state_match", ""),
+                            sequence_match=result.get("sequence_match", ""),
+                            memory_match=result.get("memory_match", ""),
+                            hash_match=result.get("hash_match", ""),
+                            client_final_seq=result.get("client_final_seq", 0),
+                            server_final_seq=result.get("server_final_seq", 0),
+                            session_id=result.get("session_id", ""),
+                        )
 
                         acc = result["accepted_count"]
                         rej = result["rejected_count"]

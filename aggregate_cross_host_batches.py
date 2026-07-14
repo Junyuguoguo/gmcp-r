@@ -152,6 +152,32 @@ def validate_batch(rows: list[dict], repeat_id: int, batch_path: Path) -> list[s
         if len(serv_commit) != 40:
             errors.append(f"{ctx}: server_git_commit length {len(serv_commit)} != 40")
 
+        # V29: schema_version must be '2'
+        sv = r.get("schema_version", "")
+        if sv != "2":
+            errors.append(f"{ctx}: schema_version={sv!r}, expected '2'")
+
+    # --- Per-batch aggregated checks ---
+
+    # V30: each batch config set must equal EXPECTED_CONFIGS
+    batch_configs = Counter(
+        (r.get("protocol", ""), int(r.get("message_count", -1)), int(r.get("payload_size", -1)))
+        for r in rows
+    )
+    if set(batch_configs) != EXPECTED_CONFIGS:
+        missing = EXPECTED_CONFIGS - set(batch_configs)
+        extra = set(batch_configs) - EXPECTED_CONFIGS
+        errors.append(
+            f"{batch_path.name}: V30 FAIL batch config mismatch. missing={missing}, extra={extra}"
+        )
+
+    # V31: each config appears exactly 1 time within the batch
+    for key in sorted(EXPECTED_CONFIGS):
+        if batch_configs.get(key, 0) != 1:
+            errors.append(
+                f"{batch_path.name}: V31 FAIL {key} appears {batch_configs.get(key, 0)}x, expected 1"
+            )
+
     return errors
 
 
